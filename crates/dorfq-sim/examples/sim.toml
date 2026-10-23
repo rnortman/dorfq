@@ -1,0 +1,46 @@
+# A week of arrivals on two runners, then a day to drain, four
+# replications. Run it with:
+#   make sim ARGS="run --config $PWD/crates/dorfq-sim/examples/sim.toml"
+
+seed = 1                   # master seed; every replication's streams derive from it
+replications = 4
+
+[world]
+hours = 168                # arrivals stop after this many hours
+drain_hours = 24           # then the run drains, and stops at hours + drain_hours at the latest
+arrivals_per_hour = 0.75   # Poisson
+runners = 2                # concurrent CI runs; further runs wait for a runner
+ci_minutes = { min = 150, max = 210 }   # uniform run duration
+p_bad = 0.05               # a pull request breaks on its own against trunk
+p_interact = 0.002         # a pair of pull requests whose queue time overlapped break only together
+p_flake = 0.02             # a run fails for no reason in the tree
+p_conflict = 0.02          # a pull request arrives with a textual conflict against trunk
+repush_per_hour = 0.0      # per queued pull request: head changes, intent kept
+withdraw_per_hour = 0.0    # per queued pull request: intent cleared
+
+# What pooling costs with no failure response at all.
+[[policy]]
+name = "all-at-once"
+kind = "all-at-once"
+
+# The conventional pipelined bisect with memory: the baseline.
+[[policy]]
+name = "bisect"
+kind = "bisect"
+lanes = 2
+max_batch = 8
+
+# The Bayesian scheduler, its priors set equal to the world's rates.
+[[policy]]
+name = "bayes"
+kind = "bayes"
+lanes = 2
+max_batch = 24
+p_bad = 0.05               # prior: a pull request fails on its own against trunk
+p_interact = 0.002         # prior: a pair fails only together; also the per-landing decay
+p_flake = 0.02             # a run fails for no reason
+run_cost = 0.5             # one run, in landed-pull-request units
+w_reject = 1.0             # resolving a bad pull request, in the same units
+eject_above = 0.9          # posterior at which a singled-out cause is ejected
+others_below = 0.1         # a run singles a cause out when every other cause in it is below this
+speculate_above = 0.0      # a candidate starts when its score exceeds this

@@ -93,3 +93,82 @@ production needs, and whether the forge or the scheduler should own it, is a
 design decision. The
 `TODO(security-label-grants-unreviewed-landing-on-any-later-head)` comment
 sits above the label check in `fetch_world`.
+### eject-reason-display
+
+`EjectReason` has no rendering of its own in `dorfq-core`, so three crates
+spell it by hand: the driver's plan log (`crates/dorfq/src/driver.rs`), the
+mock's author messages (`crates/dorfq-forge-mock/src/lib.rs`) and the
+simulator's trace, where the `TODO(eject-reason-display)` comment sits. The
+first two use the same words independently; the trace needs a form without
+spaces. Give `EjectReason` a `Display` (and a token form if the trace keeps
+one) and have all three call it, so a new variant is worded once. Deferred
+because it changes `dorfq-core`, which is a coordinated contract change
+landed on `main`, and which form each audience gets is a decision for that
+change.
+
+### eject-reason-interacts-with
+
+When the Bayesian scheduler singles out a pair of pull requests that fail
+only together, it ejects the newer one with `EjectReason::BatchFailed`
+naming the run that singled the pair out. The honest reason is "fails
+together with #N": the author hears less than the scheduler knows. Add
+`EjectReason::InteractsWith { pr, batch }` to `dorfq-core`, render it in the
+mock forge's author messages and the driver's plan log, and have the
+scheduler emit it where the `TODO(eject-reason-interacts-with)` comment sits
+in `crates/dorfq-scheduler/src/bayes/policy.rs`. Deferred because it is a
+contract change, landed on `main` with both sides of the boundary.
+
+### bayes-pair-search
+
+The Bayesian scheduler's culprit finders search a set of materialised cross
+pairs one pair per run, in rank order, so locating the failing pair among
+the `n × m` cross pairs of two halves that passed alone costs on the order
+of `n · m` runs. Cross-subset finders — one side against half of the other,
+recursively — would locate it in about `log2(n · m)` runs. The
+`TODO(bayes-pair-search)` comment sits where finders are generated in
+`crates/dorfq-scheduler/src/bayes/policy.rs`. Deferred because the search
+strategy is design work: which subsets to run, how their verdicts update
+the pair beliefs, and how a finder of several pull requests is scored
+against the chain.
+
+### bayes-posterior-precision
+
+The Bayesian scheduler's exact inference sums an alternating series over
+the subsets of a component's failed runs. When a component is explained
+only by causes at low belief — pairs at the interaction prior, members
+whose alibi set them to the floor and whose belief later landings lifted
+back near that prior — the probability of
+all its failures falls toward the rounding error of the terms that cancel
+to give it, and the posteriors become noise. That is the shape a CI outage
+or a long flaky spell produces, with the same pull requests retried on
+culprit finders. Today the guard where the `TODO(bayes-posterior-precision)`
+comment sits in `crates/dorfq-scheduler/src/bayes/infer.rs` estimates the
+error and stops the process once the estimate reaches 1%, rather than
+eject a pull request on noise; the estimate runs well above the true
+error, so the stop comes a run or two before the posteriors are noise. It
+is reached two ways. Inferring over the evidence reaches it at a chain of
+about nine or more such linked runs at the shipped priors. Scoring a
+candidate batch by the posteriors its failure would give reaches it
+sooner: the hypothetical run is summed with every component that a cause
+the batch would blame belongs to, so one cluster reaches it a run before
+the evidence does, and a batch whose members come from separate clusters
+is scored over their union, whose runs count as if they were one cluster:
+two clusters of four, each resolved comfortably on its own, stop the
+process. The chain extension grows from the ready pull requests in
+ascending order of belief, which puts members lifted off their alibi by a
+landing first, so such a batch is an ordinary candidate. Until it is
+resolved, `bayes` is not to be run against a real forge: a flaky spell
+would stop the queue. Two recoveries are candidates: drop the component's
+oldest runs until the sum is significant, or fall back to exact
+enumeration over the component's causes when there are few of them.
+Deferred because either changes what the posteriors are in a regime no
+simulated world has reached, so choosing and sizing one is model design
+with a world that exercises it; and because the scheduler contract gives
+`step` no way to report that it cannot compute, so the alternative to a
+stop is a contract change. Scoring has a third, exact remedy for the
+union: components share no cause, so the hypothetical run's failure can be
+scored against each component separately and the results combined, which
+leaves the posteriors unchanged and moves the scoring stop back to where a
+single cluster puts it. It resolves neither the single-cluster case nor
+inference over the evidence, and it changes when the queue stops, so it is
+chosen together with the recovery above.

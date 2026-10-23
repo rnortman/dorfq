@@ -1,5 +1,5 @@
 {
-  "checksum": "2a2f199f3981fc80861365b34a8753af1de98b04f465d0146cbbadcb16ea7478",
+  "checksum": "aa18aeb3f2ef5736118918212916beb66004e46584b43d08ce1f06087413a1a2",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -979,6 +979,18 @@
     },
     "dorfq-scheduler 0.0.0": {
       "common_attrs": {
+        "deps": [
+          {
+            "id": "serde 1.0.229",
+            "target": "serde"
+          }
+        ],
+        "deps_dev": [
+          {
+            "id": "toml 1.1.8+spec-1.1.0",
+            "target": "toml"
+          }
+        ],
         "edition": "2024"
       },
       "library_target_name": "dorfq_scheduler",
@@ -993,6 +1005,42 @@
         {
           "Library": {
             "crate_name": "dorfq_scheduler",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "0.0.0"
+    },
+    "dorfq-sim 0.0.0": {
+      "common_attrs": {
+        "deps": [
+          {
+            "id": "clap 4.6.7",
+            "target": "clap"
+          },
+          {
+            "id": "serde 1.0.229",
+            "target": "serde"
+          },
+          {
+            "id": "toml 1.1.8+spec-1.1.0",
+            "target": "toml"
+          }
+        ],
+        "edition": "2024"
+      },
+      "library_target_name": "dorfq_sim",
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "name": "dorfq-sim",
+      "package_url": "https://github.com/rnortman/dorfq",
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "dorfq_sim",
             "crate_root": "src/lib.rs"
           }
         }
@@ -4664,6 +4712,7 @@
     "dorfq-core 0.0.0": "crates/dorfq-core",
     "dorfq-forge-github 0.0.0": "crates/dorfq-forge-github",
     "dorfq-forge-mock 0.0.0": "crates/dorfq-forge-mock",
-    "dorfq-scheduler 0.0.0": "crates/dorfq-scheduler"
+    "dorfq-scheduler 0.0.0": "crates/dorfq-scheduler",
+    "dorfq-sim 0.0.0": "crates/dorfq-sim"
   }
 }

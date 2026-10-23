@@ -1,0 +1,54 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+WORKSPACE_DEPS = [
+    "//crates/dorfq-core:dorfq_core",
+    "//crates/dorfq-scheduler:dorfq_scheduler",
+]
+
+rust_library(
+    name = "dorfq_sim",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    crate_root = "src/lib.rs",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True) + WORKSPACE_DEPS,
+)
+
+rust_binary(
+    name = "dorfq-sim",
+    srcs = ["src/main.rs"],
+    crate_name = "dorfq_sim_cli",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True) + WORKSPACE_DEPS + [":dorfq_sim"],
+)
+
+rust_test(
+    name = "dorfq_sim_test",
+    size = "small",
+    compile_data = ["examples/sim.toml"],
+    crate = ":dorfq_sim",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test(
+    name = "cli_test",
+    size = "small",
+    srcs = ["tests/cli.rs"],
+    crate_root = "tests/cli.rs",
+    data = [
+        "examples/sim.toml",
+        ":dorfq-sim",
+    ],
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    rustc_env = {
+        "DORFQ_SIM_BIN": "$(rootpath :dorfq-sim)",
+        "DORFQ_SIM_EXAMPLE": "$(rootpath examples/sim.toml)",
+    },
+    deps = all_crate_deps(normal_dev = True),
+)

@@ -222,6 +222,19 @@ name = "dorfq-scheduler"
 version = "0.0.0"
 dependencies = [
  "dorfq-core",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "dorfq-sim"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "dorfq-core",
+ "dorfq-scheduler",
+ "serde",
+ "toml",
 ]
 
 [[package]]

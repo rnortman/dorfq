@@ -24,6 +24,7 @@ help:
 	@echo "  make live-test     run the GitHub forge against a disposable repository (DORFQ_GITHUB_TOKEN, DORFQ_LIVE_REPO)"
 	@echo "  make release       build the dorfq binary optimised"
 	@echo "  make local-deploy  install the optimised binary to ~/.local/bin and restart the user unit if running"
+	@echo "  make sim           run the dorfq-sim simulator (ARGS=... for arguments)"
 	@echo "  make fix           rustfmt and buildifier the tree in place"
 	@echo "  make repin         re-render every crate hub's lock files after a Cargo.toml change or scrub bump"
 	@echo "  make ide           write rust-project.json for rust-analyzer"
@@ -64,6 +65,9 @@ run:
 .PHONY: live-test
 live-test:
 	bazel run //crates/dorfq-forge-github:live
+.PHONY: sim
+sim:
+	bazel run //crates/dorfq-sim -- $(ARGS)
 
 .PHONY: release
 release:

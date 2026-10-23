@@ -13,3 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 dorfq-core = { path = "../dorfq-core" }
+serde = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }
