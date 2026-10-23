@@ -10,8 +10,19 @@ trunk.
 
 ## Status
 
-Scaffolding only: the build, the gates and a placeholder `dorfq` binary.
-There is no queue yet. `CHANGELOG.md` tracks what exists.
+The boundary between the scheduler and the forge exists, with a stub on
+each side and the driver that joins them: a deliberately simple scheduler
+that batches every ready pull request at once, an in-memory mock forge
+driven by a scenario file, and a `dorfq run` loop that plays one against
+the other. There is no implementation against a real forge yet.
+`CHANGELOG.md` tracks what exists.
+
+```sh
+make run ARGS="run --config $PWD/crates/dorfq/examples/mock.toml --exit-when-idle"
+```
+
+plays the shipped scenario: one pull request ejected for conflicting with
+trunk, three landed in one batch, and one ejected when its batch fails.
 
 ## Building
 
@@ -35,6 +46,14 @@ invocation.
 - `crates/` — the Rust workspace. `Cargo.toml` and `Cargo.lock` are the
   source of truth for crate versions; Bazel builds them through
   `crate_universe`.
+  - `crates/dorfq-core/` — the contract between scheduler and forge: the
+    observation and plan types, the `Scheduler` and `Forge` traits, and the
+    rules both sides keep.
+  - `crates/dorfq-scheduler/` — schedulers; today the `AllAtOnce` stub.
+  - `crates/dorfq-forge-mock/` — the in-memory mock forge and its scenario
+    format.
+  - `crates/dorfq/` — the application: configuration, provider
+    construction, the driver loop and the `dorfq` binary.
 - `tools/scrub/` — the secret scanner the commit, push and CI gates run,
   built by Bazel from its published crate with a pinned gitleaks.
 - `tools/pins/` — a test holding the version pins that appear in more than

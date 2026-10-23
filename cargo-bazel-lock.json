@@ -1,5 +1,5 @@
 {
-  "checksum": "c640cd4b314fffbe7ee53b597af8851e5e2272776fd1eb012ca8fcd171d6915d",
+  "checksum": "9046a5b20684a0de125a08638e5bcb909d9aebcaa6a6f476d072bd0b1cfd5d0b",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -7,6 +7,7 @@
     "aarch64-unknown-linux-gnu": [
       "aarch64-unknown-linux-gnu"
     ],
+    "cfg(any())": [],
     "cfg(windows)": [
       "x86_64-pc-windows-msvc"
     ],
@@ -478,6 +479,14 @@
           {
             "id": "clap 4.6.7",
             "target": "clap"
+          },
+          {
+            "id": "serde 1.0.229",
+            "target": "serde"
+          },
+          {
+            "id": "toml 1.1.8+spec-1.1.0",
+            "target": "toml"
           }
         ],
         "edition": "2024"
@@ -499,6 +508,140 @@
         }
       ],
       "version": "0.0.0"
+    },
+    "dorfq-core 0.0.0": {
+      "common_attrs": {
+        "edition": "2024"
+      },
+      "library_target_name": "dorfq_core",
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "name": "dorfq-core",
+      "package_url": "https://github.com/rnortman/dorfq",
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "dorfq_core",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "0.0.0"
+    },
+    "dorfq-forge-mock 0.0.0": {
+      "common_attrs": {
+        "deps": [
+          {
+            "id": "serde 1.0.229",
+            "target": "serde"
+          },
+          {
+            "id": "toml 1.1.8+spec-1.1.0",
+            "target": "toml"
+          }
+        ],
+        "edition": "2024"
+      },
+      "library_target_name": "dorfq_forge_mock",
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "name": "dorfq-forge-mock",
+      "package_url": "https://github.com/rnortman/dorfq",
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "dorfq_forge_mock",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "0.0.0"
+    },
+    "dorfq-scheduler 0.0.0": {
+      "common_attrs": {
+        "edition": "2024"
+      },
+      "library_target_name": "dorfq_scheduler",
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "name": "dorfq-scheduler",
+      "package_url": "https://github.com/rnortman/dorfq",
+      "repository": null,
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "dorfq_scheduler",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "0.0.0"
+    },
+    "equivalent 1.0.3": {
+      "common_attrs": {
+        "edition": "2015"
+      },
+      "library_target_name": "equivalent",
+      "license": "Apache-2.0 OR MIT",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "equivalent",
+      "package_url": "https://github.com/indexmap-rs/equivalent",
+      "repository": {
+        "Http": {
+          "sha256": "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826",
+          "url": "https://static.crates.io/crates/equivalent/1.0.3/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "equivalent",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "1.0.3"
+    },
+    "hashbrown 0.17.1": {
+      "common_attrs": {
+        "edition": "2024"
+      },
+      "library_target_name": "hashbrown",
+      "license": "MIT OR Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "hashbrown",
+      "package_url": "https://github.com/rust-lang/hashbrown",
+      "repository": {
+        "Http": {
+          "sha256": "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a",
+          "url": "https://static.crates.io/crates/hashbrown/0.17.1/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "hashbrown",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "0.17.1"
     },
     "heck 0.5.0": {
       "common_attrs": {
@@ -528,6 +671,45 @@
         }
       ],
       "version": "0.5.0"
+    },
+    "indexmap 2.14.2": {
+      "common_attrs": {
+        "deps": [
+          {
+            "id": "equivalent 1.0.3",
+            "target": "equivalent"
+          },
+          {
+            "id": "hashbrown 0.17.1",
+            "target": "hashbrown"
+          }
+        ],
+        "edition": "2024"
+      },
+      "library_target_name": "indexmap",
+      "license": "Apache-2.0 OR MIT",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "indexmap",
+      "package_url": "https://github.com/indexmap-rs/indexmap",
+      "repository": {
+        "Http": {
+          "sha256": "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855",
+          "url": "https://static.crates.io/crates/indexmap/2.14.2/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "indexmap",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "2.14.2"
     },
     "is_terminal_polyfill 1.70.2": {
       "common_attrs": {
@@ -691,6 +873,204 @@
       ],
       "version": "1.0.47"
     },
+    "serde 1.0.229": {
+      "build_script_attrs": {},
+      "common_attrs": {
+        "crate_features": [
+          "default",
+          "derive",
+          "serde_derive",
+          "std"
+        ],
+        "deps": [
+          {
+            "id": "serde_core 1.0.229",
+            "target": "serde_core"
+          }
+        ],
+        "edition": "2021",
+        "extra_deps": [
+          ":build_script_build"
+        ],
+        "proc_macro_deps": [
+          {
+            "id": "serde_derive 1.0.229",
+            "target": "serde_derive"
+          }
+        ]
+      },
+      "library_target_name": "serde",
+      "license": "MIT OR Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "serde",
+      "package_url": "https://github.com/serde-rs/serde",
+      "repository": {
+        "Http": {
+          "sha256": "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba",
+          "url": "https://static.crates.io/crates/serde/1.0.229/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "serde",
+            "crate_root": "src/lib.rs"
+          }
+        },
+        {
+          "BuildScript": {
+            "crate_name": "build_script_build",
+            "crate_root": "build.rs"
+          }
+        }
+      ],
+      "version": "1.0.229"
+    },
+    "serde_core 1.0.229": {
+      "build_script_attrs": {},
+      "common_attrs": {
+        "crate_features": [
+          "alloc",
+          "result",
+          "std"
+        ],
+        "edition": "2021",
+        "extra_deps": [
+          ":build_script_build"
+        ],
+        "proc_macro_deps": {
+          "common": [],
+          "selects": {
+            "cfg(any())": [
+              {
+                "id": "serde_derive 1.0.229",
+                "target": "serde_derive"
+              }
+            ]
+          }
+        }
+      },
+      "library_target_name": "serde_core",
+      "license": "MIT OR Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "serde_core",
+      "package_url": "https://github.com/serde-rs/serde",
+      "repository": {
+        "Http": {
+          "sha256": "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48",
+          "url": "https://static.crates.io/crates/serde_core/1.0.229/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "serde_core",
+            "crate_root": "src/lib.rs"
+          }
+        },
+        {
+          "BuildScript": {
+            "crate_name": "build_script_build",
+            "crate_root": "build.rs"
+          }
+        }
+      ],
+      "version": "1.0.229"
+    },
+    "serde_derive 1.0.229": {
+      "common_attrs": {
+        "crate_features": [
+          "default"
+        ],
+        "deps": [
+          {
+            "id": "proc-macro2 1.0.107",
+            "target": "proc_macro2"
+          },
+          {
+            "id": "quote 1.0.47",
+            "target": "quote"
+          },
+          {
+            "id": "syn 3.0.9",
+            "target": "syn"
+          }
+        ],
+        "edition": "2021"
+      },
+      "library_target_name": "serde_derive",
+      "license": "MIT OR Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "serde_derive",
+      "package_url": "https://github.com/serde-rs/serde",
+      "repository": {
+        "Http": {
+          "sha256": "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348",
+          "url": "https://static.crates.io/crates/serde_derive/1.0.229/download"
+        }
+      },
+      "targets": [
+        {
+          "ProcMacro": {
+            "crate_name": "serde_derive",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "1.0.229"
+    },
+    "serde_spanned 1.1.2": {
+      "common_attrs": {
+        "crate_features": [
+          "alloc",
+          "serde",
+          "std"
+        ],
+        "deps": [
+          {
+            "id": "serde_core 1.0.229",
+            "target": "serde_core"
+          }
+        ],
+        "edition": "2024"
+      },
+      "library_target_name": "serde_spanned",
+      "license": "MIT OR Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "serde_spanned",
+      "package_url": "https://github.com/toml-rs/toml",
+      "repository": {
+        "Http": {
+          "sha256": "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c",
+          "url": "https://static.crates.io/crates/serde_spanned/1.1.2/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "serde_spanned",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "1.1.2"
+    },
     "strsim 0.11.1": {
       "common_attrs": {
         "edition": "2015"
@@ -770,6 +1150,180 @@
         }
       ],
       "version": "3.0.9"
+    },
+    "toml 1.1.8+spec-1.1.0": {
+      "common_attrs": {
+        "crate_features": [
+          "default",
+          "display",
+          "parse",
+          "serde",
+          "std"
+        ],
+        "deps": [
+          {
+            "id": "serde_core 1.0.229",
+            "target": "serde_core"
+          },
+          {
+            "id": "serde_spanned 1.1.2",
+            "target": "serde_spanned"
+          },
+          {
+            "id": "toml_datetime 1.1.2+spec-1.1.0",
+            "target": "toml_datetime"
+          },
+          {
+            "id": "toml_parser 1.1.5+spec-1.1.0",
+            "target": "toml_parser"
+          },
+          {
+            "id": "toml_writer 1.1.3+spec-1.1.0",
+            "target": "toml_writer"
+          },
+          {
+            "id": "winnow 1.0.4",
+            "target": "winnow"
+          }
+        ],
+        "edition": "2024"
+      },
+      "library_target_name": "toml",
+      "license": "MIT OR Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "toml",
+      "package_url": "https://github.com/toml-rs/toml",
+      "repository": {
+        "Http": {
+          "sha256": "20489e00e4d8741d6be680764cc12e270655e375a20d1011e844a9c3379e678d",
+          "url": "https://static.crates.io/crates/toml/1.1.8+spec-1.1.0/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "toml",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "1.1.8+spec-1.1.0"
+    },
+    "toml_datetime 1.1.2+spec-1.1.0": {
+      "common_attrs": {
+        "crate_features": [
+          "alloc",
+          "serde",
+          "std"
+        ],
+        "deps": [
+          {
+            "id": "serde_core 1.0.229",
+            "target": "serde_core"
+          }
+        ],
+        "edition": "2024"
+      },
+      "library_target_name": "toml_datetime",
+      "license": "MIT OR Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "toml_datetime",
+      "package_url": "https://github.com/toml-rs/toml",
+      "repository": {
+        "Http": {
+          "sha256": "2b86d767906c6c42421dcba507eb9d203e779497710a47782a224bb871653053",
+          "url": "https://static.crates.io/crates/toml_datetime/1.1.2+spec-1.1.0/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "toml_datetime",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "1.1.2+spec-1.1.0"
+    },
+    "toml_parser 1.1.5+spec-1.1.0": {
+      "common_attrs": {
+        "crate_features": [
+          "alloc",
+          "std"
+        ],
+        "deps": [
+          {
+            "id": "winnow 1.0.4",
+            "target": "winnow"
+          }
+        ],
+        "edition": "2024"
+      },
+      "library_target_name": "toml_parser",
+      "license": "MIT OR Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "toml_parser",
+      "package_url": "https://github.com/toml-rs/toml",
+      "repository": {
+        "Http": {
+          "sha256": "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c",
+          "url": "https://static.crates.io/crates/toml_parser/1.1.5+spec-1.1.0/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "toml_parser",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "1.1.5+spec-1.1.0"
+    },
+    "toml_writer 1.1.3+spec-1.1.0": {
+      "common_attrs": {
+        "crate_features": [
+          "alloc",
+          "std"
+        ],
+        "edition": "2024"
+      },
+      "library_target_name": "toml_writer",
+      "license": "MIT OR Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "toml_writer",
+      "package_url": "https://github.com/toml-rs/toml",
+      "repository": {
+        "Http": {
+          "sha256": "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770",
+          "url": "https://static.crates.io/crates/toml_writer/1.1.3+spec-1.1.0/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "toml_writer",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "1.1.3+spec-1.1.0"
     },
     "unicode-ident 1.0.27": {
       "common_attrs": {
@@ -903,13 +1457,46 @@
         }
       ],
       "version": "0.61.2"
+    },
+    "winnow 1.0.4": {
+      "common_attrs": {
+        "edition": "2021"
+      },
+      "library_target_name": "winnow",
+      "license": "MIT",
+      "license_file": "LICENSE-MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "name": "winnow",
+      "package_url": "https://github.com/winnow-rs/winnow",
+      "repository": {
+        "Http": {
+          "sha256": "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81",
+          "url": "https://static.crates.io/crates/winnow/1.0.4/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "winnow",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "1.0.4"
     }
   },
   "direct_deps": [
-    "clap 4.6.7"
+    "clap 4.6.7",
+    "serde 1.0.229",
+    "toml 1.1.8+spec-1.1.0"
   ],
   "direct_dev_deps": [],
   "workspace_members": {
-    "dorfq 0.0.0": "crates/dorfq"
+    "dorfq 0.0.0": "crates/dorfq",
+    "dorfq-core 0.0.0": "crates/dorfq-core",
+    "dorfq-forge-mock 0.0.0": "crates/dorfq-forge-mock",
+    "dorfq-scheduler 0.0.0": "crates/dorfq-scheduler"
   }
 }

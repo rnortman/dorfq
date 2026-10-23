@@ -3,6 +3,12 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 VERSION = "0.0.0"
 
+WORKSPACE_DEPS = [
+    "//crates/dorfq-core:dorfq_core",
+    "//crates/dorfq-forge-mock:dorfq_forge_mock",
+    "//crates/dorfq-scheduler:dorfq_scheduler",
+]
+
 # //tools/pins reads this file to hold VERSION equal to Cargo.toml's.
 exports_files(["BUILD.bazel"])
 
@@ -17,7 +23,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     version = VERSION,
     visibility = ["//visibility:public"],
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + WORKSPACE_DEPS,
 )
 
 rust_binary(
@@ -27,12 +33,13 @@ rust_binary(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     version = VERSION,
     visibility = ["//visibility:public"],
-    deps = all_crate_deps(normal = True) + [":dorfq_lib"],
+    deps = all_crate_deps(normal = True) + WORKSPACE_DEPS + [":dorfq_lib"],
 )
 
 rust_test(
     name = "dorfq_lib_test",
     size = "small",
+    compile_data = ["examples/scenario.toml"],
     crate = ":dorfq_lib",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     version = VERSION,
@@ -44,9 +51,16 @@ rust_test(
     size = "small",
     srcs = ["tests/cli.rs"],
     crate_root = "tests/cli.rs",
-    data = [":dorfq"],
+    data = [
+        "examples/mock.toml",
+        "examples/scenario.toml",
+        ":dorfq",
+    ],
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
-    rustc_env = {"DORFQ_BIN": "$(rootpath :dorfq)"},
+    rustc_env = {
+        "DORFQ_BIN": "$(rootpath :dorfq)",
+        "DORFQ_EXAMPLE_CONFIG": "$(rootpath examples/mock.toml)",
+    },
     version = VERSION,
     deps = all_crate_deps(normal_dev = True),
 )

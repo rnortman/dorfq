@@ -1,0 +1,12 @@
+[package]
+name = "dorfq-core"
+description = "DorfQ's scheduler-forge contract: the types and traits both sides agree on"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"

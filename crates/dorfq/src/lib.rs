@@ -1,7 +1,15 @@
 //! DorfQ, a merge queue that pools pull requests into batched CI runs.
 //!
-//! This crate is scaffolding: it proves the build, the lints and the tests
-//! end to end.
+//! This crate is the application: it reads a configuration, builds the forge
+//! and the scheduler it names, and runs the driver loop that joins them
+//! across the `dorfq_core` contract.
+
+pub mod config;
+pub mod driver;
+pub mod providers;
+
+#[cfg(test)]
+mod e2e_tests;
 
 /// The version of this crate, as the build stamped it.
 pub fn version() -> &'static str {

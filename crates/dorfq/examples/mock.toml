@@ -1,0 +1,13 @@
+# The shipped demonstration: the mock forge playing scenario.toml to the
+# all-at-once stub scheduler. Run it from the repository root with
+#   make run ARGS="run --config $PWD/crates/dorfq/examples/mock.toml --exit-when-idle"
+
+[forge]
+kind = "mock"
+scenario = "scenario.toml"
+
+[scheduler]
+kind = "all-at-once"
+
+[driver]
+tick_millis = 0
