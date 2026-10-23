@@ -5,9 +5,9 @@
 //! says, and pending CI runs count down to their verdict. Commits are
 //! synthetic, minted from a counter, so every run of a scenario is
 //! identical. Effects check rules 5 and 6 of the [`dorfq_core`] contract
-//! against the latest observation and the effects performed since it, and
-//! answer a violation with [`ForgeError::Permanent`] carrying a
-//! [`Violation`].
+//! through a [`Ledger`], and answer a violation with
+//! [`ForgeError::Permanent`] carrying a
+//! [`Violation`](dorfq_core::ledger::Violation).
 //!
 //! Rule 9 is a message log: every message the mock would send an author is
 //! written to the sink as one line when it happens and kept in
@@ -15,11 +15,11 @@
 
 mod scenario;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::error::Error;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
 
+use dorfq_core::ledger::Ledger;
 use dorfq_core::{
     BatchId, BatchMember, BatchStart, BatchState, BatchStatus, CiStatus, ConflictWith, EjectReason,
     Forge, ForgeError, LandRefusal, Mergeable, Observation, PrNumber, PrSnapshot, Sha,
@@ -71,81 +71,6 @@ impl fmt::Display for Message {
     }
 }
 
-/// A call that breaks rule 5 or rule 6: a scheduler bug.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Violation {
-    /// `start_batch` with an id the latest observation reports or that was
-    /// started since it.
-    BatchIdInUse { batch: BatchId },
-    /// `start_batch` with no members.
-    EmptyBatch { batch: BatchId },
-    /// `start_batch` naming a member twice.
-    DuplicateMember { batch: BatchId, pr: PrNumber },
-    /// `start_batch` naming a pull request that is not known.
-    MemberNotKnown { batch: BatchId, pr: PrNumber },
-    /// `start_batch` or `eject` naming a member of a batch `land` was called
-    /// on since the latest observation, whether or not the landing was
-    /// refused.
-    LandedInPlan { effect: &'static str, pr: PrNumber },
-    /// `start_batch` on a base that is neither the latest observation's
-    /// trunk nor the tip of one of its batches.
-    UnknownBase { batch: BatchId, base: Sha },
-    /// `land` or `retire` on a batch that is not known.
-    UnknownBatch {
-        effect: &'static str,
-        batch: BatchId,
-    },
-    /// `land` on a batch the latest observation did not report as passed.
-    NotPassed { batch: BatchId },
-    /// `land` on the same batch twice after one observation.
-    LandedTwice { batch: BatchId },
-    /// `eject` on a pull request that is not known.
-    UnknownPr { pr: PrNumber },
-}
-
-impl fmt::Display for Violation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Violation::BatchIdInUse { batch } => {
-                write!(f, "start_batch: batch id {} is already in use", batch.0)
-            }
-            Violation::EmptyBatch { batch } => {
-                write!(f, "start_batch: batch {} has no members", batch.0)
-            }
-            Violation::DuplicateMember { batch, pr } => {
-                write!(f, "start_batch: batch {} names pr {} twice", batch.0, pr.0)
-            }
-            Violation::MemberNotKnown { batch, pr } => write!(
-                f,
-                "start_batch: batch {} names pr {}, which is not known",
-                batch.0, pr.0
-            ),
-            Violation::LandedInPlan { effect, pr } => write!(
-                f,
-                "{effect}: pr {} is a member of a batch this plan lands",
-                pr.0
-            ),
-            Violation::UnknownBase { batch, base } => write!(
-                f,
-                "start_batch: batch {} is based on {base}, which is neither trunk nor a batch tip",
-                batch.0
-            ),
-            Violation::UnknownBatch { effect, batch } => {
-                write!(f, "{effect}: batch {} is not known", batch.0)
-            }
-            Violation::NotPassed { batch } => {
-                write!(f, "land: batch {} was not reported as passed", batch.0)
-            }
-            Violation::LandedTwice { batch } => {
-                write!(f, "land: batch {} was already landed in this plan", batch.0)
-            }
-            Violation::UnknownPr { pr } => write!(f, "eject: pr {} is not known", pr.0),
-        }
-    }
-}
-
-impl Error for Violation {}
-
 /// Where a scenario pull request is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lifecycle {
@@ -171,17 +96,6 @@ struct MockBatch {
     remaining: u64,
 }
 
-/// Effects performed since the latest observation, for rules 5 and 6.
-#[derive(Default)]
-struct Since {
-    /// Pull requests an effect took out of `prs`: ejected, or landed.
-    removed: BTreeSet<PrNumber>,
-    started: BTreeSet<BatchId>,
-    /// Batches `land` was called on, refused or not.
-    landed: BTreeSet<BatchId>,
-    retired: BTreeSet<BatchId>,
-}
-
 /// The mock forge.
 pub struct MockForge {
     ci_ticks: u64,
@@ -190,8 +104,7 @@ pub struct MockForge {
     trunk: Sha,
     next_commit: u64,
     tick: u64,
-    latest: Option<Observation>,
-    since: Since,
+    ledger: Ledger,
     messages: Vec<Message>,
     sink: Box<dyn Write>,
 }
@@ -218,8 +131,7 @@ impl MockForge {
             trunk: commit(1),
             next_commit: 2,
             tick: 0,
-            latest: None,
-            since: Since::default(),
+            ledger: Ledger::new(),
             messages: Vec::new(),
             sink,
         }
@@ -333,76 +245,6 @@ impl MockForge {
         }
     }
 
-    fn observed_batch(&self, id: BatchId) -> Option<&BatchStatus> {
-        self.latest
-            .as_ref()
-            .and_then(|o| o.batches.iter().find(|b| b.id == id))
-    }
-
-    fn batch_known(&self, id: BatchId) -> bool {
-        self.observed_batch(id).is_some() && !self.since.retired.contains(&id)
-    }
-
-    fn pr_known(&self, pr: PrNumber) -> bool {
-        self.observed_pr(pr) && !self.since.removed.contains(&pr)
-    }
-
-    /// True when `pr` is a member, as the latest observation reports it, of
-    /// a batch `land` was called on since that observation.
-    fn in_landing(&self, pr: PrNumber) -> bool {
-        self.since.landed.iter().any(|&b| {
-            self.observed_batch(b)
-                .is_some_and(|s| s.members.iter().any(|m| m.pr == pr))
-        })
-    }
-
-    fn observed_pr(&self, pr: PrNumber) -> bool {
-        self.latest
-            .as_ref()
-            .is_some_and(|o| o.prs.iter().any(|p| p.number == pr))
-    }
-
-    fn check_start(&self, batch: &BatchStart) -> Result<(), Violation> {
-        let id = batch.id;
-        if self.observed_batch(id).is_some() || self.since.started.contains(&id) {
-            return Err(Violation::BatchIdInUse { batch: id });
-        }
-        if batch.prs.is_empty() {
-            return Err(Violation::EmptyBatch { batch: id });
-        }
-        let mut seen = BTreeSet::new();
-        for &pr in &batch.prs {
-            if !seen.insert(pr) {
-                return Err(Violation::DuplicateMember { batch: id, pr });
-            }
-            if self.in_landing(pr) {
-                return Err(Violation::LandedInPlan {
-                    effect: "start_batch",
-                    pr,
-                });
-            }
-            if !self.pr_known(pr) {
-                return Err(Violation::MemberNotKnown { batch: id, pr });
-            }
-        }
-        let base_known = self.latest.as_ref().is_some_and(|o| {
-            o.trunk == batch.base
-                || o.batches.iter().any(|b| match &b.state {
-                    BatchState::Testing { tip, .. }
-                    | BatchState::Landed { tip }
-                    | BatchState::LandRefused { tip, .. } => *tip == batch.base,
-                    BatchState::Conflict { .. } => false,
-                })
-        });
-        if !base_known {
-            return Err(Violation::UnknownBase {
-                batch: id,
-                base: batch.base.clone(),
-            });
-        }
-        Ok(())
-    }
-
     /// Merges the members in order: the first that conflicts ends the build.
     fn build(&self, prs: &[PrNumber]) -> Option<BatchState> {
         for (i, number) in prs.iter().enumerate() {
@@ -455,22 +297,17 @@ fn commit(n: u64) -> Sha {
     Sha::parse(&format!("{n:040x}")).expect("40 lowercase hex digits")
 }
 
-fn violation(v: Violation) -> ForgeError {
-    ForgeError::Permanent(Box::new(v))
-}
-
 impl Forge for MockForge {
     fn observe(&mut self) -> Result<Observation, ForgeError> {
         self.advance()?;
         self.tick += 1;
         let observation = self.snapshot();
-        self.latest = Some(observation.clone());
-        self.since = Since::default();
+        self.ledger.observed(&observation);
         Ok(observation)
     }
 
     fn start_batch(&mut self, batch: &BatchStart) -> Result<(), ForgeError> {
-        self.check_start(batch).map_err(violation)?;
+        self.ledger.check_start(batch)?;
         let members = batch
             .prs
             .iter()
@@ -508,7 +345,7 @@ impl Forge for MockForge {
                 remaining: self.ci_ticks,
             },
         );
-        self.since.started.insert(batch.id);
+        self.ledger.started(batch.id);
         if testing {
             for &pr in &batch.prs {
                 self.tell(pr, Event::Testing { batch: batch.id })?;
@@ -518,26 +355,10 @@ impl Forge for MockForge {
     }
 
     fn land(&mut self, batch: BatchId) -> Result<(), ForgeError> {
-        if !self.batch_known(batch) {
-            return Err(violation(Violation::UnknownBatch {
-                effect: "land",
-                batch,
-            }));
-        }
-        if self.since.landed.contains(&batch) {
-            return Err(violation(Violation::LandedTwice { batch }));
-        }
-        let observed = self
-            .observed_batch(batch)
-            .expect("a known batch is in the latest observation");
-        let BatchState::Testing {
-            tip,
-            ci: CiStatus::Passed,
-        } = observed.state.clone()
-        else {
-            return Err(violation(Violation::NotPassed { batch }));
+        let BatchState::Testing { tip, .. } = self.ledger.check_land(batch)?.state.clone() else {
+            unreachable!("check_land returns a batch reported as testing");
         };
-        self.since.landed.insert(batch);
+        self.ledger.landing(batch);
         let status = self.batches[&batch].status.clone();
         if let Some(reason) = self.refusal(&status) {
             self.batches
@@ -555,8 +376,8 @@ impl Forge for MockForge {
             .state = BatchState::Landed { tip: tip.clone() };
         for member in &status.members {
             self.set_pr(member.pr, Lifecycle::Merged, None);
-            self.since.removed.insert(member.pr);
         }
+        self.ledger.landed(batch);
         for member in &status.members {
             self.tell(member.pr, Event::Landed { tip: tip.clone() })?;
         }
@@ -564,29 +385,16 @@ impl Forge for MockForge {
     }
 
     fn retire(&mut self, batch: BatchId) -> Result<(), ForgeError> {
-        if !self.batch_known(batch) {
-            return Err(violation(Violation::UnknownBatch {
-                effect: "retire",
-                batch,
-            }));
-        }
+        self.ledger.check_retire(batch)?;
         self.batches.remove(&batch);
-        self.since.retired.insert(batch);
+        self.ledger.retired(batch);
         Ok(())
     }
 
     fn eject(&mut self, pr: PrNumber, reason: &EjectReason) -> Result<(), ForgeError> {
-        if self.in_landing(pr) {
-            return Err(violation(Violation::LandedInPlan {
-                effect: "eject",
-                pr,
-            }));
-        }
-        if !self.pr_known(pr) {
-            return Err(violation(Violation::UnknownPr { pr }));
-        }
+        self.ledger.check_eject(pr)?;
         self.set_pr(pr, Lifecycle::Ejected, None);
-        self.since.removed.insert(pr);
+        self.ledger.ejected(pr);
         self.tell(
             pr,
             Event::Ejected {

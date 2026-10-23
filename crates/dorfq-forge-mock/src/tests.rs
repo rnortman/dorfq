@@ -3,6 +3,8 @@ use std::collections::BTreeSet;
 use std::io;
 use std::rc::Rc;
 
+use dorfq_core::ledger::Violation;
+
 use super::*;
 
 /// A sink the test can read back.

@@ -15,4 +15,6 @@ rust-version = "1.98"
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "1"
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }

@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # dorfq/batch/<id> is a batch the queue published; it lands only once
+    # this check passes on its tip.
+    branches: [main, "dorfq/batch/**"]
   pull_request:
   workflow_dispatch:
 
