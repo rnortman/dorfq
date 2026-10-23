@@ -20,12 +20,30 @@ against GitHub**. dorfq does not run on its own repository yet: batch
 branches get CI only once the workflow change that covers them is on `main`.
 `CHANGELOG.md` tracks what exists.
 
+On the scheduler side there are two real policies beside the stub: `bisect`,
+the conventional pipelined bisect with memory that every number is compared
+to, and `bayes`, which keeps a belief about every queued pull request,
+infers culprits exactly from the runs that failed and passed, and chooses
+batches by expected value. Both are measured with `dorfq-sim`, a seeded,
+event-driven simulator that runs any scheduler against a world of pull
+requests with hidden truths (bad ones, pairs that break only together,
+flaky runs, a fixed number of runners) and reports runner-hours per landed
+pull request, time to land and to reject, wasted runner time and false
+ejections.
+
 ```sh
 make run ARGS="run --config $PWD/crates/dorfq/examples/mock.toml --exit-when-idle"
 ```
 
 plays the shipped scenario: one pull request ejected for conflicting with
 trunk, three landed in one batch, and one ejected when its batch fails.
+
+```sh
+make sim ARGS="run --config $PWD/crates/dorfq-sim/examples/sim.toml"
+```
+
+runs the shipped simulator example, a week of arrivals on two runners, and
+prints one column per policy.
 
 ## Running against GitHub
 
@@ -112,7 +130,8 @@ invocation.
   - `crates/dorfq-core/` — the contract between scheduler and forge: the
     observation and plan types, the `Scheduler` and `Forge` traits, and the
     rules both sides keep.
-  - `crates/dorfq-scheduler/` — schedulers; today the `AllAtOnce` stub.
+  - `crates/dorfq-scheduler/` — schedulers and their configuration: the
+    `AllAtOnce` stub, the `Bisect` baseline and the `Bayes` scheduler.
   - `crates/dorfq-forge-mock/` — the in-memory mock forge and its scenario
     format.
   - `crates/dorfq-forge-github/` — the GitHub forge, over the REST API, and
@@ -121,6 +140,9 @@ invocation.
     repository as disposable.
   - `crates/dorfq/` — the application: configuration, provider
     construction, the driver loop and the `dorfq` binary.
+  - `crates/dorfq-sim/` — the simulator: a seeded world that implements the
+    forge side of the contract, the loop that runs a scheduler against it,
+    the metrics and the `dorfq-sim` binary.
 - `tools/scrub/` — the secret scanner the commit, push and CI gates run,
   built by Bazel from its published crate with a pinned gitleaks.
 - `tools/pins/` — a test holding the version pins that appear in more than

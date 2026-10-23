@@ -15,9 +15,9 @@ use dorfq_core::{
 use dorfq_forge_github::api::{ApiError, RestClient};
 use dorfq_forge_github::{GitHubForge, Settings};
 use dorfq_forge_mock::{MockForge, Scenario, ScenarioError};
-use dorfq_scheduler::AllAtOnce;
+use dorfq_scheduler::SchedulerConfig;
 
-use crate::config::{ForgeConfig, SchedulerConfig};
+use crate::config::ForgeConfig;
 
 /// A provider that could not be built.
 #[derive(Debug)]
@@ -153,11 +153,10 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
     }
 }
 
-/// Builds the configured scheduler.
+/// Builds the configured scheduler, whose parameters
+/// [`crate::config::Config`] validated at load.
 pub fn scheduler(config: &SchedulerConfig) -> Box<dyn Scheduler> {
-    match config {
-        SchedulerConfig::AllAtOnce {} => Box::new(AllAtOnce::new()),
-    }
+    config.build()
 }
 
 #[cfg(test)]

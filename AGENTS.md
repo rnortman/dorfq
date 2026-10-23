@@ -41,6 +41,7 @@ gate never will.
 | `make build` | Build every target |
 | `make test` | Every test, without the lint aspects (the inner loop) |
 | `make run ARGS=...` | Build and run the `dorfq` binary |
+| `make sim ARGS=...` | Build and run the `dorfq-sim` simulator |
 | `make release` | Build the `dorfq` binary optimised |
 | `make fix` | rustfmt and buildifier the tree in place |
 | `make repin` | Re-render every crate hub's lock files |
@@ -156,6 +157,8 @@ moves only by fast-forward.
 - `make check` must pass: clippy with warnings denied, rustfmt, buildifier,
   every test.
 - No unused code. No backwards-compatibility shims.
+- Schedulers use ordered collections (`BTreeMap`, `BTreeSet`); `HashMap`'s
+  iteration order is per-process random and would break rule 4.
 - Default branch: `main`.
 
 ## TODO system

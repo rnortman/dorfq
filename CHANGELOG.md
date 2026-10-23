@@ -25,6 +25,30 @@ Notable changes to dorfq. Format follows
   requests included. Restrict who can label accordingly.
 - `make live-test`: exercises the GitHub forge end to end against a
   disposable repository whose name contains `scratch` or `playground`.
+- A `bayes` scheduler: keeps a probability that each queued pull request
+  breaks on its own and that a pair breaks only together, updates it
+  exactly from every run that failed or passed, chooses batches by expected
+  value against the cost of a run, runs suspects alone to find the culprit
+  while the chain keeps landing, and ejects a pull request only when a
+  failed run singles it out. If clusters of linked failures grow large
+  enough that its probabilities can no longer be computed precisely, it
+  stops the process rather than act on noise (see
+  `bayes-posterior-precision` in `TODO.md`).
+- A `bisect` scheduler: the conventional pipelined bisect. Batches run as one
+  chain, each on the previous one's tip; a failed batch is split in half and
+  the halves run next; no batch is built from pull requests already known
+  to fail together.
+- `dorfq-sim run --config <path> [--trace]`: a deterministic, seeded
+  simulator that runs schedulers against a world of pull requests whose
+  truth it knows (which break on their own, which pairs break only
+  together, which runs flake) on a fixed number of CI runners, and prints a
+  table comparing them: runner-hours per landed pull request, time to land
+  and to reject, wasted runner time, false ejections. Two policies at one
+  seed see the same arrivals and truths. `make sim` runs it; the shipped
+  example is `crates/dorfq-sim/examples/sim.toml`.
+- Scheduler configuration (`[scheduler]`, `kind = "all-at-once" | "bisect" |
+  "bayes"`) now lives in the scheduler crate and is shared by `dorfq` and the
+  simulator; out-of-range parameters are rejected by name.
 - `dorfq run --config <path>`: the first end-to-end loop. It reads a TOML
   configuration naming a forge (the service hosting the repository and its
   pull requests) and a scheduler (the part that decides what to batch, land

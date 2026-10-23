@@ -1,0 +1,468 @@
+use std::collections::BTreeMap;
+
+use dorfq_core::{BatchId, BatchStart, Ejection, PrNumber, Sha};
+
+use super::*;
+use dorfq_scheduler::BayesConfig;
+
+/// The shipped example configuration.
+const EXAMPLE: &str = include_str!("../examples/sim.toml");
+
+/// A world of a few hours and a handful of pull requests.
+fn small(p_bad: f64, p_interact: f64, p_flake: f64, p_conflict: f64) -> WorldConfig {
+    WorldConfig {
+        hours: 6,
+        drain_hours: 48,
+        arrivals_per_hour: 3.0,
+        runners: 2,
+        ci_minutes: CiMinutes { min: 20, max: 40 },
+        p_bad,
+        p_interact,
+        p_flake,
+        p_conflict,
+        repush_per_hour: 0.0,
+        withdraw_per_hour: 0.0,
+    }
+}
+
+/// [`small`] with every queued pull request re-pushed and withdrawn on
+/// clocks.
+fn churning(p_bad: f64, p_interact: f64, p_flake: f64) -> WorldConfig {
+    WorldConfig {
+        repush_per_hour: 0.3,
+        withdraw_per_hour: 0.1,
+        ..small(p_bad, p_interact, p_flake, 0.05)
+    }
+}
+
+fn bisect() -> SchedulerConfig {
+    SchedulerConfig::Bisect {
+        lanes: 2,
+        max_batch: 8,
+    }
+}
+
+/// `Bayes` at the example's parameters.
+fn bayes() -> SchedulerConfig {
+    SchedulerConfig::Bayes(BayesConfig {
+        lanes: 2,
+        max_batch: 24,
+        p_bad: 0.05,
+        p_interact: 0.002,
+        p_flake: 0.02,
+        run_cost: 0.5,
+        w_reject: 1.0,
+        eject_above: 0.9,
+        others_below: 0.1,
+        speculate_above: 0.0,
+    })
+}
+
+/// Runs to the end, asserting no failure, the world's invariants and the
+/// count identity.
+fn replicate_cleanly(config: &WorldConfig, scheduler: &SchedulerConfig, seed: u64) -> World {
+    let (world, outcome) = replicate(config, scheduler, seed, 0, None);
+    assert_eq!(outcome, Ok(()), "{scheduler:?}");
+    assert_eq!(world.check_invariants(), Ok(()), "{scheduler:?}");
+    let m = world.metrics();
+    let ejected = m.ejected_bad + m.ejected_good;
+    assert_eq!(m.arrived, m.landed + ejected + m.withdrawn + m.unfinished);
+    assert!(m.arrived > 5, "too few arrivals to say anything: {m:?}");
+    world
+}
+
+/// A forge that records the effects it is asked for, failing on one.
+#[derive(Default)]
+struct Recorder {
+    calls: Vec<&'static str>,
+    fail_on: Option<&'static str>,
+}
+
+impl Recorder {
+    fn call(&mut self, name: &'static str) -> Result<(), ForgeError> {
+        self.calls.push(name);
+        if self.fail_on == Some(name) {
+            return Err(ForgeError::Transient("refused".into()));
+        }
+        Ok(())
+    }
+}
+
+impl Forge for Recorder {
+    fn observe(&mut self) -> Result<Observation, ForgeError> {
+        unreachable!("execute never observes")
+    }
+
+    fn start_batch(&mut self, _: &BatchStart) -> Result<(), ForgeError> {
+        self.call("start")
+    }
+
+    fn land(&mut self, _: BatchId) -> Result<(), ForgeError> {
+        self.call("land")
+    }
+
+    fn retire(&mut self, _: BatchId) -> Result<(), ForgeError> {
+        self.call("retire")
+    }
+
+    fn eject(&mut self, _: PrNumber, _: &EjectReason) -> Result<(), ForgeError> {
+        self.call("eject")
+    }
+}
+
+fn full_plan(trunk: Sha) -> Plan {
+    Plan {
+        start: vec![BatchStart {
+            id: BatchId(3),
+            base: trunk,
+            prs: vec![PrNumber(1)],
+        }],
+        land: vec![BatchId(1)],
+        retire: vec![BatchId(2)],
+        eject: vec![Ejection {
+            pr: PrNumber(2),
+            reason: EjectReason::ConflictsWithTrunk,
+        }],
+    }
+}
+
+fn trunk() -> Sha {
+    Sha::parse(&format!("{:040x}", 1)).expect("hex")
+}
+
+#[test]
+fn a_plan_executes_in_rule_seven_order_and_stops_at_the_first_error() {
+    let mut forge = Recorder::default();
+    execute(&mut forge, &full_plan(trunk())).unwrap();
+    assert_eq!(forge.calls, ["land", "start", "eject", "retire"]);
+    let mut forge = Recorder {
+        fail_on: Some("start"),
+        ..Recorder::default()
+    };
+    assert!(execute(&mut forge, &full_plan(trunk())).is_err());
+    assert_eq!(forge.calls, ["land", "start"]);
+}
+
+/// Retires whatever it sees and starts the first queued pull request again.
+struct Restless {
+    next: u64,
+}
+
+impl Scheduler for Restless {
+    fn step(&mut self, o: &Observation) -> Plan {
+        let mut plan = Plan {
+            retire: o.batches.iter().map(|b| b.id).collect(),
+            ..Plan::default()
+        };
+        if let Some(pr) = o.prs.first() {
+            self.next += 1;
+            plan.start.push(BatchStart {
+                id: BatchId(self.next),
+                base: o.trunk.clone(),
+                prs: vec![pr.number],
+            });
+        }
+        plan
+    }
+}
+
+/// Never plans anything.
+struct Idle;
+
+impl Scheduler for Idle {
+    fn step(&mut self, _: &Observation) -> Plan {
+        Plan::default()
+    }
+}
+
+#[test]
+fn a_scheduler_that_never_settles_is_livelocked() {
+    let config = small(0.0, 0.0, 0.0, 0.0);
+    let mut world = World::new(config, Streams::for_replication(1, 0));
+    let outcome = drive(&mut world, &mut Restless { next: 0 }, u64::MAX, None);
+    let Err(SimError::Livelock { at }) = outcome else {
+        panic!("expected a livelock, got {outcome:?}");
+    };
+    assert!(at > 0, "the first pull request arrives after t=0");
+}
+
+#[test]
+fn a_scheduler_that_never_acts_on_a_conflicting_pull_request_is_stuck() {
+    let config = small(0.0, 0.0, 0.0, 1.0);
+    let mut world = World::new(config, Streams::for_replication(1, 0));
+    let outcome = drive(&mut world, &mut Idle, u64::MAX, None);
+    let Err(SimError::Stuck {
+        queued, tracked, ..
+    }) = outcome
+    else {
+        panic!("expected stuck, got {outcome:?}");
+    };
+    assert!(queued > 0);
+    assert_eq!(tracked, 0);
+}
+
+/// Starts a batch naming a pull request that never arrived.
+struct Rogue;
+
+impl Scheduler for Rogue {
+    fn step(&mut self, o: &Observation) -> Plan {
+        Plan {
+            start: vec![BatchStart {
+                id: BatchId(1),
+                base: o.trunk.clone(),
+                prs: vec![PrNumber(999)],
+            }],
+            ..Plan::default()
+        }
+    }
+}
+
+#[test]
+fn a_violating_plan_is_the_last_step_of_the_trace() {
+    let config = small(0.0, 0.0, 0.0, 0.0);
+    let mut world = World::new(config, Streams::for_replication(1, 0)).traced();
+    let mut lines = Vec::new();
+    let outcome = drive(&mut world, &mut Rogue, u64::MAX, Some(&mut lines));
+    let Err(SimError::Violation { at: 0, message }) = outcome else {
+        panic!("expected a violation at t=0, got {outcome:?}");
+    };
+    assert!(message.contains("pr 999"), "{message}");
+    let last = lines.last().expect("a step line");
+    assert!(
+        last.starts_with("t=0 ") && last.contains("start 1[999]@1 "),
+        "{last}"
+    );
+}
+
+#[test]
+fn a_replication_cut_off_at_the_deadline_counts_its_unfinished_work() {
+    // One runner and long runs leave work queued when the drain is 0.
+    let config = WorldConfig {
+        drain_hours: 0,
+        runners: 1,
+        ci_minutes: CiMinutes { min: 90, max: 120 },
+        ..small(0.1, 0.0, 0.0, 0.0)
+    };
+    let deadline = config.hours * HOUR;
+    let world = replicate_cleanly(&config, &bisect(), 1);
+    let m = world.metrics();
+    assert!(m.unfinished > 0, "{m:?}");
+    assert_eq!(world.now(), deadline);
+    assert!(world.runs().iter().all(|r| r.started_at <= deadline));
+    // Seed-pinned: a run is still on the runner at the deadline, and its
+    // elapsed time is charged.
+    let finished: u64 = world.runs().iter().map(|r| r.consumed).sum();
+    assert!(m.runner_hours * HOUR as f64 > finished as f64, "{m:?}");
+}
+
+#[test]
+fn an_empty_world_drains_at_once() {
+    let mut config = small(0.0, 0.0, 0.0, 0.0);
+    config.arrivals_per_hour = 0.0;
+    let metrics = run(&config, &bisect(), 1, 0, None).unwrap();
+    assert_eq!(metrics.arrived, 0);
+    assert_eq!(metrics.runner_hours_per_landed, None);
+}
+
+#[test]
+fn one_seed_and_one_policy_give_identical_metrics_records_and_traces() {
+    let config = small(0.1, 0.01, 0.05, 0.05);
+    let traced = || {
+        let mut lines = Vec::new();
+        let (world, outcome) = replicate(&config, &bisect(), 7, 0, Some(&mut lines));
+        assert_eq!(outcome, Ok(()));
+        let records = (world.metrics(), world.pr_records(), world.runs().to_vec());
+        (records, lines)
+    };
+    let (first, first_trace) = traced();
+    let (second, second_trace) = traced();
+    assert_eq!(first, second);
+    assert_eq!(first_trace, second_trace);
+    assert!(first_trace.iter().any(|l| l.starts_with("t=0 ")));
+    assert!(first_trace.iter().any(|l| l.starts_with("arrive ")));
+    assert!(first_trace.iter().any(|l| l.starts_with("ci ")));
+}
+
+#[test]
+fn two_policies_at_one_seed_see_identical_arrivals_and_truths() {
+    let config = small(0.2, 0.01, 0.05, 0.1);
+    let (floor, _) = replicate(&config, &SchedulerConfig::AllAtOnce {}, 5, 0, None);
+    let (bisect, _) = replicate(&config, &bisect(), 5, 0, None);
+    assert!(floor.truths().len() > 5);
+    assert_eq!(floor.truths(), bisect.truths());
+}
+
+#[test]
+fn simulate_reports_every_policy_at_every_replication() {
+    let mut config = SimConfig::parse(EXAMPLE).unwrap();
+    config.world = small(0.1, 0.01, 0.02, 0.02);
+    config.replications = 2;
+    let report = simulate(&config, true);
+    let names: Vec<&str> = report.policies.iter().map(|p| p.name.as_str()).collect();
+    let expected: Vec<&str> = config.policy.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, expected);
+    assert!(!report.failed(), "{report}");
+    for policy in &report.policies {
+        assert_eq!(policy.replications.len(), 2);
+        assert!(policy.trace.iter().any(|l| l.starts_with("t=0 ")));
+    }
+    let untraced = simulate(&config, false);
+    assert!(untraced.policies.iter().all(|p| p.trace.is_empty()));
+}
+
+#[test]
+fn all_at_once_ejects_every_member_of_a_failed_batch() {
+    // Seed-pinned: at this seed some failing batch holds a pull request
+    // that interacts with nothing, so the floor ejects a good one.
+    let config = small(0.0, 0.05, 0.0, 0.0);
+    let world = replicate_cleanly(&config, &SchedulerConfig::AllAtOnce {}, 3);
+    let exits: BTreeMap<PrNumber, Option<(u64, Exit)>> = world
+        .pr_records()
+        .into_iter()
+        .map(|r| (r.number, r.left))
+        .collect();
+    let failed: Vec<&RunRecord> = world
+        .runs()
+        .iter()
+        .filter(|r| r.verdict == Some(CiStatus::Failed))
+        .collect();
+    assert!(!failed.is_empty(), "no batch failed at this seed");
+    for run in failed {
+        // Every all-at-once batch is built on trunk, so its tree beyond
+        // trunk is its own members.
+        assert_eq!(run.tree.len(), run.members);
+        for pr in &run.tree {
+            assert!(
+                matches!(exits[pr], Some((_, Exit::Ejected { .. }))),
+                "pr {} of failed batch {} is {:?}",
+                pr.0,
+                run.batch.0,
+                exits[pr]
+            );
+        }
+    }
+    assert!(world.metrics().ejected_good > 0, "{:?}", world.metrics());
+}
+
+#[test]
+fn bisect_lands_every_good_and_ejects_every_bad_pull_request_without_flakes() {
+    // An invariant in this world: with no flakes or interactions a
+    // singleton fails only when it is bad, and a chain child's failure is
+    // read as its own only once everything beneath it passed.
+    for seed in 1..=4 {
+        let config = small(0.2, 0.0, 0.0, 0.1);
+        let world = replicate_cleanly(&config, &bisect(), seed);
+        let m = world.metrics();
+        assert_eq!(
+            (m.ejected_good, m.unfinished, m.withdrawn),
+            (0, 0, 0),
+            "{m:?}"
+        );
+        assert!(m.landed > 0 && m.ejected_bad > 0, "{m:?}");
+    }
+}
+
+#[test]
+fn bisect_lands_every_good_pull_request_beside_interacting_pairs_without_flakes() {
+    // An invariant without flakes or churn: a singleton read as its own
+    // failure fails only when it is bad or interacts with a pull request
+    // beneath it or on trunk, so every ejection is justified. Draining is
+    // seed-specific: the 48-hour drain is ample for six hours of arrivals.
+    for seed in 1..=4 {
+        let config = small(0.05, 0.05, 0.0, 0.0);
+        let world = replicate_cleanly(&config, &bisect(), seed);
+        let m = world.metrics();
+        assert_eq!((m.ejected_good, m.unfinished), (0, 0), "{m:?}");
+        assert!(m.landed > 0 && m.ejected_bad > 0, "{m:?}");
+    }
+}
+
+#[test]
+fn every_policy_runs_cleanly_under_repushes_and_withdrawals() {
+    for seed in 1..=4 {
+        let config = churning(0.1, 0.02, 0.05);
+        for scheduler in [SchedulerConfig::AllAtOnce {}, bisect(), bayes()] {
+            let world = replicate_cleanly(&config, &scheduler, seed);
+            assert!(world.metrics().withdrawn > 0, "{:?}", world.metrics());
+        }
+    }
+}
+
+/// Asserts that every `BatchFailed` ejection names a run that had completed
+/// `Failed` by the moment of the ejection and whose tree held the ejected
+/// pull request. Returns how many ejections it checked.
+fn assert_ejections_name_failed_runs_of_their_tree(world: &World) -> usize {
+    let runs: BTreeMap<BatchId, &RunRecord> = world.runs().iter().map(|r| (r.batch, r)).collect();
+    let mut checked = 0;
+    for record in world.pr_records() {
+        let Some((at, Exit::Ejected { reason, .. })) = &record.left else {
+            continue;
+        };
+        let EjectReason::BatchFailed { batch } = reason else {
+            continue;
+        };
+        let run = runs.get(batch).unwrap_or_else(|| {
+            panic!(
+                "pr {} names batch {}, which never ran",
+                record.number.0, batch.0
+            )
+        });
+        assert_eq!(run.verdict, Some(CiStatus::Failed), "{run:?}");
+        assert!(
+            run.started_at + run.consumed <= *at,
+            "pr {} ejected at {at} naming {run:?}, which had not completed",
+            record.number.0
+        );
+        assert!(
+            run.tree.contains(&record.number),
+            "pr {} is not in the tree of {run:?}",
+            record.number.0
+        );
+        checked += 1;
+    }
+    checked
+}
+
+/// [`small`] with flakes and nothing else wrong.
+fn flaky() -> WorldConfig {
+    WorldConfig {
+        hours: 24,
+        ..small(0.0, 0.0, 0.05, 0.0)
+    }
+}
+
+#[test]
+fn bayes_ejects_only_members_of_failed_runs_it_names_in_a_flake_free_world() {
+    let config = small(0.2, 0.0, 0.0, 0.1);
+    let world = replicate_cleanly(&config, &bayes(), 1);
+    assert!(assert_ejections_name_failed_runs_of_their_tree(&world) > 0);
+    let m = world.metrics();
+    assert!(m.landed > 0 && m.ejected_bad > 0, "{m:?}");
+    // Seed-pinned, not an invariant of `Bayes`: a good pull request that
+    // keeps failing beside distinct bad ones can be singled out.
+    assert_eq!(m.ejected_good, 0, "{m:?}");
+}
+
+#[test]
+fn bayes_ejects_no_good_pull_request_where_bisect_does_in_a_flaky_world() {
+    let config = flaky();
+    let world = replicate_cleanly(&config, &bayes(), 1);
+    assert_ejections_name_failed_runs_of_their_tree(&world);
+    let m = world.metrics();
+    assert!(m.landed > 0, "{m:?}");
+    // Seed-pinned comparison, not an invariant: `Bayes` ejects a good pull
+    // request when two lone runs of it flake, `Bisect` when one does.
+    assert_eq!(m.ejected_good, 0, "{m:?}");
+    let baseline = replicate_cleanly(&config, &bisect(), 1).metrics();
+    assert!(baseline.ejected_good > 0, "{baseline:?}");
+}
+
+#[test]
+fn every_policy_in_the_example_world_runs_one_replication_cleanly() {
+    let config = SimConfig::parse(EXAMPLE).unwrap();
+    for policy in &config.policy {
+        let (world, outcome) = replicate(&config.world, &policy.scheduler, config.seed, 0, None);
+        assert_eq!(outcome, Ok(()), "policy {}", policy.name);
+        assert_eq!(world.check_invariants(), Ok(()), "policy {}", policy.name);
+    }
+}

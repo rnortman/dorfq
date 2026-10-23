@@ -7,10 +7,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use dorfq_forge_github::Settings;
+use dorfq_scheduler::SchedulerConfig;
 use serde::Deserialize;
 
-/// A loaded configuration, with every path resolved.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// A loaded configuration, with every path resolved and the scheduler's
+/// parameters validated.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub forge: ForgeConfig,
@@ -46,14 +48,6 @@ pub enum ForgeConfig {
         /// The environment variable holding the token; never the token.
         token_env: String,
     },
-}
-
-/// The scheduler to build.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum SchedulerConfig {
-    /// The stub that batches every ready pull request at once.
-    AllAtOnce {},
 }
 
 /// How the driver loop runs.
@@ -112,9 +106,14 @@ impl Config {
         })
     }
 
-    /// Parses configuration text, resolving relative paths against `dir`.
+    /// Parses configuration text, validates the scheduler's parameters, and
+    /// resolves relative paths against `dir`.
     fn parse(text: &str, dir: &Path) -> Result<Config, String> {
         let mut config: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+        config
+            .scheduler
+            .validate()
+            .map_err(|e| format!("scheduler: {e}"))?;
         match &mut config.forge {
             ForgeConfig::Mock { scenario } => {
                 let resolved = dir.join(scenario.as_path());
@@ -338,6 +337,16 @@ tick_millis = 60000
         let text = GITHUB.replace("label = \"queue\"", "label = \"queue\"\ntoken = \"x\"");
         let message = rejected(&text);
         assert!(message.contains("token"), "{message}");
+    }
+
+    #[test]
+    fn out_of_range_scheduler_parameter_is_rejected_by_name() {
+        let text = VALID.replace(
+            "kind = \"all-at-once\"",
+            "kind = \"bisect\"\nlanes = 0\nmax_batch = 4",
+        );
+        let message = rejected(&text);
+        assert!(message.contains("lanes"), "{message}");
     }
 
     #[test]
