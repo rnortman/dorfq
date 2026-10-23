@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 dorfq-core = { path = "../dorfq-core" }
+dorfq-forge-github = { path = "../dorfq-forge-github" }
 dorfq-forge-mock = { path = "../dorfq-forge-mock" }
 dorfq-scheduler = { path = "../dorfq-scheduler" }
 serde = { workspace = true }

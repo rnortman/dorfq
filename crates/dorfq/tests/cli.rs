@@ -148,3 +148,45 @@ fn exit_when_idle_waits_for_a_later_arrival() {
     let last = stdout.lines().last().expect("a trace");
     assert!(last.ends_with("| idle"), "last line {last:?}");
 }
+
+#[test]
+fn github_with_unset_token_variable_exits_one_naming_it() {
+    let var = "DORFQ_CLI_TEST_TOKEN_THAT_IS_NEVER_SET";
+    exits_one_naming_token_variable(var, "github-unset-token.toml", |command| {
+        command.env_remove(var);
+    });
+}
+
+#[test]
+fn github_with_empty_token_variable_exits_one_naming_it() {
+    let var = "DORFQ_CLI_TEST_TOKEN_THAT_IS_EMPTY";
+    exits_one_naming_token_variable(var, "github-empty-token.toml", |command| {
+        command.env(var, "");
+    });
+}
+
+/// Runs `dorfq run` on a `github` configuration whose token is read from
+/// `var`, with an `api_base` nothing listens on, and expects exit 1, no
+/// stdout, and `var` named on stderr.
+fn exits_one_naming_token_variable(var: &str, file: &str, set_token: impl FnOnce(&mut Command)) {
+    let dir = PathBuf::from(std::env::var("TEST_TMPDIR").expect("TEST_TMPDIR under bazel test"));
+    let config = dir.join(file);
+    fs::write(
+        &config,
+        format!(
+            "[forge]\nkind = \"github\"\napi_base = \"https://127.0.0.1:1\"\n\
+             owner = \"alice\"\nrepo = \"widgets\"\ntrunk = \"main\"\nlabel = \"queue\"\n\
+             checks = [\"check\"]\ntoken_env = \"{var}\"\n\n\
+             [scheduler]\nkind = \"all-at-once\"\n\n[driver]\ntick_millis = 0\n"
+        ),
+    )
+    .expect("write config");
+    let mut command = Command::new(env!("DORFQ_BIN"));
+    command.args(["run", "--config"]).arg(&config);
+    set_token(&mut command);
+    let output = command.output().expect("spawn dorfq");
+    assert_eq!(output.status.code(), Some(1), "dorfq run: {output:?}");
+    assert!(output.stdout.is_empty(), "dorfq run: {output:?}");
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(stderr.contains(var), "stderr: {stderr:?}");
+}

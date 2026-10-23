@@ -5,6 +5,7 @@ VERSION = "0.0.0"
 
 WORKSPACE_DEPS = [
     "//crates/dorfq-core:dorfq_core",
+    "//crates/dorfq-forge-github:dorfq_forge_github",
     "//crates/dorfq-forge-mock:dorfq_forge_mock",
     "//crates/dorfq-scheduler:dorfq_scheduler",
 ]
@@ -39,7 +40,10 @@ rust_binary(
 rust_test(
     name = "dorfq_lib_test",
     size = "small",
-    compile_data = ["examples/scenario.toml"],
+    compile_data = [
+        "examples/github.toml",
+        "examples/scenario.toml",
+    ],
     crate = ":dorfq_lib",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     version = VERSION,

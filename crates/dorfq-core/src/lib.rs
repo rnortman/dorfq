@@ -76,6 +76,12 @@
 //!    reason, and leaving the queue by neither. The scheduler decides the
 //!    ejection reason and nothing else about messaging; nothing about
 //!    messages crosses the boundary.
+//!
+//! Forges enforce rules 5 and 6 through [`ledger::Ledger`], which holds the
+//! latest observation and the effects performed since it, so every forge
+//! judges knownness by the same code.
+
+pub mod ledger;
 
 use std::error::Error;
 use std::fmt;

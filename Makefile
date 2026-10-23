@@ -1,7 +1,7 @@
 # Repo-root Makefile: a frontend to Bazel, the check gate, and hook wiring.
 #
 # Bazel is the build. Every recipe here is a spelled-out Bazel invocation (or
-# git plumbing), so `check` is one definition that the pre-commit hook and CI
+# git plumbing, or `local-deploy`'s install and systemctl), so `check` is one definition that the pre-commit hook and CI
 # both run, reproducible on a fresh clone with nothing installed but bazelisk.
 
 # Recipes run under bash with -e and pipefail, so a failing command anywhere in a
@@ -21,7 +21,9 @@ help:
 	@echo "  make build         build every target"
 	@echo "  make test          run every test, without the lint aspects"
 	@echo "  make run           run the dorfq binary (ARGS=... for arguments)"
+	@echo "  make live-test     run the GitHub forge against a disposable repository (DORFQ_GITHUB_TOKEN, DORFQ_LIVE_REPO)"
 	@echo "  make release       build the dorfq binary optimised"
+	@echo "  make local-deploy  install the optimised binary to ~/.local/bin and restart the user unit if running"
 	@echo "  make fix           rustfmt and buildifier the tree in place"
 	@echo "  make repin         re-render every crate hub's lock files after a Cargo.toml change or scrub bump"
 	@echo "  make ide           write rust-project.json for rust-analyzer"
@@ -56,9 +58,25 @@ ARGS ?=
 run:
 	bazel run //crates/dorfq -- $(ARGS)
 
+# The live lane: the GitHub forge against a real, disposable repository whose
+# name contains "scratch" or "playground". Not part of `check`: it needs the network and a
+# token, which `bazel run` leaves to the operator's environment.
+.PHONY: live-test
+live-test:
+	bazel run //crates/dorfq-forge-github:live
+
 .PHONY: release
 release:
 	bazel build --config=release //crates/dorfq
+
+# Installs the optimised binary where the example user unit expects it and
+# restarts the unit if it is running. Restarting is safe at any point: the
+# queue recovers its state from the repository on the next observation.
+.PHONY: local-deploy
+local-deploy:
+	bazel build --config=release //crates/dorfq
+	install -D "$$(bazel cquery --config=release --output=files //crates/dorfq)" ~/.local/bin/dorfq
+	systemctl --user try-restart dorfq
 
 # Scoped to what `check` enforces that has a fixer, so `make fix && make check`
 # is a clean cycle. Clippy findings are fixed by hand.

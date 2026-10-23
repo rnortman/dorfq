@@ -129,6 +129,25 @@ landing removes nothing.
 A new field or variant in the contract is a coordinated change of
 `dorfq-core` and both sides, landed on `main` before either builds on it.
 
+## GitHub layout
+
+The GitHub forge (`crates/dorfq-forge-github`) keeps every piece of queue
+state in the repository it serves, so a restarted process recovers from one
+observation. These names are the queue's:
+
+| Name | What it is |
+|---|---|
+| the configured label | intent: an open pull request against trunk carrying it is enqueued |
+| `refs/heads/dorfq/batch/<id>` | a tracked batch's tip; exists from the end of a successful build until `retire`; CI must run on pushes to it |
+| `refs/heads/dorfq/build/<id>` | the branch a batch's merges are made on; exists only during `start_batch` |
+| `refs/heads/dorfq/probe/<id>` | the branch conflict attribution uses; exists only during `start_batch` |
+| `refs/dorfq/batches/<id>` | the batch's record, a commit whose message is the record text |
+
+`<id>` is the decimal batch id. While the queue runs, nobody pushes to,
+deletes or creates anything under `dorfq/` or `refs/dorfq/` by hand: the
+forge reads a foreign or moved ref there as `Permanent` and stops. Trunk
+moves only by fast-forward.
+
 ## Code standards
 
 - Rust edition 2024, the pinned stable toolchain. The edition is set once

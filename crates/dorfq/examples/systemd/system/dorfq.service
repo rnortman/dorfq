@@ -1,0 +1,26 @@
+# dorfq as a systemd system service. Install as
+# /etc/systemd/system/dorfq.service, with
+#   /usr/local/bin/dorfq                the binary from `make release`
+#   /etc/dorfq/dorfq.toml               the configuration (see ../../github.toml)
+#   /etc/dorfq/token.env                DORFQ_GITHUB_TOKEN=<token>, mode 0600
+# then `systemctl enable --now dorfq`. Every piece of queue state lives in
+# the repository, so the service runs as a throwaway user with no files of
+# its own; systemd reads the token file as root before dropping to it.
+#
+# dorfq exits only on a Permanent error, which a restart does not cure; the
+# delay keeps a restart loop slow while the cause is found.
+
+[Unit]
+Description=dorfq merge queue
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/dorfq run --config /etc/dorfq/dorfq.toml
+EnvironmentFile=/etc/dorfq/token.env
+DynamicUser=yes
+Restart=on-failure
+RestartSec=5min
+
+[Install]
+WantedBy=multi-user.target

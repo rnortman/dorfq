@@ -1,0 +1,22 @@
+# dorfq as a systemd user service, for running a queue from a login account.
+# Install as ~/.config/systemd/user/dorfq.service, with
+#   ~/.local/bin/dorfq                  the binary from `make release`
+#   ~/.config/dorfq/dorfq.toml          the configuration (see ../../github.toml)
+#   ~/.config/dorfq/token.env           DORFQ_GITHUB_TOKEN=<token>, mode 0600
+# then `systemctl --user enable --now dorfq`. To keep it running while logged
+# out: `loginctl enable-linger`.
+#
+# dorfq exits only on a Permanent error, which a restart does not cure; the
+# delay keeps a restart loop slow while the cause is found.
+
+[Unit]
+Description=dorfq merge queue
+
+[Service]
+ExecStart=%h/.local/bin/dorfq run --config %h/.config/dorfq/dorfq.toml
+EnvironmentFile=%h/.config/dorfq/token.env
+Restart=on-failure
+RestartSec=5min
+
+[Install]
+WantedBy=default.target

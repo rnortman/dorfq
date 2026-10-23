@@ -1,0 +1,34 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+rust_library(
+    name = "dorfq_forge_github",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/bin/**"],
+    ),
+    crate_root = "src/lib.rs",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True) + ["//crates/dorfq-core:dorfq_core"],
+)
+
+rust_test(
+    name = "dorfq_forge_github_test",
+    size = "small",
+    crate = ":dorfq_forge_github",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+# The live lane against a disposable GitHub repository: `make live-test`.
+# Built by `make check`, run only by hand; it needs the network and a token.
+rust_binary(
+    name = "live",
+    srcs = ["src/bin/live.rs"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        ":dorfq_forge_github",
+        "//crates/dorfq-core:dorfq_core",
+    ],
+)

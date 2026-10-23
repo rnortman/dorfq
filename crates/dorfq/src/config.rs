@@ -6,6 +6,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use dorfq_forge_github::Settings;
 use serde::Deserialize;
 
 /// A loaded configuration, with every path resolved.
@@ -26,6 +27,24 @@ pub enum ForgeConfig {
         /// The scenario file; relative paths are resolved against the
         /// configuration file's directory at load.
         scenario: PathBuf,
+    },
+    /// A GitHub repository, through the REST API.
+    #[serde(rename = "github")]
+    GitHub {
+        /// `https://api.github.com`, or `https://<host>/api/v3` for GitHub
+        /// Enterprise.
+        api_base: String,
+        owner: String,
+        repo: String,
+        /// The branch the queue lands on.
+        trunk: String,
+        /// The intent label.
+        label: String,
+        /// The check names that must pass, on pull request heads and batch
+        /// tips.
+        checks: Vec<String>,
+        /// The environment variable holding the token; never the token.
+        token_env: String,
     },
 }
 
@@ -100,6 +119,33 @@ impl Config {
             ForgeConfig::Mock { scenario } => {
                 let resolved = dir.join(scenario.as_path());
                 *scenario = resolved;
+            }
+            ForgeConfig::GitHub {
+                api_base,
+                owner,
+                repo,
+                trunk,
+                label,
+                checks,
+                token_env,
+            } => {
+                if !api_base.starts_with("https://") {
+                    return Err(format!(
+                        "forge.api_base {api_base:?} is not an https:// URL"
+                    ));
+                }
+                for (field, value) in [("owner", owner), ("repo", repo), ("token_env", token_env)] {
+                    if value.is_empty() {
+                        return Err(format!("forge.{field} is empty"));
+                    }
+                }
+                Settings {
+                    trunk: trunk.clone(),
+                    label: label.clone(),
+                    checks: checks.clone(),
+                }
+                .validate()
+                .map_err(|problem| format!("forge.{problem}"))?;
             }
         }
         Ok(config)
@@ -190,6 +236,108 @@ tick_millis = 0
         assert!(message.contains("kind"), "{message}");
         let message = rejected(&VALID.replace("[driver]\ntick_millis = 0", ""));
         assert!(message.contains("driver"), "{message}");
+    }
+
+    const GITHUB: &str = r#"
+[forge]
+kind = "github"
+api_base = "https://api.github.com"
+owner = "alice"
+repo = "dorfq"
+trunk = "main"
+label = "queue"
+checks = ["check"]
+token_env = "DORFQ_GITHUB_TOKEN"
+
+[scheduler]
+kind = "all-at-once"
+
+[driver]
+tick_millis = 60000
+"#;
+
+    #[test]
+    fn github_configuration_parses() {
+        let config = Config::parse(GITHUB, Path::new("conf")).unwrap();
+        assert_eq!(
+            config.forge,
+            ForgeConfig::GitHub {
+                api_base: "https://api.github.com".to_owned(),
+                owner: "alice".to_owned(),
+                repo: "dorfq".to_owned(),
+                trunk: "main".to_owned(),
+                label: "queue".to_owned(),
+                checks: vec!["check".to_owned()],
+                token_env: "DORFQ_GITHUB_TOKEN".to_owned(),
+            }
+        );
+        assert_eq!(config.driver, DriverConfig { tick_millis: 60000 });
+    }
+
+    #[test]
+    fn shipped_github_example_parses() {
+        let text = include_str!("../examples/github.toml");
+        let config = Config::parse(text, Path::new("")).unwrap();
+        assert!(matches!(config.forge, ForgeConfig::GitHub { .. }));
+    }
+
+    #[test]
+    fn github_missing_field_is_rejected_naming_it() {
+        for field in [
+            "api_base",
+            "owner",
+            "repo",
+            "trunk",
+            "label",
+            "checks",
+            "token_env",
+        ] {
+            let text: String = GITHUB
+                .lines()
+                .filter(|line| !line.starts_with(&format!("{field} =")))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            let message = rejected(&text);
+            assert!(message.contains(field), "{field}: {message}");
+        }
+    }
+
+    #[test]
+    fn github_empty_field_is_rejected_naming_it() {
+        for (field, value) in [
+            ("owner", "\"alice\""),
+            ("repo", "\"dorfq\""),
+            ("trunk", "\"main\""),
+            ("label", "\"queue\""),
+            ("token_env", "\"DORFQ_GITHUB_TOKEN\""),
+        ] {
+            let text = GITHUB.replace(&format!("{field} = {value}"), &format!("{field} = \"\""));
+            let message = rejected(&text);
+            assert_eq!(message, format!("forge.{field} is empty"));
+        }
+    }
+
+    #[test]
+    fn github_plain_http_base_is_rejected() {
+        let text = GITHUB.replace("https://api.github.com", "http://api.github.com");
+        let message = rejected(&text);
+        assert!(message.contains("forge.api_base"), "{message}");
+        assert!(message.contains("http://api.github.com"), "{message}");
+    }
+
+    #[test]
+    fn github_empty_checks_are_rejected() {
+        let message = rejected(&GITHUB.replace("[\"check\"]", "[]"));
+        assert_eq!(message, "forge.checks names no check");
+        let message = rejected(&GITHUB.replace("[\"check\"]", "[\"check\", \"\"]"));
+        assert_eq!(message, "forge.checks[1] is empty");
+    }
+
+    #[test]
+    fn github_unknown_field_is_rejected() {
+        let text = GITHUB.replace("label = \"queue\"", "label = \"queue\"\ntoken = \"x\"");
+        let message = rejected(&text);
+        assert!(message.contains("token"), "{message}");
     }
 
     #[test]

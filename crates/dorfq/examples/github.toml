@@ -1,0 +1,24 @@
+# The GitHub forge on one repository, polled once a minute, with the
+# all-at-once stub scheduler. Set `owner` and `repo` to the repository the
+# queue serves (for dorfq itself, the owner and name in the `repository` URL
+# of the workspace Cargo.toml), export the token in DORFQ_GITHUB_TOKEN, then
+# from the repository root run
+#   make run ARGS="run --config $PWD/crates/dorfq/examples/github.toml"
+# The operator steps (label, token permissions, CI on batch branches) are in
+# README.md, "Running against GitHub".
+
+[forge]
+kind = "github"
+api_base = "https://api.github.com"   # GitHub Enterprise: https://<host>/api/v3
+owner = "example-owner"
+repo = "dorfq"
+trunk = "main"
+label = "queue"
+checks = ["check"]                    # required check names on heads and batch tips
+token_env = "DORFQ_GITHUB_TOKEN"      # the environment variable holding the token
+
+[scheduler]
+kind = "all-at-once"
+
+[driver]
+tick_millis = 60000
