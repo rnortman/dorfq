@@ -1,0 +1,47 @@
+# Bazel flags for this repo. bzlmod only; there is no WORKSPACE file.
+
+# --- Correctness posture ---
+build --spawn_strategy=sandboxed
+# The one exception: a test tagged no-sandbox runs locally. //:buildifier_test
+# is that test; it walks the whole workspace, which no sandbox can show it.
+test --strategy=TestRunner=sandboxed,local
+build --incompatible_strict_action_env
+# No network for build and test actions. A target that genuinely needs the
+# network is tagged `requires-network`, and there should be none.
+build --sandbox_default_allow_network=false
+common --incompatible_disallow_empty_glob
+test --test_output=errors
+test --test_summary=terse
+common --test_env=RUST_BACKTRACE=1
+# Local default refreshes the module lockfile; CI overrides with
+# --lockfile_mode=error so resolution drift is a red build there.
+common --lockfile_mode=update
+
+# --- Caching ---
+# `common`, so a `common --disk_cache` in .bazelrc.user replaces it.
+common --disk_cache=~/.cache/dorfq-bazel-disk
+common --experimental_disk_cache_gc_max_size=10G
+common --experimental_disk_cache_gc_max_age=30d
+
+# --- Rust ---
+# The repo's own formatter and linter configuration, for the aspects and for
+# the runners alike (rules_rust otherwise uses its own .rustfmt.toml).
+build --@rules_rust//rust/settings:rustfmt.toml=//:rustfmt.toml
+build --@rules_rust//rust/settings:clippy.toml=//:clippy.toml
+# The lint lanes, as aspects over whatever targets are asked for. Behind a
+# config so an inner-loop build does not pay for them; `make check` turns
+# them on. Warnings are denied: a warning the gate tolerates is a warning
+# nobody reads.
+build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect,@rules_rust//rust:defs.bzl%rustfmt_aspect
+build:lint --output_groups=+clippy_checks,+rustfmt_checks
+build:lint --@rules_rust//rust/settings:clippy_flags=-Dwarnings
+
+# --- Release ---
+build:release --compilation_mode=opt
+
+# Per-developer flags, gitignored. Imported last, so a line there overrides a
+# line here for the same command; a `common` line there does not override a
+# `build` or `test` line here, because Bazel applies every `common` line before
+# any `build` line. The home rc (~/.bazelrc) is read after this whole file,
+# under the same rule.
+try-import %workspace%/.bazelrc.user

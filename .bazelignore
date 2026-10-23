@@ -1,0 +1,10 @@
+# Directories Bazel never looks inside. Wildcards are not supported here, so
+# every path is spelled out: the convenience symlinks (which point into the
+# output base and would otherwise be globbed recursively) and any cargo tree an
+# IDE leaves behind.
+.git
+bazel-bin
+bazel-out
+bazel-testlogs
+bazel-dorfq
+target

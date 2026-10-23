@@ -1,0 +1,135 @@
+"""dorfq's Bazel module graph.
+
+Third-party Rust dependencies are not declared here: `crate.from_cargo` reads
+`Cargo.toml` + `Cargo.lock`, which stay the single source of truth for versions
+and features. What lives here is the toolchain set, all of it pinned and
+fetched by checksum, so a build needs nothing from the host but bazelisk.
+"""
+
+module(name = "dorfq")
+
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_rust", version = "0.74.0")
+bazel_dep(name = "rules_shell", version = "0.8.0")
+
+bazel_dep(name = "buildifier_prebuilt", version = "10.1.0", dev_dependency = True)
+
+# --- Rust toolchain -------------------------------------------------------
+# Pinned exactly. rust-toolchain.toml states the same version for the tools
+# that run outside Bazel (rust-analyzer); //tools/pins:pins_test holds the
+# two equal. `rustfmt_version` is stated because the extension otherwise
+# defaults it to a nightly, which would give the lint aspect a different
+# formatter from the one the write-time hook runs.
+RUST_VERSION = "1.98.0"
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    rustfmt_version = RUST_VERSION,
+    versions = [RUST_VERSION],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# --- Third-party crates ---------------------------------------------------
+# `cargo-bazel-lock.json` is the rendered, reproducible view of Cargo.lock.
+# Re-pin after any dependency change with `make repin`.
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    lockfile = "//:cargo-bazel-lock.json",
+    manifests = ["//:Cargo.toml"],
+)
+
+# brenn-scrub, from crates.io, in a hub of its own: a build tool nothing links
+# must not join the workspace hub's feature unification. `repositories` is
+# required, not optional: a crate.spec without it applies to every hub in the
+# module. Pinned by the two files under tools/scrub; `make repin` re-renders
+# both hubs (CARGO_BAZEL_REPIN applies to every hub this extension declares).
+crate.spec(
+    package = "brenn-scrub",
+    repositories = ["scrub_crates"],
+    version = "=0.2.0",
+)
+crate.annotation(
+    crate = "brenn-scrub",
+    gen_binaries = ["brenn-scrub"],
+    repositories = ["scrub_crates"],
+)
+crate.from_specs(
+    name = "scrub_crates",
+    cargo_lockfile = "//tools/scrub:Cargo.lock",
+    lockfile = "//tools/scrub:cargo-bazel-lock.json",
+)
+use_repo(crate, "crates", "scrub_crates")
+
+# --- gitleaks -------------------------------------------------------------
+# The release brenn-scrub 0.2.0 pins. brenn-scrub refuses any other gitleaks
+# version, so this moves together with the crate.spec above.
+GITLEAKS_VERSION = "8.30.0"
+
+GITLEAKS_SHA256_X86_64 = "79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e"
+
+GITLEAKS_SHA256_AARCH64 = "b4cbbb6ddf7d1b2a603088cd03a4e3f7ce48ee7fd449b51f7de6ee2906f5fa2f"
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "gitleaks_x86_64_linux",
+    build_file = "//tools/scrub:gitleaks.BUILD.bazel",
+    sha256 = GITLEAKS_SHA256_X86_64,
+    url = "https://github.com/gitleaks/gitleaks/releases/download/v" + GITLEAKS_VERSION +
+          "/gitleaks_" + GITLEAKS_VERSION + "_linux_x64.tar.gz",
+)
+
+http_archive(
+    name = "gitleaks_aarch64_linux",
+    build_file = "//tools/scrub:gitleaks.BUILD.bazel",
+    sha256 = GITLEAKS_SHA256_AARCH64,
+    url = "https://github.com/gitleaks/gitleaks/releases/download/v" + GITLEAKS_VERSION +
+          "/gitleaks_" + GITLEAKS_VERSION + "_linux_arm64.tar.gz",
+)
+
+# --- Hermetic C toolchain -------------------------------------------------
+# rustc links through a C toolchain, and Bazel's auto-detected host gcc puts
+# machine-specific facts into every action key. A pinned LLVM release plus a
+# pinned Debian sysroot makes the build byte-identical across machines and
+# keeps the host compiler out of it. The sysroot is Chromium's bullseye amd64
+# sysroot (glibc 2.31): binaries link against it and run on any newer glibc.
+# `dev_dependency`: registration is unconditional, and a module depending on
+# this one brings its own toolchain.
+bazel_dep(name = "toolchains_llvm", version = "1.12.0", dev_dependency = True)
+
+sysroot = use_repo_rule("@toolchains_llvm//toolchain:sysroot.bzl", "sysroot")
+
+sysroot(
+    name = "org_chromium_sysroot_linux_x64",
+    dev_dependency = True,
+    sha256 = "52d61d4446ffebfaa3dda2cd02da4ab4876ff237853f46d273e7f9b666652e1d",
+    # Chromium serves each sysroot tarball under its own sha256, no filename.
+    urls = ["https://commondatastorage.googleapis.com/chrome-linux-sysroot/52d61d4446ffebfaa3dda2cd02da4ab4876ff237853f46d273e7f9b666652e1d"],
+)
+
+llvm = use_extension(
+    "@toolchains_llvm//toolchain/extensions:llvm.bzl",
+    "llvm",
+    dev_dependency = True,
+)
+llvm.toolchain(
+    name = "llvm_toolchain",
+    cxx_include_layout = {"linux-x86_64": "debian"},
+    llvm_version = "23.1.4",
+)
+llvm.sysroot(
+    name = "llvm_toolchain",
+    label = "@org_chromium_sysroot_linux_x64//sysroot",
+    targets = ["linux-x86_64"],
+)
+use_repo(llvm, "llvm_toolchain", "llvm_toolchain_llvm")
+
+register_toolchains(
+    "@llvm_toolchain//:all",
+    dev_dependency = True,
+)

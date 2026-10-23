@@ -1,0 +1,52 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+VERSION = "0.0.0"
+
+# //tools/pins reads this file to hold VERSION equal to Cargo.toml's.
+exports_files(["BUILD.bazel"])
+
+rust_library(
+    name = "dorfq_lib",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    crate_name = "dorfq",
+    crate_root = "src/lib.rs",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    version = VERSION,
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "dorfq",
+    srcs = ["src/main.rs"],
+    crate_name = "dorfq_cli",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    version = VERSION,
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True) + [":dorfq_lib"],
+)
+
+rust_test(
+    name = "dorfq_lib_test",
+    size = "small",
+    crate = ":dorfq_lib",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    version = VERSION,
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test(
+    name = "cli_test",
+    size = "small",
+    srcs = ["tests/cli.rs"],
+    crate_root = "tests/cli.rs",
+    data = [":dorfq"],
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    rustc_env = {"DORFQ_BIN": "$(rootpath :dorfq)"},
+    version = VERSION,
+    deps = all_crate_deps(normal_dev = True),
+)

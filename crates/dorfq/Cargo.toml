@@ -1,0 +1,20 @@
+[package]
+name = "dorfq"
+description = "DorfQ: a merge queue that pools pull requests into batched CI runs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Nothing here is publishable yet. Flip this when the crate is.
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "dorfq"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }

@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# The job only reads the tree. Pinned here so a permissive repo-level default
+# cannot silently hand a write-capable token to cached actions or anything
+# `make check` executes.
+permissions:
+  contents: read
+
+jobs:
+  # Named for its role rather than its contents: the required-status-check rule
+  # on the branch embeds this string, so renaming it later silently makes that
+  # rule vacuous.
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    # A cold cache fetches the Rust and LLVM toolchains and compiles the
+    # scanner's dependency closure once.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      # No Rust toolchain step and no scanner install: everything this job
+      # compiles, lints, runs and scans goes through Bazel, which fetches its
+      # own pinned toolchains, brenn-scrub and gitleaks by checksum. bazelisk is
+      # preinstalled on the runner image and reads .bazelversion, so the Bazel
+      # here is the one the tree pins rather than the image's.
+
+      # The two caches answer different questions and invalidate on different
+      # things. The repository cache holds fetched archives, so its key hashes
+      # every file that pins one: MODULE.bazel, its lock, .bazelversion and
+      # both Cargo.lock files. The disk
+      # cache holds action outputs, which change with every commit, so it is
+      # restored from the nearest earlier run and written back fresh.
+      #
+      # Both restore by prefix when the exact key misses. Entries in either
+      # cache are named by their own hash, so a stale entry is either still
+      # wanted or never looked up. Dead entries accumulate; if the shared
+      # actions-cache budget starts thrashing, bump the key prefixes to start
+      # clean.
+      - name: Cache Bazel repository cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/bazel-repo
+          key: bazel-repo-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelversion', 'Cargo.lock', 'tools/scrub/Cargo.lock') }}
+          restore-keys: |
+            bazel-repo-
+
+      - name: Cache Bazel disk cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/bazel-disk
+          key: bazel-disk-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelversion', 'Cargo.lock', 'tools/scrub/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            bazel-disk-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelversion', 'Cargo.lock', 'tools/scrub/Cargo.lock') }}-
+            bazel-disk-
+
+      # Written rather than tracked, because these are facts about this runner,
+      # not about the project. The file is the per-developer override the
+      # tracked .bazelrc already try-imports, so the gate command itself is
+      # unchanged from the one a developer runs.
+      #
+      # --lockfile_mode=error is the one behavioural difference from a local run,
+      # and it is deliberate: locally the lockfile refreshes, here a resolution
+      # that does not match the committed lock is a red build.
+      - name: Configure Bazel for CI
+        run: |
+          cat >> .bazelrc.user <<EOF
+          common --repository_cache=$HOME/.cache/bazel-repo
+          common --disk_cache=$HOME/.cache/bazel-disk
+          common --lockfile_mode=error
+          common --show_timestamps
+          common --color=no
+          common --curses=no
+          test --keep_going
+          EOF
+
+      # The gate is reproducible locally on a fresh clone. No lane may skip in
+      # CI. It includes the scrub kit check and the tree scan; with no private
+      # overlay here, the scan applies the public rules only.
+      - run: make check

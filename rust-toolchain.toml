@@ -1,0 +1,7 @@
+# For the tools that run outside Bazel: rust-analyzer, and nothing in the
+# gate. Must equal RUST_VERSION in MODULE.bazel; //tools/pins:pins_test
+# checks. No `targets`: there is no cross-compilation yet.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

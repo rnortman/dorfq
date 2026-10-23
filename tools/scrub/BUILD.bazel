@@ -1,0 +1,51 @@
+"""`bazel run //:brenn-scrub -- <mode>`: brenn-scrub with the pinned gitleaks.
+
+The target is named `brenn-scrub` so that a hook running
+`bazel run //tools/scrub:brenn-scrub -- staged` contains `brenn-scrub --
+staged`, which `brenn-scrub init --check` accepts as the invocation.
+"""
+
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+config_setting(
+    name = "linux_x86_64",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
+config_setting(
+    name = "linux_aarch64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+)
+
+alias(
+    name = "gitleaks",
+    actual = select(
+        {
+            ":linux_aarch64": "@gitleaks_aarch64_linux//:gitleaks",
+            ":linux_x86_64": "@gitleaks_x86_64_linux//:gitleaks",
+        },
+        no_match_error = """no pinned gitleaks release archive for this platform.
+Only linux x86_64 and linux aarch64 are pinned; add an http_archive for the
+platform in MODULE.bazel and a branch to this select().""",
+    ),
+)
+
+sh_binary(
+    name = "brenn-scrub",
+    srcs = ["scrub.sh"],
+    data = [
+        ":gitleaks",
+        "@scrub_crates//:brenn-scrub__brenn-scrub",
+    ],
+    env = {
+        "GITLEAKS_BIN": "$(rlocationpath :gitleaks)",
+        "SCRUB_BIN": "$(rlocationpath @scrub_crates//:brenn-scrub__brenn-scrub)",
+    },
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+)

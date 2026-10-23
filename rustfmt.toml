@@ -1,0 +1,4 @@
+# One formatter configuration for the rustfmt aspect in `make check`, the
+# write-time formatting hook and rust-analyzer alike.
+edition = "2024"
+style_edition = "2024"

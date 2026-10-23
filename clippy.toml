@@ -1,0 +1,3 @@
+# Clippy configuration for the lint aspect in `make check` and for
+# rust-analyzer alike. Must agree with `rust-version` in Cargo.toml.
+msrv = "1.98"

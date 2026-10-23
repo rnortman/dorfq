@@ -1,0 +1,44 @@
+# Globs here are deliberately wide. An uncovered artifact is one `git add .` away
+# from becoming tracked content that has to be scrubbed back out again.
+
+# Bazel's convenience symlinks, any output base or cache placed inside the tree,
+# and per-developer flag files. MODULE.bazel.lock and both cargo-bazel-lock.json
+# files are tracked; these are not.
+bazel-*
+.bazel-*
+/.bazelrc.user
+
+# Cargo build trees (cargo is not the build here, but an IDE or a stray
+# `cargo build` still produces one) and rustfmt's backup files.
+target/
+**/*.rs.bk
+
+# The IDE's view of the build, written by `make ide`. It names absolute paths
+# into a Bazel output base, so it is per-machine by construction.
+rust-project.json
+.rules_rust_analyzer/
+
+# Run and diagnostic output.
+*.log
+*.jsonl
+logs/
+
+# Per-machine tool configuration that names local paths.
+*.local.toml
+.local/
+
+# Personal Claude Code settings (settings.json is shared).
+.claude/settings.local.json
+
+# Local secret-scanner rule overrides. Never content in this repo.
+.gitleaks.local.toml
+
+# Private per-repo agent context (CLAUDE.md and AGENTS.md are shared).
+CLAUDE.local.md
+
+# Editor and OS noise.
+*.swp
+*~
+.vscode/
+.idea/
+.DS_Store

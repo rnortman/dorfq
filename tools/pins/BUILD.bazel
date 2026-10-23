@@ -1,0 +1,47 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+# Holds the version pins that live in more than one file equal.
+sh_test(
+    name = "pins_test",
+    size = "small",
+    srcs = ["pins_test.sh"],
+    data = [
+        "//:Cargo.toml",
+        "//:MODULE.bazel",
+        "//:clippy.toml",
+        "//:rust-toolchain.toml",
+        "//crates/dorfq:BUILD.bazel",
+    ],
+    env = {
+        "CARGO_TOML": "$(rlocationpath //:Cargo.toml)",
+        "CLIPPY_TOML": "$(rlocationpath //:clippy.toml)",
+        "CRATE_BUILD": "$(rlocationpath //crates/dorfq:BUILD.bazel)",
+        "MODULE_BAZEL": "$(rlocationpath //:MODULE.bazel)",
+        "RUST_TOOLCHAIN_TOML": "$(rlocationpath //:rust-toolchain.toml)",
+    },
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+)
+
+# Holds pins_test to failing: one broken pin at a time must turn it red.
+sh_test(
+    name = "pins_mismatch_test",
+    size = "small",
+    srcs = ["pins_mismatch_test.sh"],
+    data = [
+        "pins_test.sh",
+        "//:Cargo.toml",
+        "//:MODULE.bazel",
+        "//:clippy.toml",
+        "//:rust-toolchain.toml",
+        "//crates/dorfq:BUILD.bazel",
+    ],
+    env = {
+        "CARGO_TOML": "$(rlocationpath //:Cargo.toml)",
+        "CLIPPY_TOML": "$(rlocationpath //:clippy.toml)",
+        "CRATE_BUILD": "$(rlocationpath //crates/dorfq:BUILD.bazel)",
+        "MODULE_BAZEL": "$(rlocationpath //:MODULE.bazel)",
+        "PINS_TEST": "$(rlocationpath pins_test.sh)",
+        "RUST_TOOLCHAIN_TOML": "$(rlocationpath //:rust-toolchain.toml)",
+    },
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+)

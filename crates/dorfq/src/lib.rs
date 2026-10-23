@@ -1,0 +1,27 @@
+//! DorfQ, a merge queue that pools pull requests into batched CI runs.
+//!
+//! This crate is scaffolding: it proves the build, the lints and the tests
+//! end to end.
+
+/// The version of this crate, as the build stamped it.
+pub fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version;
+
+    #[test]
+    fn version_is_three_dot_separated_integers() {
+        let v = version();
+        let parts: Vec<&str> = v.split('.').collect();
+        assert_eq!(parts.len(), 3, "version {v:?} is not major.minor.patch");
+        for part in parts {
+            assert!(
+                part.parse::<u64>().is_ok(),
+                "version {v:?} has a non-integer component {part:?}"
+            );
+        }
+    }
+}

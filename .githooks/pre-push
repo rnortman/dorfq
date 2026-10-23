@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+
+exec bazel run //tools/scrub:brenn-scrub -- range
