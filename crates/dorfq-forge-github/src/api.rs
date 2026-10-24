@@ -34,9 +34,14 @@ pub trait GitHubApi {
     fn merge(&mut self, base_branch: &str, head: &Sha, message: &str) -> Result<Merge, ApiError>;
     /// True when `descendant` is `ancestor` or has it in its history.
     fn is_ancestor(&mut self, ancestor: &Sha, descendant: &Sha) -> Result<bool, ApiError>;
-    /// Open pull requests targeting the branch `base`.
-    fn list_open_prs(&mut self, base: &str) -> Result<Vec<PrSummary>, ApiError>;
+    /// Every open pull request in the repository.
+    fn list_open_prs(&mut self) -> Result<Vec<PrSummary>, ApiError>;
     fn get_pr(&mut self, number: PrNumber) -> Result<PrDetail, ApiError>;
+    /// Changes the branch a pull request targets.
+    fn set_base(&mut self, number: PrNumber, base: &str) -> Result<(), ApiError>;
+    /// The heads, as merged, of the closed and merged pull requests whose head
+    /// branch is `branch` in this repository and whose base is `base`.
+    fn merged_pr_heads(&mut self, branch: &str, base: &str) -> Result<Vec<Sha>, ApiError>;
     /// Check runs and commit statuses on `sha`, newest first.
     fn checks(&mut self, sha: &Sha) -> Result<Vec<CheckResult>, ApiError>;
     /// Removes a label from a pull request; an absent label is not an error.
@@ -87,6 +92,11 @@ pub enum Merge {
 pub struct PrSummary {
     pub number: PrNumber,
     pub head: Sha,
+    /// The branch it targets.
+    pub base: String,
+    /// Its head branch's name, when the head lives in this repository;
+    /// `None` for a head in a fork, which no pull request here can target.
+    pub head_branch: Option<String>,
     pub labels: Vec<String>,
     pub title: String,
 }
@@ -274,6 +284,10 @@ pub struct RestClient {
     api_base: String,
     /// `/repos/{owner}/{repo}`, encoded.
     repo_path: String,
+    /// `owner/repo`, unencoded.
+    repo_name: String,
+    /// The repository's owner, unencoded.
+    owner: String,
     credential: Credential,
     transport: Transport,
     now: Clock,
@@ -333,6 +347,8 @@ impl RestClient {
         RestClient {
             api_base: api_base.trim_end_matches('/').to_owned(),
             repo_path: format!("/repos/{}/{}", encode(owner), encode(repo)),
+            repo_name: format!("{owner}/{repo}"),
+            owner: owner.to_owned(),
             credential,
             transport,
             now,
@@ -350,6 +366,8 @@ impl RestClient {
         let RestClient {
             api_base,
             repo_path,
+            repo_name: _,
+            owner: _,
             credential,
             transport,
             now,
@@ -618,16 +636,24 @@ impl GitHubApi for RestClient {
         }
     }
 
-    fn list_open_prs(&mut self, base: &str) -> Result<Vec<PrSummary>, ApiError> {
-        let path = format!("/pulls?state=open&base={}", encode(base));
+    fn list_open_prs(&mut self) -> Result<Vec<PrSummary>, ApiError> {
+        let path = "/pulls?state=open";
         let what = format!("GET {path}");
-        let found: Vec<PrJson> = self.get_array(&path)?;
+        let found: Vec<PrJson> = self.get_array(path)?;
         found
             .into_iter()
             .map(|pr| {
+                // GitHub compares repository names case-insensitively.
+                let local = pr
+                    .head
+                    .repo
+                    .as_ref()
+                    .is_some_and(|r| r.full_name.eq_ignore_ascii_case(&self.repo_name));
                 Ok(PrSummary {
                     number: PrNumber(pr.number),
                     head: parse_sha(&what, &pr.head.sha)?,
+                    base: pr.base.branch,
+                    head_branch: local.then_some(pr.head.branch),
                     labels: pr.labels.into_iter().map(|l| l.name).collect(),
                     title: pr.title,
                 })
@@ -655,6 +681,30 @@ impl GitHubApi for RestClient {
             mergeable: pr.mergeable,
             merged,
         })
+    }
+
+    fn set_base(&mut self, number: PrNumber, base: &str) -> Result<(), ApiError> {
+        let path = format!("/pulls/{}", number.0);
+        let response = self.call(Method::Patch, &path, Some(&json!({ "base": base })))?;
+        match response.status {
+            200 => Ok(()),
+            _ => Err(failure(Method::Patch, &path, &response)),
+        }
+    }
+
+    fn merged_pr_heads(&mut self, branch: &str, base: &str) -> Result<Vec<Sha>, ApiError> {
+        let path = format!(
+            "/pulls?state=closed&head={}&base={}",
+            encode(&format!("{}:{branch}", self.owner)),
+            encode(base)
+        );
+        let what = format!("GET {path}");
+        let found: Vec<PrJson> = self.get_array(&path)?;
+        found
+            .into_iter()
+            .filter(|pr| pr.merged_at.is_some())
+            .map(|pr| parse_sha(&what, &pr.head.sha))
+            .collect()
     }
 
     fn checks(&mut self, sha: &Sha) -> Result<Vec<CheckResult>, ApiError> {
@@ -1002,11 +1052,25 @@ struct BranchJson {
 }
 
 #[derive(Deserialize)]
+struct RepoJson {
+    full_name: String,
+}
+
+#[derive(Deserialize)]
+struct HeadJson {
+    sha: String,
+    #[serde(rename = "ref")]
+    branch: String,
+    /// Null for a head in a deleted fork.
+    repo: Option<RepoJson>,
+}
+
+#[derive(Deserialize)]
 struct PrJson {
     number: u64,
     title: String,
     state: String,
-    head: ShaJson,
+    head: HeadJson,
     base: BranchJson,
     labels: Vec<LabelJson>,
     #[serde(default)]
@@ -1014,6 +1078,9 @@ struct PrJson {
     /// Only the single-item endpoint carries it.
     #[serde(default)]
     merged: Option<bool>,
+    /// The list endpoint's merge record; null when not merged.
+    #[serde(default)]
+    merged_at: Option<String>,
 }
 
 #[derive(Deserialize)]

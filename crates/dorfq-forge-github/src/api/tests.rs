@@ -120,7 +120,7 @@ fn pr_json(number: u64, head: &str, labels: &[&str], mergeable: Value) -> Value 
         "number": number,
         "title": format!("change {number}"),
         "state": "open",
-        "head": { "sha": head, "ref": "topic" },
+        "head": { "sha": head, "ref": "topic", "repo": { "full_name": "acme/widgets" } },
         "base": { "sha": A, "ref": "main" },
         "labels": labels.iter().map(|l| json!({ "name": l })).collect::<Vec<_>>(),
         "mergeable": mergeable,
@@ -417,7 +417,7 @@ fn compare_not_found_is_permanent() {
 
 #[test]
 fn list_follows_link_next() {
-    let page2 = format!("{REPO}/pulls?state=open&base=main&per_page=100&page=2");
+    let page2 = format!("{REPO}/pulls?state=open&per_page=100&page=2");
     let mut first = ok(json!([pr_json(1, A, &["queue"], Value::Null)]));
     first.headers.push((
         "link",
@@ -429,22 +429,26 @@ fn list_follows_link_next() {
         format!("<{REPO}/pulls?page=1>; rel=\"prev\", <{REPO}/pulls?page=1>; rel=\"first\""),
     ));
     let (mut api, seen) = client(vec![
-        route("GET", "/pulls?state=open&base=main&per_page=100", first),
+        route("GET", "/pulls?state=open&per_page=100", first),
         (format!("GET {page2}"), second),
     ]);
-    let prs = api.list_open_prs("main").unwrap();
+    let prs = api.list_open_prs().unwrap();
     assert_eq!(
         prs,
         vec![
             PrSummary {
                 number: PrNumber(1),
                 head: sha(A),
+                base: "main".to_owned(),
+                head_branch: Some("topic".to_owned()),
                 labels: vec!["queue".to_owned()],
                 title: "change 1".to_owned(),
             },
             PrSummary {
                 number: PrNumber(2),
                 head: sha(B),
+                base: "main".to_owned(),
+                head_branch: Some("topic".to_owned()),
                 labels: vec![],
                 title: "change 2".to_owned(),
             },
@@ -455,21 +459,112 @@ fn list_follows_link_next() {
 
 #[test]
 fn a_failed_later_page_fails_the_list() {
-    let page2 = format!("{REPO}/pulls?state=open&base=main&per_page=100&page=2");
+    let page2 = format!("{REPO}/pulls?state=open&per_page=100&page=2");
     let mut first = ok(json!([pr_json(1, A, &["queue"], Value::Null)]));
     first
         .headers
         .push(("link", format!("<{page2}>; rel=\"next\"")));
     let (mut api, _) = client(vec![
-        route("GET", "/pulls?state=open&base=main&per_page=100", first),
+        route("GET", "/pulls?state=open&per_page=100", first),
         (
             format!("GET {page2}"),
             status(502, json!({ "message": "Bad Gateway" })),
         ),
     ]);
-    let error = api.list_open_prs("main").unwrap_err();
+    let error = api.list_open_prs().unwrap_err();
     assert!(is_transient(&error), "{error}");
     assert!(error.to_string().contains("HTTP 502"), "{error}");
+}
+
+#[test]
+fn list_reads_each_base_and_head_branch_but_not_a_forks() {
+    let mut stacked = pr_json(1, A, &["queue"], Value::Null);
+    stacked["base"]["ref"] = json!("feature/one");
+    stacked["head"]["ref"] = json!("feature/two");
+    let mut shouting = pr_json(2, B, &[], Value::Null);
+    shouting["head"]["repo"]["full_name"] = json!("ACME/Widgets");
+    let mut fork = pr_json(3, C, &[], Value::Null);
+    fork["head"]["repo"]["full_name"] = json!("someone/widgets");
+    let mut deleted_fork = pr_json(4, C, &[], Value::Null);
+    deleted_fork["head"]["repo"] = Value::Null;
+    let (mut api, _) = client(vec![route(
+        "GET",
+        "/pulls?state=open&per_page=100",
+        ok(json!([stacked, shouting, fork, deleted_fork])),
+    )]);
+    let prs = api.list_open_prs().unwrap();
+    let got: Vec<(u64, &str, Option<&str>)> = prs
+        .iter()
+        .map(|p| (p.number.0, p.base.as_str(), p.head_branch.as_deref()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (1, "feature/one", Some("feature/two")),
+            (2, "main", Some("topic")),
+            (3, "main", None),
+            (4, "main", None),
+        ]
+    );
+}
+
+#[test]
+fn set_base_patches_the_pull_request() {
+    let (mut api, seen) = client(vec![route(
+        "PATCH",
+        "/pulls/7",
+        ok(pr_json(7, A, &[], Value::Null)),
+    )]);
+    api.set_base(PrNumber(7), "main").unwrap();
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, Method::Patch);
+    assert_eq!(seen[0].2, Some(json!({ "base": "main" })));
+}
+
+#[test]
+fn set_base_maps_a_refusal() {
+    let cases = [
+        (
+            status(422, json!({ "message": "Validation Failed" })),
+            false,
+        ),
+        (
+            status(403, json!({ "message": "Resource not accessible" })),
+            false,
+        ),
+        (status(502, Value::Null), true),
+    ];
+    for (canned, transient) in cases {
+        let code = canned.status;
+        let (mut api, _) = client(vec![route("PATCH", "/pulls/7", canned)]);
+        let error = api.set_base(PrNumber(7), "main").unwrap_err();
+        assert_eq!(is_transient(&error), transient, "HTTP {code}: {error}");
+        assert!(error.to_string().contains("PATCH /pulls/7"), "{error}");
+    }
+}
+
+#[test]
+fn merged_pr_heads_asks_for_trunk_merges_of_the_branch_and_keeps_merged_ones() {
+    let mut merged = pr_json(5, A, &[], Value::Null);
+    merged["state"] = json!("closed");
+    merged["merged_at"] = json!("2026-10-01T00:00:00Z");
+    let mut abandoned = pr_json(6, B, &[], Value::Null);
+    abandoned["state"] = json!("closed");
+    abandoned["merged_at"] = Value::Null;
+    let mut also_merged = pr_json(8, C, &[], Value::Null);
+    also_merged["state"] = json!("closed");
+    also_merged["merged_at"] = json!("2026-10-02T00:00:00Z");
+    // The route matches the whole query, so it is what checks `base=main`.
+    let (mut api, _) = client(vec![route(
+        "GET",
+        "/pulls?state=closed&head=acme%3Afeature%2Fone&base=main&per_page=100",
+        ok(json!([merged, abandoned, also_merged])),
+    )]);
+    assert_eq!(
+        api.merged_pr_heads("feature/one", "main").unwrap(),
+        vec![sha(A), sha(C)]
+    );
 }
 
 #[test]
@@ -881,6 +976,7 @@ fn encode_keeps_only_unreserved() {
     assert_eq!(encode("a-b_c.d~e"), "a-b_c.d~e");
     assert_eq!(encode("merge queue/1"), "merge%20queue%2F1");
     assert_eq!(encode("é"), "%C3%A9");
+    assert_eq!(encode("a&b#c=d?e+f"), "a%26b%23c%3Dd%3Fe%2Bf");
 }
 
 #[test]

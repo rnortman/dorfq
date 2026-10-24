@@ -6,7 +6,7 @@
 //!
 //! | Name | What it is |
 //! |---|---|
-//! | the configured label | intent: an open pull request against trunk carrying it is enqueued |
+//! | the configured label | intent: an open pull request against trunk, or against the head branch of another enqueued pull request, carrying it is enqueued |
 //! | `refs/heads/dorfq/batch/<id>` | a tracked batch's tip; exists from the end of a successful build until `retire`; CI must run on pushes to it |
 //! | `refs/heads/dorfq/build/<id>` | the branch a batch's merges are made on; exists only during `start_batch` |
 //! | `refs/heads/dorfq/probe/<id>` | the branch conflict attribution uses; exists only during `start_batch` |
@@ -18,6 +18,35 @@
 //! nobody pushes to, deletes or creates anything under `dorfq/` or
 //! `refs/dorfq/` by hand: the forge reads a foreign or moved ref there as
 //! [`ForgeError::Permanent`] and stops. Trunk moves only by fast-forward.
+//!
+//! # Stacks
+//!
+//! The enqueued set is built in rounds over the labelled open pull requests:
+//! first those against trunk, then each one whose base branch is the head
+//! branch of a pull request enqueued in an earlier round, based on the
+//! lowest-numbered such pull request. A pull request whose head is in a fork
+//! has no head branch here, so nothing stacks on it. Every pull request is
+//! reported [`StackPolicy::Splittable`](dorfq_core::StackPolicy).
+//!
+//! A labelled pull request the rounds leave out is moved onto trunk when the
+//! latest observation reported it stacked on an enqueued pull request whose
+//! head branch it still targets, and that pull request has since merged into
+//! trunk: the queue completed its landing since the latest observation,
+//! whatever GitHub shows as its base; or it is open, targeting trunk, with its
+//! head in trunk's history; or closed and merged into trunk with its recorded
+//! head at the branch's tip.
+//! The rounds are then run again. Any other labelled pull request left out is
+//! not enqueued, and its author is told to retarget it: a base branch whose
+//! pull request was merged into another branch, that moved on after its pull
+//! request merged, or that was never a pull request's head, or one the queue
+//! never reported this pull request stacked on, whatever its history, which
+//! includes every labelled pull request after a restart, never makes the
+//! queue change a pull request's base.
+//!
+//! A labelled member of a batch whose record reads landed is reported on
+//! trunk, whatever its base, and its landing is completed when the batch is
+//! retired. A member of a landed batch that is still open against another
+//! branch is moved onto trunk when its landing is completed.
 //!
 //! # Recovery
 //!
@@ -68,7 +97,7 @@ use dorfq_core::{
 };
 
 use api::{ApiError, GitHubApi, Merge, PrSummary, RefEntry, RefUpdate};
-use messages::{Event, Marker, Message};
+use messages::{Blocker, Event, Marker, Message};
 use record::{Record, RecordState};
 
 /// What the forge is configured with.
@@ -113,13 +142,53 @@ pub struct GitHubForge {
     /// observation (label removed, author told), with the batch they landed
     /// in.
     completed: BTreeMap<PrNumber, BatchId>,
-    /// The titles of the pull requests enqueued at the latest observation,
-    /// for merge commit messages.
-    titles: BTreeMap<PrNumber, String>,
+    /// What the effects need about the pull requests enqueued at the latest
+    /// observation.
+    enqueued: BTreeMap<PrNumber, Enqueued>,
     /// Comments not yet posted, in order.
     outbox: VecDeque<Message>,
     /// One line per message posted.
     sink: Box<dyn Write>,
+}
+
+/// What the forge keeps about a pull request it reported enqueued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Enqueued {
+    /// For merge commit messages.
+    title: String,
+    /// Its head branch, which a pull request stacked on it targets; `None`
+    /// for a head in a fork.
+    head_branch: Option<String>,
+}
+
+/// What one read of the repository found.
+struct World {
+    observation: Observation,
+    enqueued: BTreeMap<PrNumber, Enqueued>,
+    /// Every labelled open pull request in the listing that is not
+    /// enqueued, with the reason.
+    blocked: BTreeMap<PrNumber, Blocker>,
+}
+
+/// What a labelled pull request the enqueued set left out is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Class {
+    /// The latest observation reported it stacked on a pull request that
+    /// has since merged into trunk: it belongs on trunk.
+    MergedBase,
+    Blocked(Blocker),
+}
+
+/// What the latest observation says a labelled pull request was queued on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stacked {
+    /// Not reported stacked on the pull request whose head it targets.
+    No,
+    /// Reported stacked on a pull request whose landing this process
+    /// completed since that observation.
+    OnLanded,
+    /// Reported stacked on a pull request this process has not landed since.
+    OnUnlanded,
 }
 
 /// Where an observation's [`Observation::now`] comes from.
@@ -207,7 +276,7 @@ impl GitHubForge {
             clock,
             ledger: Ledger::new(),
             completed: BTreeMap::new(),
-            titles: BTreeMap::new(),
+            enqueued: BTreeMap::new(),
             outbox: VecDeque::new(),
             sink,
         })
@@ -232,8 +301,10 @@ impl GitHubForge {
         Ok(())
     }
 
-    /// The observation, and the titles of the pull requests it reports.
-    fn fetch_world(&mut self) -> Result<(Observation, BTreeMap<PrNumber, String>), ForgeError> {
+    /// The observation, what the effects need about the pull requests it
+    /// reports, and why each labelled open pull request it does not report
+    /// is not enqueued.
+    fn fetch_world(&mut self) -> Result<World, ForgeError> {
         let now = (self.clock)().map_err(|e| permanent(format!("reading the clock: {e}")))?;
         let trunk = self.trunk()?;
 
@@ -241,7 +312,7 @@ impl GitHubForge {
         // page reads lists the item on the boundary twice. Kept once at the
         // same head; listed at two heads, the listing is read again next tick.
         let mut listed: BTreeMap<PrNumber, PrSummary> = BTreeMap::new();
-        for summary in self.api.list_open_prs(&self.settings.trunk)? {
+        for summary in self.api.list_open_prs()? {
             match listed.get(&summary.number) {
                 Some(seen) if seen.head == summary.head => {}
                 Some(seen) => {
@@ -256,20 +327,102 @@ impl GitHubForge {
             }
         }
 
-        let mut prs = Vec::new();
-        let mut titles = BTreeMap::new();
-        for summary in listed.into_values() {
-            // TODO(security-label-grants-unreviewed-landing-on-any-later-head)
-            if !summary.labels.contains(&self.settings.label) {
-                continue;
+        let mut batches = Vec::new();
+        for entry in self.api.list_refs(RECORDS)? {
+            if let Some(status) = self.recover(&entry, &trunk)? {
+                batches.push(status);
             }
-            let detail = self.api.get_pr(summary.number)?;
-            let status = match detail.mergeable {
-                Some(false) => PrStatus::Conflicting(ConflictWith::Trunk),
+        }
+        // A landed member's content is in trunk, whatever its base on GitHub.
+        let landed: BTreeSet<PrNumber> = batches
+            .iter()
+            .filter(|b| matches!(b.state, BatchState::Landed { .. }))
+            .flat_map(|b| b.members.iter().map(|m| m.pr))
+            .collect();
+
+        // A merged base retargeted onto trunk can carry pull requests of its
+        // own, so the enqueued set is computed again after every retarget. A
+        // retarget changes only the retargeted pull request's base, which
+        // can bring a blocked pull request into the enqueued set but never
+        // changes the class of one it leaves out: each is classified once.
+        let mut retargeted = BTreeSet::new();
+        let mut blocked = BTreeMap::new();
+        let bases = loop {
+            let bases = enqueued_bases(&listed, &self.settings, &landed);
+            blocked.retain(|n, _| !bases.contains_key(n));
+            let left: Vec<PrNumber> = listed
+                .values()
+                .filter(|s| s.labels.contains(&self.settings.label))
+                .map(|s| s.number)
+                .filter(|n| !bases.contains_key(n) && !blocked.contains_key(n))
+                .collect();
+            let mut moved = false;
+            for number in left {
+                let base = listed[&number].base.clone();
+                let stacked = self.latest_snapshot(number).map_or(Stacked::No, |p| {
+                    reported_stacked(p.base, &self.enqueued, &self.completed, &base)
+                });
+                let class = classify(
+                    self.api.as_mut(),
+                    &self.settings.trunk,
+                    number,
+                    &base,
+                    stacked,
+                    &listed,
+                    &trunk,
+                )?;
+                match class {
+                    Class::MergedBase => match self.api.set_base(number, &self.settings.trunk) {
+                        Ok(()) => {
+                            if let Some(summary) = listed.get_mut(&number) {
+                                summary.base = self.settings.trunk.clone();
+                            }
+                            retargeted.insert(number);
+                            moved = true;
+                        }
+                        Err(ApiError::Permanent(error)) => {
+                            eprintln!(
+                                "dorfq: could not retarget #{} onto {}: {error}",
+                                number.0, self.settings.trunk
+                            );
+                            blocked.insert(number, Blocker::Branch(base));
+                        }
+                        Err(error) => return Err(error.into()),
+                    },
+                    Class::Blocked(blocker) => {
+                        blocked.insert(number, blocker);
+                    }
+                }
+            }
+            if !moved {
+                break bases;
+            }
+        };
+
+        let mut prs = Vec::new();
+        let mut enqueued = BTreeMap::new();
+        for (&number, &base) in &bases {
+            let summary = &listed[&number];
+            // GitHub recomputes mergeability after a change of base.
+            let mergeable = if retargeted.contains(&number) {
+                None
+            } else {
+                self.api.get_pr(number)?.mergeable
+            };
+            let status = match mergeable {
+                Some(false) => PrStatus::Conflicting(match base {
+                    PrBase::Trunk => ConflictWith::Trunk,
+                    PrBase::Pr(a) => ConflictWith::Pr(a),
+                }),
                 mergeable => {
                     let mut holds = BTreeSet::new();
                     if mergeable.is_none() {
                         holds.insert(Hold::MergeabilityUnknown);
+                    }
+                    if let PrBase::Pr(a) = base
+                        && !self.api.is_ancestor(&listed[&a].head, &summary.head)?
+                    {
+                        holds.insert(Hold::AncestorMoved { pr: a });
                     }
                     match self.ci(&summary.head)? {
                         CiStatus::Passed => {}
@@ -287,20 +440,14 @@ impl GitHubForge {
                     }
                 }
             };
-            titles.insert(summary.number, summary.title);
-            prs.push(PrSnapshot::new(
-                summary.number,
-                summary.head,
-                PrBase::Trunk,
-                status,
-            ));
-        }
-
-        let mut batches = Vec::new();
-        for entry in self.api.list_refs(RECORDS)? {
-            if let Some(status) = self.recover(&entry, &trunk)? {
-                batches.push(status);
-            }
+            enqueued.insert(
+                number,
+                Enqueued {
+                    title: summary.title.clone(),
+                    head_branch: summary.head_branch.clone(),
+                },
+            );
+            prs.push(PrSnapshot::new(number, summary.head.clone(), base, status));
         }
 
         prs.sort_by_key(|pr| pr.number);
@@ -309,20 +456,52 @@ impl GitHubForge {
             if let Some(&batch) = self.completed.get(&gone.number) {
                 return Ok(Departed::Landed { batch });
             }
-            let pr = self.api.get_pr(gone.number)?;
-            let on_trunk = pr.base == self.settings.trunk;
-            if pr.open && on_trunk && pr.labels.contains(&self.settings.label) {
-                // Enqueued, yet not listed: a pull request closed between two
-                // page reads moved it across a page boundary, or its label
-                // came back after the listing.
-                return Err(transient(format!(
-                    "#{} is enqueued but the listing of open pull requests left it out",
-                    gone.number.0
-                )));
+            let blocked_on = |blocker: &Blocker| match (blocker, gone.base) {
+                (Blocker::Pr(a), PrBase::Pr(b)) if *a == b => {
+                    Departed::Withdrawn(Withdrawal::Blocked { on: b })
+                }
+                _ => Departed::Withdrawn(Withdrawal::Retargeted),
+            };
+            // The listing holds it: this tick already decided what it is.
+            if listed.contains_key(&gone.number) {
+                return Ok(match blocked.get(&gone.number) {
+                    Some(blocker) => blocked_on(blocker),
+                    None => Departed::Withdrawn(Withdrawal::IntentCleared),
+                });
             }
-            Ok(if pr.merged && on_trunk {
+            let pr = self.api.get_pr(gone.number)?;
+            let trunk_name = &self.settings.trunk;
+            if pr.open && pr.labels.contains(&self.settings.label) {
+                let left_out = || {
+                    // A pull request closed between two page reads moved it
+                    // across a page boundary, or its label came back after
+                    // the listing.
+                    Err(transient(format!(
+                        "#{} is enqueued but the listing of open pull requests left it out",
+                        gone.number.0
+                    )))
+                };
+                if pr.base == *trunk_name || has_enqueued_holder(&listed, &bases, &pr.base) {
+                    return left_out();
+                }
+                let stacked =
+                    reported_stacked(gone.base, &self.enqueued, &self.completed, &pr.base);
+                return match classify(
+                    self.api.as_mut(),
+                    trunk_name,
+                    gone.number,
+                    &pr.base,
+                    stacked,
+                    &listed,
+                    &trunk,
+                )? {
+                    Class::MergedBase => left_out(),
+                    Class::Blocked(blocker) => Ok(blocked_on(&blocker)),
+                };
+            }
+            Ok(if pr.merged && pr.base == *trunk_name {
                 Departed::Merged
-            } else if pr.merged || (pr.open && !on_trunk) {
+            } else if pr.merged {
                 // Merged into another branch leaves its content out of trunk.
                 Departed::Withdrawn(Withdrawal::Retargeted)
             } else if !pr.open {
@@ -331,8 +510,11 @@ impl GitHubForge {
                 Departed::Withdrawn(Withdrawal::IntentCleared)
             })
         })?;
-        let observation = Observation::new(now, trunk, prs, batches, departed);
-        Ok((observation, titles))
+        Ok(World {
+            observation: Observation::new(now, trunk, prs, batches, departed),
+            enqueued,
+            blocked,
+        })
     }
 
     /// The batch a record ref describes, per the recovery table; `None` for
@@ -418,19 +600,26 @@ impl GitHubForge {
     /// The rule-9 messages for `observation`. A departure is told it landed
     /// when it landed with a batch and this process has not completed that
     /// landing, nothing when it was ejected, and that it withdrew otherwise.
-    /// A pull request in `entered` is greeted unless its comment thread shows
-    /// it was greeted already. One that is `Waiting` and was not at the
-    /// latest observation is told what holds it, unless it entered and its
-    /// thread already ends with that. Holds that are only
+    /// A departure in `blocked` is told nothing here: every pull request in
+    /// `blocked` is told why it is not enqueued unless its comment thread
+    /// already ends with that, naming the same blocker. A pull request in
+    /// `entered` is greeted unless its comment thread shows it was greeted
+    /// already. One that is `Waiting` and was not at the latest observation
+    /// is told what holds it, unless it entered and its thread already ends
+    /// with that. Holds that are only
     /// `MergeabilityUnknown` are not told: GitHub recomputes mergeability
     /// after every move of trunk, and the author has nothing to do.
     fn transitions(
         &mut self,
         observation: &Observation,
         entered: &BTreeSet<PrNumber>,
+        blocked: &BTreeMap<PrNumber, Blocker>,
     ) -> Result<Vec<Message>, ForgeError> {
         let mut messages = Vec::new();
         for Departure { pr, how, .. } in &observation.departed {
+            if blocked.contains_key(pr) {
+                continue;
+            }
             let event = match how {
                 Departed::Landed { batch } if !self.completed.contains_key(pr) => {
                     let tip = observation
@@ -451,6 +640,17 @@ impl GitHubForge {
             };
             if let Some(event) = event {
                 messages.push(Message { pr: *pr, event });
+            }
+        }
+        for (&pr, blocker) in blocked {
+            let thread = self.api.list_comments(pr)?;
+            if !messages::told_blocked(&thread, blocker) {
+                messages.push(Message {
+                    pr,
+                    event: Event::Blocked {
+                        on: blocker.clone(),
+                    },
+                });
             }
         }
         for snapshot in &observation.prs {
@@ -482,16 +682,19 @@ impl GitHubForge {
         Ok(messages)
     }
 
+    /// The latest observation's snapshot of `pr`, if it reported it.
+    fn latest_snapshot(&self, pr: PrNumber) -> Option<&PrSnapshot> {
+        let latest = self.ledger.latest()?;
+        let i = latest.prs.binary_search_by_key(&pr, |p| p.number).ok()?;
+        Some(&latest.prs[i])
+    }
+
     /// Whether the latest observation reported `pr` `Waiting` on holds its
     /// author is told about.
     fn held_at_latest(&self, pr: PrNumber) -> bool {
-        self.ledger.latest().is_some_and(|o| {
-            o.prs
-                .binary_search_by_key(&pr, |p| p.number)
-                .is_ok_and(|i| match &o.prs[i].status {
-                    PrStatus::Waiting(holds) => tells_author(holds),
-                    PrStatus::Ready | PrStatus::Conflicting(_) => false,
-                })
+        self.latest_snapshot(pr).is_some_and(|p| match &p.status {
+            PrStatus::Waiting(holds) => tells_author(holds),
+            PrStatus::Ready | PrStatus::Conflicting(_) => false,
         })
     }
 
@@ -521,10 +724,11 @@ impl GitHubForge {
 
     /// The merge commit message for `pr` in batch `id`.
     fn merge_message(&self, id: BatchId, pr: PrNumber) -> String {
-        let title = self
-            .titles
+        let title = &self
+            .enqueued
             .get(&pr)
-            .expect("a batch member is enqueued at the latest observation");
+            .expect("a batch member is enqueued at the latest observation")
+            .title;
         format!("Merge #{}: {title}\n\nDorfq-Batch: {}", pr.0, id.0)
     }
 
@@ -591,10 +795,20 @@ impl GitHubForge {
         if trunk != status.base {
             return Ok(Some(LandRefusal::TrunkMoved { trunk }));
         }
+        let mut bases = BTreeMap::new();
+        for member in &status.members {
+            let base = self.latest_snapshot(member.pr).and_then(|p| match p.base {
+                PrBase::Trunk => Some(self.settings.trunk.clone()),
+                PrBase::Pr(a) => self.enqueued.get(&a)?.head_branch.clone(),
+            });
+            bases.insert(member.pr, base);
+        }
         for member in &status.members {
             let pr = self.api.get_pr(member.pr)?;
+            // A member the latest observation does not report departed while
+            // its batch was in flight.
             let enqueued = pr.open
-                && pr.base == self.settings.trunk
+                && bases[&member.pr].as_ref() == Some(&pr.base)
                 && pr.labels.contains(&self.settings.label)
                 && pr.head == member.head;
             if !enqueued {
@@ -617,8 +831,11 @@ impl GitHubForge {
             .ok_or_else(|| permanent(format!("trunk branch {trunk_ref} does not exist")))
     }
 
-    /// A landed member leaves the queue: its label is removed, its landing
-    /// is completed, and it is told it landed.
+    /// A landed member leaves the queue: its label is removed, it is moved
+    /// onto trunk if it is still open on another branch, its landing is
+    /// completed, and it is told it landed. A failed move, refused or
+    /// transient, is a line on stderr: the member has landed whatever GitHub
+    /// shows as its base.
     fn complete_landing(
         &mut self,
         pr: PrNumber,
@@ -626,6 +843,15 @@ impl GitHubForge {
         tip: &Sha,
     ) -> Result<(), ForgeError> {
         self.api.remove_label(pr, &self.settings.label)?;
+        // Nothing retries the move: the next observation departs the member
+        // `Landed` and forgets it, so a failure of either kind is reported
+        // here and the landing goes on.
+        if let Err(error) = self.move_onto_trunk(pr) {
+            eprintln!(
+                "dorfq: could not retarget #{} onto {}: {error}",
+                pr.0, self.settings.trunk
+            );
+        }
         self.completed.insert(pr, batch);
         self.outbox.push_back(Message {
             pr,
@@ -636,6 +862,16 @@ impl GitHubForge {
         });
         Ok(())
     }
+
+    /// Sets `pr`'s base to trunk if it is open against another branch.
+    fn move_onto_trunk(&mut self, pr: PrNumber) -> Result<(), ApiError> {
+        // TODO(github-stack-retargets-unverified)
+        let detail = self.api.get_pr(pr)?;
+        if detail.open && detail.base != self.settings.trunk {
+            self.api.set_base(pr, &self.settings.trunk)?;
+        }
+        Ok(())
+    }
 }
 
 impl Forge for GitHubForge {
@@ -644,7 +880,11 @@ impl Forge for GitHubForge {
     /// who entered or left the queue since the previous observation (rule 9).
     fn observe(&mut self) -> Result<Observation, ForgeError> {
         self.flush()?;
-        let (observation, titles) = self.fetch_world()?;
+        let World {
+            observation,
+            enqueued,
+            blocked,
+        } = self.fetch_world()?;
         let entered: BTreeSet<PrNumber> = observation
             .prs
             .iter()
@@ -653,10 +893,10 @@ impl Forge for GitHubForge {
             .collect();
         // Every read that can fail comes before the ledger moves on, so a
         // failed observation is retried against the same latest one.
-        let messages = self.transitions(&observation, &entered)?;
+        let messages = self.transitions(&observation, &entered, &blocked)?;
         self.ledger.observed(&observation)?;
         self.completed.clear();
-        self.titles = titles;
+        self.enqueued = enqueued;
         self.outbox.extend(messages);
         Ok(observation)
     }
@@ -667,16 +907,10 @@ impl Forge for GitHubForge {
     /// probe's tip is an empty commit on its base.
     fn start_batch(&mut self, batch: &BatchStart) -> Result<(), ForgeError> {
         self.ledger.check_start(batch)?;
-        let latest = self
-            .ledger
-            .latest()
-            .expect("check_start accepts nothing before an observation");
         let mut members = Vec::new();
         for &pr in &batch.prs {
-            let snapshot = latest
-                .prs
-                .iter()
-                .find(|p| p.number == pr)
+            let snapshot = self
+                .latest_snapshot(pr)
                 .expect("check_start accepts only enqueued members");
             members.push(BatchMember::new(pr, snapshot.head.clone()));
         }
@@ -820,6 +1054,10 @@ impl Forge for GitHubForge {
     /// Removes the intent label and tells the author why.
     fn eject(&mut self, pr: PrNumber, reason: &EjectReason) -> Result<(), ForgeError> {
         self.ledger.check_eject(pr)?;
+        let base = self
+            .latest_snapshot(pr)
+            .expect("check_eject accepts only enqueued pull requests")
+            .base;
         // TODO(errhandling-write-applied-but-reported-transient-tells-authors-wrong-thing)
         self.api.remove_label(pr, &self.settings.label)?;
         self.ledger.ejected(pr);
@@ -827,10 +1065,142 @@ impl Forge for GitHubForge {
             pr,
             event: Event::Ejected {
                 reason: reason.clone(),
+                base,
             },
         });
         self.flush()
     }
+}
+
+/// The enqueued set over the deduplicated listing, with each member's base:
+/// labelled pull requests against trunk or in `landed`, on trunk, then, round
+/// by round, labelled pull requests whose base branch is the head branch of
+/// one enqueued in an earlier round, based on the lowest-numbered of those. A
+/// base always enters in an earlier round than its child, so the result is
+/// acyclic and closed under `base`.
+fn enqueued_bases(
+    listed: &BTreeMap<PrNumber, PrSummary>,
+    settings: &Settings,
+    landed: &BTreeSet<PrNumber>,
+) -> BTreeMap<PrNumber, PrBase> {
+    // TODO(security-label-grants-unreviewed-landing-on-any-later-head)
+    let labelled: Vec<&PrSummary> = listed
+        .values()
+        .filter(|s| s.labels.contains(&settings.label))
+        .collect();
+    let mut bases = BTreeMap::new();
+    let mut by_branch: BTreeMap<&str, PrNumber> = BTreeMap::new();
+    loop {
+        let round: Vec<(&PrSummary, PrBase)> = labelled
+            .iter()
+            .filter(|s| !bases.contains_key(&s.number))
+            .filter_map(|s| {
+                let base = if s.base == settings.trunk || landed.contains(&s.number) {
+                    PrBase::Trunk
+                } else {
+                    PrBase::Pr(*by_branch.get(s.base.as_str())?)
+                };
+                Some((*s, base))
+            })
+            .collect();
+        if round.is_empty() {
+            return bases;
+        }
+        for (summary, base) in round {
+            bases.insert(summary.number, base);
+            if let Some(head_branch) = &summary.head_branch {
+                by_branch
+                    .entry(head_branch.as_str())
+                    .and_modify(|n| *n = (*n).min(summary.number))
+                    .or_insert(summary.number);
+            }
+        }
+    }
+}
+
+/// Whether a pull request in `bases` has head branch `branch`: one whose
+/// base is `branch` would join the enqueued set.
+fn has_enqueued_holder(
+    listed: &BTreeMap<PrNumber, PrSummary>,
+    bases: &BTreeMap<PrNumber, PrBase>,
+    branch: &str,
+) -> bool {
+    listed
+        .values()
+        .any(|s| bases.contains_key(&s.number) && s.head_branch.as_deref() == Some(branch))
+}
+
+/// Whether a pull request the latest observation reported with base
+/// `reported` was stacked on a pull request whose recorded head branch is
+/// `base`, and whether `completed`, the pull requests whose landing this
+/// process completed since then, holds that one.
+fn reported_stacked(
+    reported: PrBase,
+    enqueued: &BTreeMap<PrNumber, Enqueued>,
+    completed: &BTreeMap<PrNumber, BatchId>,
+    base: &str,
+) -> Stacked {
+    match reported {
+        PrBase::Pr(a) if enqueued.get(&a).and_then(|e| e.head_branch.as_deref()) == Some(base) => {
+            if completed.contains_key(&a) {
+                Stacked::OnLanded
+            } else {
+                Stacked::OnUnlanded
+            }
+        }
+        _ => Stacked::No,
+    }
+}
+
+/// What labelled pull request `pr`, whose base branch `base` is neither
+/// trunk (`trunk_name`, at `trunk`) nor an enqueued pull request's head, is.
+/// `stacked` is what the latest observation says `pr` was queued on.
+///
+/// - Stacked on one this process landed since: a merged base, with no read.
+/// - Otherwise, with an open pull request (other than `pr`, the
+///   lowest-numbered) whose head `base` carries: when stacked, a merged
+///   base if that one targets trunk with its head in trunk, else blocked on
+///   it; when not stacked, blocked on the branch if its head is in trunk,
+///   else blocked on it.
+/// - With none: when stacked, a merged base if a closed pull request merged
+///   into trunk has `base`'s tip as its recorded head; blocked on the branch
+///   otherwise.
+fn classify(
+    api: &mut dyn GitHubApi,
+    trunk_name: &str,
+    pr: PrNumber,
+    base: &str,
+    stacked: Stacked,
+    listed: &BTreeMap<PrNumber, PrSummary>,
+    trunk: &Sha,
+) -> Result<Class, ForgeError> {
+    if stacked == Stacked::OnLanded {
+        return Ok(Class::MergedBase);
+    }
+    let on_branch = || Class::Blocked(Blocker::Branch(base.to_owned()));
+    let holder = listed
+        .values()
+        .find(|s| s.number != pr && s.head_branch.as_deref() == Some(base));
+    if let Some(a) = holder {
+        let in_trunk = api.is_ancestor(&a.head, trunk)?;
+        return Ok(match stacked {
+            Stacked::OnUnlanded if in_trunk && a.base == trunk_name => Class::MergedBase,
+            Stacked::No if in_trunk => on_branch(),
+            _ => Class::Blocked(Blocker::Pr(a.number)),
+        });
+    }
+    if stacked == Stacked::No {
+        return Ok(on_branch());
+    }
+    let merged = match api.get_ref(&branch(base))? {
+        Some(tip) => api.merged_pr_heads(base, trunk_name)?.contains(&tip),
+        None => false,
+    };
+    Ok(if merged {
+        Class::MergedBase
+    } else {
+        on_branch()
+    })
 }
 
 /// A batch branch must be where the record says the batch was published.
