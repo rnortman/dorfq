@@ -2,12 +2,12 @@
 //! [`Forge`] a scheduler acts through.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::error::Error;
-use std::fmt;
 
+use dorfq_core::ledger::Ledger;
 use dorfq_core::{
-    BatchId, BatchMember, BatchStart, BatchState, BatchStatus, CiStatus, ConflictWith, EjectReason,
-    Forge, ForgeError, LandRefusal, Mergeable, Observation, PrNumber, PrSnapshot, Sha,
+    BatchId, BatchMember, BatchStart, BatchState, BatchStatus, CiStatus, ConflictWith, Departed,
+    EjectReason, Failure, Forge, ForgeError, LandRefusal, Observation, PrBase, PrNumber,
+    PrSnapshot, PrStatus, Sha, Timestamp, Withdrawal,
 };
 
 use crate::config::WorldConfig;
@@ -15,93 +15,6 @@ use crate::metrics::{Exit, Metrics, PrRecord, RunRecord};
 use crate::rng::{SplitMix64, Streams, mix, unit};
 
 const HOUR: f64 = crate::HOUR as f64;
-
-/// A call that breaks rule 5 or rule 6: a scheduler bug.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Violation {
-    BatchIdInUse {
-        batch: BatchId,
-    },
-    EmptyBatch {
-        batch: BatchId,
-    },
-    DuplicateMember {
-        batch: BatchId,
-        pr: PrNumber,
-    },
-    MemberNotKnown {
-        batch: BatchId,
-        pr: PrNumber,
-    },
-    LandedInPlan {
-        effect: &'static str,
-        pr: PrNumber,
-    },
-    UnknownBase {
-        batch: BatchId,
-        base: Sha,
-    },
-    UnknownBatch {
-        effect: &'static str,
-        batch: BatchId,
-    },
-    NotPassed {
-        batch: BatchId,
-    },
-    LandedTwice {
-        batch: BatchId,
-    },
-    UnknownPr {
-        pr: PrNumber,
-    },
-}
-
-impl fmt::Display for Violation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Violation::BatchIdInUse { batch } => {
-                write!(f, "start_batch: batch id {} is already in use", batch.0)
-            }
-            Violation::EmptyBatch { batch } => {
-                write!(f, "start_batch: batch {} has no members", batch.0)
-            }
-            Violation::DuplicateMember { batch, pr } => {
-                write!(f, "start_batch: batch {} names pr {} twice", batch.0, pr.0)
-            }
-            Violation::MemberNotKnown { batch, pr } => write!(
-                f,
-                "start_batch: batch {} names pr {}, which is not known",
-                batch.0, pr.0
-            ),
-            Violation::LandedInPlan { effect, pr } => write!(
-                f,
-                "{effect}: pr {} is a member of a batch this plan lands",
-                pr.0
-            ),
-            Violation::UnknownBase { batch, base } => write!(
-                f,
-                "start_batch: batch {} is based on {base}, which is neither trunk nor a batch tip",
-                batch.0
-            ),
-            Violation::UnknownBatch { effect, batch } => {
-                write!(f, "{effect}: batch {} is not known", batch.0)
-            }
-            Violation::NotPassed { batch } => {
-                write!(f, "land: batch {} was not reported as passed", batch.0)
-            }
-            Violation::LandedTwice { batch } => {
-                write!(f, "land: batch {} was already landed in this plan", batch.0)
-            }
-            Violation::UnknownPr { pr } => write!(f, "eject: pr {} is not known", pr.0),
-        }
-    }
-}
-
-impl Error for Violation {}
-
-fn violation(v: Violation) -> ForgeError {
-    ForgeError::Permanent(Box::new(v))
-}
 
 /// A scheduled happening.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,18 +50,9 @@ impl SimPr {
 
 /// A batch's claim on a runner.
 enum Run {
-    /// Conflicted while building: no run.
-    None,
-    Waiting {
-        duration: u64,
-    },
-    Running {
-        run: usize,
-        done: EventKey,
-    },
-    Done {
-        run: usize,
-    },
+    Waiting { duration: u64 },
+    Running { run: usize, done: EventKey },
+    Done { run: usize },
 }
 
 struct SimBatch {
@@ -160,15 +64,6 @@ struct SimBatch {
 struct Commit {
     parent: Option<Sha>,
     members: Vec<PrNumber>,
-}
-
-/// Effects performed since the latest observation, for rules 5 and 6.
-#[derive(Default)]
-struct Since {
-    removed: BTreeSet<PrNumber>,
-    started: BTreeSet<BatchId>,
-    landed: BTreeSet<BatchId>,
-    retired: BTreeSet<BatchId>,
 }
 
 /// The simulated forge and the truth behind it.
@@ -187,8 +82,8 @@ pub struct World {
     running: usize,
     waiting: VecDeque<BatchId>,
     runs: Vec<RunRecord>,
-    latest: Option<Observation>,
-    since: Since,
+    /// Rules 5, 6 and 8, against the latest observation.
+    ledger: Ledger,
     /// Runner-seconds the runners have been busy.
     busy: u64,
     /// Event lines since the last [`World::take_trace`]; `None` untraced.
@@ -228,8 +123,7 @@ impl World {
             running: 0,
             waiting: VecDeque::new(),
             runs: Vec::new(),
-            latest: None,
-            since: Since::default(),
+            ledger: Ledger::new(),
             busy: 0,
             trace: None,
         };
@@ -560,7 +454,8 @@ impl World {
         let flake = self.streams.ci.bernoulli(self.config.p_flake);
         let tree = self.tree(&tip);
         let ci = if flake || self.broken(&tree) {
-            CiStatus::Failed
+            // The world has no check names, so a failure carries none.
+            CiStatus::Failed(Failure::new(BTreeSet::new()))
         } else {
             CiStatus::Passed
         };
@@ -568,108 +463,58 @@ impl World {
         let tree = beyond_trunk.collect();
         let record = &mut self.runs[run];
         record.consumed = self.now - record.started_at;
-        record.verdict = Some(ci);
-        record.tree = tree;
-        let b = self.batches.get_mut(&batch).expect("tracked");
-        b.status.state = BatchState::Testing { tip, ci };
-        b.run = Run::Done { run };
         let verdict = if ci == CiStatus::Passed {
             "passed"
         } else {
             "failed"
         };
+        record.verdict = Some(ci.clone());
+        record.tree = tree;
+        let b = self.batches.get_mut(&batch).expect("tracked");
+        b.status.state = BatchState::Testing { tip, ci };
+        b.run = Run::Done { run };
         self.note(|| format!("ci {} {verdict}", batch.0));
         self.running -= 1;
         self.assign_runners();
     }
 
-    fn snapshot(&self) -> Observation {
-        let prs = self
+    /// The observation now. A departure the queue did not cause is a
+    /// withdrawal of intent, the only exit the world has besides landing and
+    /// ejection.
+    fn snapshot(&self) -> Result<Observation, ForgeError> {
+        let prs: Vec<PrSnapshot> = self
             .prs
             .values()
             .filter(|p| p.queued())
-            .map(|p| PrSnapshot {
-                number: p.record.number,
-                head: p.head.clone(),
-                mergeable: if p.conflicts_with_trunk {
-                    Mergeable::Conflicting
+            .map(|p| {
+                let status = if p.conflicts_with_trunk {
+                    PrStatus::Conflicting(ConflictWith::Trunk)
                 } else {
-                    Mergeable::Clean
-                },
-                head_ci: CiStatus::Passed,
+                    PrStatus::Ready
+                };
+                PrSnapshot::new(p.record.number, p.head.clone(), PrBase::Trunk, status)
             })
             .collect();
-        Observation {
-            trunk: self.trunk.clone(),
+        let batches: Vec<BatchStatus> = self.batches.values().map(|b| b.status.clone()).collect();
+        let departed = self.ledger.departures(&prs, &batches, |gone| {
+            match &self.prs[&gone.number].record.left {
+                Some((_, Exit::Withdrawn)) => Ok(Departed::Withdrawn(Withdrawal::IntentCleared)),
+                left => Err(ForgeError::Permanent(
+                    format!(
+                        "pr {} left as {left:?} with no batch landed or ejection to show for it",
+                        gone.number.0
+                    )
+                    .into(),
+                )),
+            }
+        })?;
+        Ok(Observation::new(
+            Timestamp(self.now),
+            self.trunk.clone(),
             prs,
-            batches: self.batches.values().map(|b| b.status.clone()).collect(),
-        }
-    }
-
-    fn observed_batch(&self, id: BatchId) -> Option<&BatchStatus> {
-        self.latest
-            .as_ref()
-            .and_then(|o| o.batches.iter().find(|b| b.id == id))
-    }
-
-    fn batch_known(&self, id: BatchId) -> bool {
-        self.observed_batch(id).is_some() && !self.since.retired.contains(&id)
-    }
-
-    fn pr_known(&self, pr: PrNumber) -> bool {
-        let observed = self
-            .latest
-            .as_ref()
-            .is_some_and(|o| o.prs.iter().any(|p| p.number == pr));
-        observed && !self.since.removed.contains(&pr)
-    }
-
-    fn in_landing(&self, pr: PrNumber) -> bool {
-        self.since.landed.iter().any(|&b| {
-            self.observed_batch(b)
-                .is_some_and(|s| s.members.iter().any(|m| m.pr == pr))
-        })
-    }
-
-    fn check_start(&self, batch: &BatchStart) -> Result<(), Violation> {
-        let id = batch.id;
-        if self.observed_batch(id).is_some() || self.since.started.contains(&id) {
-            return Err(Violation::BatchIdInUse { batch: id });
-        }
-        if batch.prs.is_empty() {
-            return Err(Violation::EmptyBatch { batch: id });
-        }
-        let mut seen = BTreeSet::new();
-        for &pr in &batch.prs {
-            if !seen.insert(pr) {
-                return Err(Violation::DuplicateMember { batch: id, pr });
-            }
-            if self.in_landing(pr) {
-                return Err(Violation::LandedInPlan {
-                    effect: "start_batch",
-                    pr,
-                });
-            }
-            if !self.pr_known(pr) {
-                return Err(Violation::MemberNotKnown { batch: id, pr });
-            }
-        }
-        let base_known = self.latest.as_ref().is_some_and(|o| {
-            o.trunk == batch.base
-                || o.batches.iter().any(|b| match &b.state {
-                    BatchState::Testing { tip, .. }
-                    | BatchState::Landed { tip }
-                    | BatchState::LandRefused { tip, .. } => *tip == batch.base,
-                    BatchState::Conflict { .. } => false,
-                })
-        });
-        if !base_known {
-            return Err(Violation::UnknownBase {
-                batch: id,
-                base: batch.base.clone(),
-            });
-        }
-        Ok(())
+            batches,
+            departed,
+        ))
     }
 
     fn refusal(&self, status: &BatchStatus) -> Option<LandRefusal> {
@@ -699,79 +544,49 @@ impl World {
 
 impl Forge for World {
     fn observe(&mut self) -> Result<Observation, ForgeError> {
-        let observation = self.snapshot();
-        self.latest = Some(observation.clone());
-        self.since = Since::default();
+        let observation = self.snapshot()?;
+        self.ledger.observed(&observation)?;
+        for d in &observation.departed {
+            self.note(|| format!("depart {} {}", d.pr.0, d.how));
+        }
         Ok(observation)
     }
 
     fn start_batch(&mut self, batch: &BatchStart) -> Result<(), ForgeError> {
-        self.check_start(batch).map_err(violation)?;
+        self.ledger.check_start(batch)?;
         let members: Vec<BatchMember> = batch
             .prs
             .iter()
-            .map(|&pr| BatchMember {
-                pr,
-                head: self.prs[&pr].head.clone(),
-            })
+            .map(|&pr| BatchMember::new(pr, self.prs[&pr].head.clone()))
             .collect();
-        let conflict = batch
-            .prs
-            .iter()
-            .find(|pr| self.prs[pr].conflicts_with_trunk);
-        let (state, run) = match conflict {
-            Some(&pr) => {
-                let with = ConflictWith::Trunk;
-                (BatchState::Conflict { pr, with }, Run::None)
-            }
-            None => {
-                let tip = self.mint();
-                let tip_commit = Commit {
-                    parent: Some(batch.base.clone()),
-                    members: batch.prs.clone(),
-                };
-                self.commits.insert(tip.clone(), tip_commit);
-                let (min, max) = (self.config.ci_minutes.min, self.config.ci_minutes.max);
-                let duration = self.streams.ci.uniform(min, max) * 60;
-                let ci = CiStatus::Pending;
-                (BatchState::Testing { tip, ci }, Run::Waiting { duration })
-            }
+        // Every build succeeds: a valid plan never starts a member that
+        // conflicts with trunk, since it is never `Ready`, and the world has
+        // no conflicts between members. A probe's tip adds no members, so
+        // its run tests the base's tree alone.
+        let tip = self.mint();
+        let tip_commit = Commit {
+            parent: Some(batch.base.clone()),
+            members: batch.prs.clone(),
         };
-        let waiting = matches!(run, Run::Waiting { .. });
-        let status = BatchStatus {
-            id: batch.id,
-            base: batch.base.clone(),
-            members,
-            state,
+        self.commits.insert(tip.clone(), tip_commit);
+        let (min, max) = (self.config.ci_minutes.min, self.config.ci_minutes.max);
+        let duration = self.streams.ci.uniform(min, max) * 60;
+        let state = BatchState::Testing {
+            tip,
+            ci: CiStatus::Pending,
         };
+        let status = BatchStatus::new(batch.id, batch.base.clone(), members, state);
+        let run = Run::Waiting { duration };
         self.batches.insert(batch.id, SimBatch { status, run });
-        self.since.started.insert(batch.id);
-        if waiting {
-            self.waiting.push_back(batch.id);
-            self.assign_runners();
-        }
+        self.ledger.started(batch.id);
+        self.waiting.push_back(batch.id);
+        self.assign_runners();
         Ok(())
     }
 
     fn land(&mut self, batch: BatchId) -> Result<(), ForgeError> {
-        if !self.batch_known(batch) {
-            return Err(violation(Violation::UnknownBatch {
-                effect: "land",
-                batch,
-            }));
-        }
-        if self.since.landed.contains(&batch) {
-            return Err(violation(Violation::LandedTwice { batch }));
-        }
-        let observed = self.observed_batch(batch).expect("known");
-        let BatchState::Testing {
-            tip,
-            ci: CiStatus::Passed,
-        } = observed.state.clone()
-        else {
-            return Err(violation(Violation::NotPassed { batch }));
-        };
-        self.since.landed.insert(batch);
+        let tip = self.ledger.check_land(batch)?.tip;
+        self.ledger.landing(batch);
         let status = self.batches[&batch].status.clone();
         let refusal = self.refusal(&status);
         let b = self.batches.get_mut(&batch).expect("known");
@@ -786,21 +601,16 @@ impl Forge for World {
         self.trunk = tip;
         for m in &status.members {
             self.leave(m.pr, Exit::Landed);
-            self.since.removed.insert(m.pr);
         }
+        self.ledger.landed(batch);
         debug_assert_eq!(self.check_landed(&status.members), Ok(()));
         Ok(())
     }
 
     fn retire(&mut self, batch: BatchId) -> Result<(), ForgeError> {
-        if !self.batch_known(batch) {
-            return Err(violation(Violation::UnknownBatch {
-                effect: "retire",
-                batch,
-            }));
-        }
+        self.ledger.check_retire(batch)?;
         let b = self.batches.remove(&batch).expect("known");
-        self.since.retired.insert(batch);
+        self.ledger.retired(batch);
         match b.run {
             Run::Waiting { .. } => self.waiting.retain(|&w| w != batch),
             Run::Running { run, done } => {
@@ -809,25 +619,17 @@ impl Forge for World {
                 self.running -= 1;
                 self.assign_runners();
             }
-            Run::None | Run::Done { .. } => {}
+            Run::Done { .. } => {}
         }
         Ok(())
     }
 
     fn eject(&mut self, pr: PrNumber, reason: &EjectReason) -> Result<(), ForgeError> {
-        if self.in_landing(pr) {
-            return Err(violation(Violation::LandedInPlan {
-                effect: "eject",
-                pr,
-            }));
-        }
-        if !self.pr_known(pr) {
-            return Err(violation(Violation::UnknownPr { pr }));
-        }
+        self.ledger.check_eject(pr)?;
         let justified = self.justified(pr);
         let reason = reason.clone();
         self.leave(pr, Exit::Ejected { reason, justified });
-        self.since.removed.insert(pr);
+        self.ledger.ejected(pr);
         Ok(())
     }
 }

@@ -13,7 +13,7 @@ use dorfq_core::{
     BatchId, BatchStart, EjectReason, Forge, ForgeError, Observation, PrNumber, Scheduler,
 };
 use dorfq_forge_github::api::{ApiError, RestClient};
-use dorfq_forge_github::{GitHubForge, Settings};
+use dorfq_forge_github::{GitHubForge, Settings, system_clock};
 use dorfq_forge_mock::{MockForge, Scenario, ScenarioError};
 use dorfq_scheduler::SchedulerConfig;
 
@@ -143,8 +143,13 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
                 label: label.clone(),
                 checks: checks.clone(),
             };
-            let forge = GitHubForge::new(Box::new(client), settings, Box::new(io::stdout()))
-                .map_err(ProviderError::GitHub)?;
+            let forge = GitHubForge::new(
+                Box::new(client),
+                settings,
+                Box::new(system_clock),
+                Box::new(io::stdout()),
+            )
+            .map_err(ProviderError::GitHub)?;
             Ok(BuiltForge {
                 forge: Box::new(forge),
                 has_scheduled_events: Box::new(|| false),

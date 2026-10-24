@@ -18,8 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use dorfq_core::{
-    BatchId, BatchState, BatchStatus, CiStatus, ConflictWith, EjectReason, Ejection, Mergeable,
-    Observation, PrNumber, PrSnapshot, Sha,
+    BatchId, BatchState, BatchStatus, CiStatus, EjectReason, Ejection, Observation, PrBase,
+    PrNumber, PrSnapshot, PrStatus, Sha, StackPolicy,
 };
 
 mod all_at_once;
@@ -60,7 +60,7 @@ impl<'a> Ejections<'a> {
     pub(crate) fn eject(&mut self, pr: PrNumber, reason: EjectReason) -> bool {
         let emitted = self.present.contains(&pr) && self.settled.insert(pr);
         if emitted {
-            self.out.push(Ejection { pr, reason });
+            self.out.push(Ejection::new(pr, reason));
         }
         emitted
     }
@@ -71,28 +71,98 @@ impl<'a> Ejections<'a> {
         self.settled.extend(batch.members.iter().map(|m| m.pr));
     }
 
-    /// Ejects every pull request `observation` reports `Conflicting` with
-    /// trunk.
+    /// Ejects every pull request `observation` reports `Conflicting`, with
+    /// what it conflicts with as the reason.
     pub(crate) fn eject_conflicting(&mut self, observation: &Observation) {
         for pr in &observation.prs {
-            if pr.mergeable == Mergeable::Conflicting {
-                self.eject(pr.number, EjectReason::ConflictsWithTrunk);
+            match &pr.status {
+                PrStatus::Conflicting(with) => {
+                    self.eject(pr.number, EjectReason::Conflicts { with: *with });
+                }
+                PrStatus::Ready | PrStatus::Waiting(_) => {}
             }
         }
     }
 }
 
-/// Whether `pr` may join a batch: clean against trunk and its own CI passed.
-pub(crate) fn is_ready(pr: &PrSnapshot) -> bool {
-    pr.mergeable == Mergeable::Clean && pr.head_ci == CiStatus::Passed
+/// Whether `pr` may join a batch: the forge reports it `Ready`.
+fn is_ready(pr: &PrSnapshot) -> bool {
+    matches!(pr.status, PrStatus::Ready)
 }
 
-/// The ejection reason for the member a `Conflict` batch names.
-pub(crate) fn conflict_reason(with: ConflictWith) -> EjectReason {
-    match with {
-        ConflictWith::Trunk => EjectReason::ConflictsWithTrunk,
-        ConflictWith::Pr(pr) => EjectReason::ConflictsWith { pr },
+/// The pull requests a batch may take: of the `Ready` ones `eligible`
+/// accepts, those whose every ancestor is taken too, less every ancestor of
+/// an enqueued `Atomic` pull request that is not taken, repeated until
+/// nothing changes. Ordered so that every base precedes its children, ties
+/// by number.
+pub(crate) fn batchable(
+    observation: &Observation,
+    eligible: impl Fn(&PrSnapshot) -> bool,
+) -> Vec<PrNumber> {
+    let by_number: BTreeMap<PrNumber, &PrSnapshot> =
+        observation.prs.iter().map(|p| (p.number, p)).collect();
+    let mut set: BTreeSet<PrNumber> = observation
+        .prs
+        .iter()
+        .filter(|p| is_ready(p) && eligible(p))
+        .map(|p| p.number)
+        .collect();
+    loop {
+        let held_back: BTreeSet<PrNumber> = observation
+            .prs
+            .iter()
+            .filter(|p| p.stack == StackPolicy::Atomic && !set.contains(&p.number))
+            .flat_map(|p| ancestors(&by_number, p))
+            .collect();
+        let kept: BTreeSet<PrNumber> = set
+            .iter()
+            .copied()
+            .filter(|n| {
+                !held_back.contains(n)
+                    && match by_number[n].base {
+                        PrBase::Trunk => true,
+                        PrBase::Pr(base) => set.contains(&base),
+                    }
+            })
+            .collect();
+        if kept == set {
+            break;
+        }
+        set = kept;
     }
+    let mut order = Vec::with_capacity(set.len());
+    let mut placed: BTreeSet<PrNumber> = BTreeSet::new();
+    let mut open: BTreeSet<PrNumber> = set
+        .iter()
+        .copied()
+        .filter(|n| by_number[n].base == PrBase::Trunk)
+        .collect();
+    while let Some(next) = open.pop_first() {
+        order.push(next);
+        placed.insert(next);
+        open.extend(
+            set.iter()
+                .copied()
+                .filter(|n| by_number[n].base == PrBase::Pr(next) && !placed.contains(n)),
+        );
+    }
+    order
+}
+
+/// `pr`'s ancestors, nearest first. The observation's base relation is
+/// closed and acyclic (rule 8).
+fn ancestors<'a>(
+    by_number: &'a BTreeMap<PrNumber, &'a PrSnapshot>,
+    pr: &PrSnapshot,
+) -> impl Iterator<Item = PrNumber> + 'a {
+    let mut at = pr.base;
+    std::iter::from_fn(move || match at {
+        PrBase::Trunk => None,
+        PrBase::Pr(n) => {
+            at = by_number[&n].base;
+            Some(n)
+        }
+    })
 }
 
 /// Batch ids for a scheduler to start batches under.
@@ -160,4 +230,80 @@ pub(crate) fn chain<'a>(
         node = &batch.base;
     }
     (end, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+    use dorfq_core::{CiStatus, Hold};
+
+    fn all(observation: &Observation) -> Vec<u64> {
+        batchable(observation, |_| true)
+            .into_iter()
+            .map(|n| n.0)
+            .collect()
+    }
+
+    #[test]
+    fn batchable_puts_every_base_before_its_children() {
+        // 5 <- 2 <- 4, 5 <- 3, and 1 on trunk.
+        let prs = vec![
+            ready(1),
+            stacked(2, 5),
+            stacked(3, 5),
+            stacked(4, 2),
+            ready(5),
+        ];
+        assert_eq!(all(&observation(prs, vec![])), [1, 5, 2, 3, 4]);
+    }
+
+    #[test]
+    fn batchable_drops_the_children_of_a_waiting_parent() {
+        let prs = vec![
+            held(1, Hold::OwnCiPending),
+            stacked(2, 1),
+            stacked(3, 2),
+            ready(4),
+        ];
+        assert_eq!(all(&observation(prs, vec![])), [4]);
+    }
+
+    #[test]
+    fn batchable_holds_back_the_ancestors_of_a_waiting_atomic_tip() {
+        let mut tip = atomic(held(3, Hold::Review));
+        tip.base = PrBase::Pr(PrNumber(2));
+        // 4 on 1 is not an ancestor of 3 but loses its base with 1.
+        let prs = vec![ready(1), stacked(2, 1), tip, stacked(4, 1), ready(5)];
+        assert_eq!(all(&observation(prs, vec![])), [5]);
+    }
+
+    #[test]
+    fn batchable_releases_the_ancestors_once_the_atomic_tip_is_ready_or_gone() {
+        let prs = vec![ready(1), stacked(2, 1), atomic(stacked(3, 2))];
+        assert_eq!(all(&observation(prs, vec![])), [1, 2, 3]);
+        let prs = vec![ready(1), stacked(2, 1)];
+        assert_eq!(all(&observation(prs, vec![])), [1, 2]);
+    }
+
+    #[test]
+    fn batchable_under_trunk_only_eligibility_holds_back_an_atomic_child_s_parent() {
+        let prs = vec![ready(1), atomic(stacked(2, 1)), ready(3), stacked(4, 3)];
+        let trunk_only = batchable(&observation(prs, vec![]), |p| p.base == PrBase::Trunk);
+        assert_eq!(trunk_only, numbers(&[3]));
+    }
+
+    #[test]
+    fn chain_walks_through_probes_on_trunk_and_on_a_tracked_tip() {
+        let batches = [
+            testing(1, trunk(), &[], CiStatus::Pending),
+            testing(2, tip(1), &[3], CiStatus::Pending),
+            testing(3, tip(2), &[], CiStatus::Passed),
+        ];
+        let trunk = trunk();
+        let (end, path) = chain(&trunk, &batches);
+        assert_eq!(end, &tip(3));
+        let ids: Vec<u64> = path.iter().map(|b| b.id.0).collect();
+        assert_eq!(ids, [3, 2, 1]);
+    }
 }

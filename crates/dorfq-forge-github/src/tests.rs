@@ -1,16 +1,18 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::rc::Rc;
 
 use dorfq_core::{
-    BatchId, BatchMember, BatchStart, BatchState, CiStatus, ConflictWith, EjectReason, Forge,
-    ForgeError, LandRefusal, Mergeable, PrNumber, Sha,
+    BatchId, BatchMember, BatchStart, BatchState, CheckName, CiStatus, ConflictWith, Departed,
+    Departure, EjectReason, Forge, ForgeError, Hold, LandRefusal, PrBase, PrNumber, PrStatus, Sha,
+    Timestamp, Withdrawal,
 };
 
 use crate::api::{ApiError, CheckOutcome, CheckResult};
 use crate::fake::{Failure, FakeGitHub};
 use crate::record::{Record, RecordState};
-use crate::{GitHubForge, Settings, branch};
+use crate::{Clock, GitHubForge, Settings, branch};
 
 /// A sink the test can read back.
 #[derive(Clone, Default)]
@@ -45,10 +47,26 @@ fn settings() -> Settings {
     }
 }
 
+/// The time every test forge's clock reads.
+const NOW: Timestamp = Timestamp(1_700_000_000);
+
+fn clock() -> Clock {
+    Box::new(|| Ok(NOW))
+}
+
 fn forge(fake: &FakeGitHub) -> (GitHubForge, Buffer) {
+    forge_with_clock(fake, clock())
+}
+
+fn forge_with_clock(fake: &FakeGitHub, clock: Clock) -> (GitHubForge, Buffer) {
     let sink = Buffer::default();
-    let forge = GitHubForge::new(Box::new(fake.clone()), settings(), Box::new(sink.clone()))
-        .unwrap_or_else(|e| panic!("{e}"));
+    let forge = GitHubForge::new(
+        Box::new(fake.clone()),
+        settings(),
+        clock,
+        Box::new(sink.clone()),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     (forge, sink)
 }
 
@@ -69,6 +87,13 @@ fn passed(fake: &FakeGitHub, sha: &Sha) {
     );
 }
 
+/// An open pull request whose own checks passed; its head.
+fn ready_pr(fake: &FakeGitHub, number: u64) -> Sha {
+    let head = fake.open_pr(number);
+    passed(fake, &head);
+    head
+}
+
 fn is_permanent(error: &ForgeError, needle: &str) -> bool {
     matches!(error, ForgeError::Permanent(_)) && error.to_string().contains(needle)
 }
@@ -86,15 +111,12 @@ fn put_record(fake: &FakeGitHub, id: u64, members: &[u64], state: RecordState) -
         base: base.clone(),
         members: members
             .iter()
-            .map(|&n| BatchMember {
-                pr: PrNumber(n),
-                head: fake.pr(n).head.clone(),
-            })
+            .map(|&n| BatchMember::new(PrNumber(n), fake.pr(n).head.clone()))
             .collect(),
         state,
     };
     let sha = fake.commit(std::slice::from_ref(&base));
-    fake.state().commits.get_mut(&sha).unwrap().message = record.render();
+    fake.state().commits.get_mut(&sha).unwrap().message = record.render().unwrap();
     fake.set_ref(&format!("refs/dorfq/batches/{id}"), &sha);
     base
 }
@@ -114,9 +136,14 @@ fn batch_ref(id: u64) -> String {
 fn new_rejects_a_missing_trunk_and_writes_nothing() {
     let fake = FakeGitHub::new();
     fake.state().refs.clear();
-    let error = GitHubForge::new(Box::new(fake.clone()), settings(), Box::new(io::sink()))
-        .err()
-        .unwrap();
+    let error = GitHubForge::new(
+        Box::new(fake.clone()),
+        settings(),
+        clock(),
+        Box::new(io::sink()),
+    )
+    .err()
+    .unwrap();
     assert!(matches!(error, ApiError::Permanent(_)));
     assert!(error.to_string().contains("refs/heads/main"), "{error}");
     assert!(fake.writes().is_empty());
@@ -126,9 +153,14 @@ fn new_rejects_a_missing_trunk_and_writes_nothing() {
 fn new_rejects_a_missing_label_and_writes_nothing() {
     let fake = FakeGitHub::new();
     fake.state().labels.clear();
-    let error = GitHubForge::new(Box::new(fake.clone()), settings(), Box::new(io::sink()))
-        .err()
-        .unwrap();
+    let error = GitHubForge::new(
+        Box::new(fake.clone()),
+        settings(),
+        clock(),
+        Box::new(io::sink()),
+    )
+    .err()
+    .unwrap();
     assert!(matches!(error, ApiError::Permanent(_)));
     assert!(error.to_string().contains("\"queue\""), "{error}");
     assert!(fake.writes().is_empty());
@@ -151,7 +183,7 @@ fn new_rejects_empty_settings_before_any_call() {
         (empty_check, "forge setting checks[2] is empty"),
     ] {
         let fake = FakeGitHub::new();
-        let error = GitHubForge::new(Box::new(fake.clone()), bad, Box::new(io::sink()))
+        let error = GitHubForge::new(Box::new(fake.clone()), bad, clock(), Box::new(io::sink()))
             .err()
             .unwrap();
         assert!(matches!(error, ApiError::Permanent(_)));
@@ -182,31 +214,44 @@ fn observe_reports_trunk_and_labelled_open_prs_against_trunk_sorted() {
     assert!(observation.batches.is_empty());
 }
 
+fn waiting(holds: &[Hold]) -> PrStatus {
+    PrStatus::Waiting(holds.iter().copied().collect())
+}
+
+fn statuses(forge: &mut GitHubForge) -> Vec<PrStatus> {
+    let observation = forge.observe().unwrap();
+    assert!(observation.prs.iter().all(|p| p.base == PrBase::Trunk));
+    observation.prs.into_iter().map(|p| p.status).collect()
+}
+
 #[test]
-fn observe_maps_mergeable_including_unknown() {
+fn observe_maps_mergeable_and_own_ci_to_status() {
     let fake = FakeGitHub::new();
-    for n in 1..=3 {
-        fake.open_pr(n);
+    let heads: Vec<Sha> = (1..=5).map(|n| fake.open_pr(n)).collect();
+    for head in &heads[..3] {
+        passed(&fake, head);
     }
+    fake.set_checks(&heads[4], vec![result("lint", CheckOutcome::Failed)]);
     fake.pr(2).mergeable = Some(false);
     fake.pr(3).mergeable = None;
+    fake.pr(4).mergeable = None;
+    fake.pr(5).mergeable = Some(false);
     let (mut forge, _) = forge(&fake);
 
-    let mergeable: Vec<Mergeable> = forge
-        .observe()
-        .unwrap()
-        .prs
-        .iter()
-        .map(|p| p.mergeable)
-        .collect();
     assert_eq!(
-        mergeable,
-        [Mergeable::Clean, Mergeable::Conflicting, Mergeable::Unknown]
+        statuses(&mut forge),
+        [
+            PrStatus::Ready,
+            PrStatus::Conflicting(ConflictWith::Trunk),
+            waiting(&[Hold::MergeabilityUnknown]),
+            waiting(&[Hold::MergeabilityUnknown, Hold::OwnCiPending]),
+            PrStatus::Conflicting(ConflictWith::Trunk),
+        ]
     );
 }
 
 #[test]
-fn observe_reads_head_ci_from_the_required_names() {
+fn observe_reads_own_ci_from_the_required_names() {
     let fake = FakeGitHub::new();
     let heads: Vec<Sha> = (1..=4).map(|n| fake.open_pr(n)).collect();
     passed(&fake, &heads[0]);
@@ -228,20 +273,13 @@ fn observe_reads_head_ci_from_the_required_names() {
     );
     let (mut forge, _) = forge(&fake);
 
-    let ci: Vec<CiStatus> = forge
-        .observe()
-        .unwrap()
-        .prs
-        .iter()
-        .map(|p| p.head_ci)
-        .collect();
     assert_eq!(
-        ci,
+        statuses(&mut forge),
         [
-            CiStatus::Passed,
-            CiStatus::Pending,
-            CiStatus::Failed,
-            CiStatus::Passed
+            PrStatus::Ready,
+            waiting(&[Hold::OwnCiPending]),
+            waiting(&[Hold::OwnCiFailed]),
+            PrStatus::Ready,
         ]
     );
 }
@@ -332,9 +370,48 @@ fn a_testing_record_at_its_branch_is_testing_with_ci_from_the_tip() {
     assert_eq!(
         forge.observe().unwrap().batches[0].state,
         BatchState::Testing {
-            tip,
+            tip: tip.clone(),
             ci: CiStatus::Passed
         }
+    );
+
+    fake.set_checks(
+        &tip,
+        vec![
+            result("check", CheckOutcome::Failed),
+            result("lint", CheckOutcome::Failed),
+            result("deploy-preview", CheckOutcome::Failed),
+        ],
+    );
+    let names = ["check", "lint"].map(|n| CheckName(n.to_owned()));
+    assert_eq!(
+        forge.observe().unwrap().batches[0].state,
+        BatchState::Testing {
+            tip,
+            ci: CiStatus::Failed(dorfq_core::Failure::new(BTreeSet::from(names)))
+        }
+    );
+}
+
+#[test]
+fn observe_reads_now_from_the_clock_it_was_given() {
+    let fake = FakeGitHub::new();
+    let time = Rc::new(Cell::new(10));
+    let reads = Rc::clone(&time);
+    let (mut forge, _) = forge_with_clock(&fake, Box::new(move || Ok(Timestamp(reads.get()))));
+    assert_eq!(forge.observe().unwrap().now, Timestamp(10));
+    time.set(25);
+    assert_eq!(forge.observe().unwrap().now, Timestamp(25));
+}
+
+#[test]
+fn a_clock_that_cannot_be_read_is_permanent() {
+    let fake = FakeGitHub::new();
+    let (mut forge, _) = forge_with_clock(&fake, Box::new(|| Err("no clock".to_owned())));
+    let error = forge.observe().unwrap_err();
+    assert!(
+        is_permanent(&error, "reading the clock: no clock"),
+        "{error}"
     );
 }
 
@@ -342,9 +419,11 @@ fn a_testing_record_at_its_branch_is_testing_with_ci_from_the_tip() {
 fn a_testing_batch_whose_tip_is_trunk_is_still_testing() {
     let fake = FakeGitHub::new();
     fake.open_pr(1);
-    let tip = fake.trunk();
+    // Trunk was moved to the tip by another hand.
+    let tip = fake.commit(&[fake.trunk()]);
     put_record(&fake, 1, &[1], RecordState::Testing { tip: tip.clone() });
     fake.set_ref(&batch_ref(1), &tip);
+    fake.set_ref(&branch("main"), &tip);
     let (mut forge, _) = forge(&fake);
 
     assert_eq!(
@@ -487,15 +566,22 @@ fn a_landing_record_whose_tip_is_not_in_trunk_is_testing() {
 fn landed_and_refused_records_are_read_back_whatever_the_branch() {
     let fake = FakeGitHub::new();
     fake.open_pr(1);
-    let tip = tip_over(&fake, &[1]);
+    let tips: Vec<Sha> = (0..3).map(|_| tip_over(&fake, &[1])).collect();
     let moved = fake.commit(&[fake.trunk()]);
-    put_record(&fake, 1, &[1], RecordState::Landed { tip: tip.clone() });
+    put_record(
+        &fake,
+        1,
+        &[1],
+        RecordState::Landed {
+            tip: tips[0].clone(),
+        },
+    );
     put_record(
         &fake,
         2,
         &[1],
         RecordState::Refused {
-            tip: tip.clone(),
+            tip: tips[1].clone(),
             reason: LandRefusal::TrunkMoved {
                 trunk: moved.clone(),
             },
@@ -506,11 +592,11 @@ fn landed_and_refused_records_are_read_back_whatever_the_branch() {
         3,
         &[1],
         RecordState::Refused {
-            tip: tip.clone(),
+            tip: tips[2].clone(),
             reason: LandRefusal::MemberGone { pr: PrNumber(1) },
         },
     );
-    fake.set_ref(&batch_ref(2), &tip);
+    fake.set_ref(&batch_ref(2), &tips[1]);
     let (mut forge, _) = forge(&fake);
 
     let states: Vec<BatchState> = forge
@@ -523,13 +609,15 @@ fn landed_and_refused_records_are_read_back_whatever_the_branch() {
     assert_eq!(
         states,
         [
-            BatchState::Landed { tip: tip.clone() },
+            BatchState::Landed {
+                tip: tips[0].clone()
+            },
             BatchState::LandRefused {
-                tip: tip.clone(),
+                tip: tips[1].clone(),
                 reason: LandRefusal::TrunkMoved { trunk: moved }
             },
             BatchState::LandRefused {
-                tip,
+                tip: tips[2].clone(),
                 reason: LandRefusal::MemberGone { pr: PrNumber(1) }
             },
         ]
@@ -540,9 +628,9 @@ fn landed_and_refused_records_are_read_back_whatever_the_branch() {
 fn batches_are_sorted_by_id() {
     let fake = FakeGitHub::new();
     fake.open_pr(1);
-    let tip = tip_over(&fake, &[1]);
     for id in [10, 2, 33] {
-        put_record(&fake, id, &[1], RecordState::Landed { tip: tip.clone() });
+        let tip = tip_over(&fake, &[1]);
+        put_record(&fake, id, &[1], RecordState::Landed { tip });
     }
     let (mut forge, _) = forge(&fake);
 
@@ -554,6 +642,24 @@ fn batches_are_sorted_by_id() {
         .map(|b| b.id.0)
         .collect();
     assert_eq!(ids, [2, 10, 33]);
+}
+
+#[test]
+fn an_observation_with_two_batches_on_one_tip_is_permanent() {
+    let fake = FakeGitHub::new();
+    fake.open_pr(1);
+    let tip = tip_over(&fake, &[1]);
+    for id in [1, 2] {
+        put_record(&fake, id, &[1], RecordState::Landed { tip: tip.clone() });
+    }
+    let (mut forge, sink) = forge(&fake);
+
+    let error = forge.observe().unwrap_err();
+    assert!(
+        is_permanent(&error, "batches 1 and 2 have one tip"),
+        "{error}"
+    );
+    assert!(sink.lines().is_empty());
 }
 
 #[test]
@@ -602,7 +708,7 @@ fn a_record_under_another_batch_ref_is_permanent() {
 #[test]
 fn a_first_sighting_with_no_marker_is_greeted_at_the_next_flush() {
     let fake = FakeGitHub::new();
-    fake.open_pr(1);
+    ready_pr(&fake, 1);
     fake.state()
         .comments
         .insert(1, vec!["Please review".to_owned()]);
@@ -622,7 +728,7 @@ fn a_first_sighting_with_no_marker_is_greeted_at_the_next_flush() {
 fn a_last_marker_of_queued_or_testing_is_not_greeted_again() {
     for last in ["queued", "testing"] {
         let fake = FakeGitHub::new();
-        fake.open_pr(1);
+        ready_pr(&fake, 1);
         fake.state().comments.insert(
             1,
             vec![marker("withdrawn"), marker(last), "LGTM".to_owned()],
@@ -637,10 +743,80 @@ fn a_last_marker_of_queued_or_testing_is_not_greeted_again() {
 }
 
 #[test]
+fn a_pull_request_is_told_what_holds_it_each_time_it_starts_waiting() {
+    let fake = FakeGitHub::new();
+    let head = fake.open_pr(1);
+    let (mut forge, sink) = forge(&fake);
+
+    forge.observe().unwrap();
+    forge.observe().unwrap();
+    assert_eq!(
+        sink.lines(),
+        [
+            "message to pr 1: queued",
+            "message to pr 1: held: own CI pending"
+        ]
+    );
+    let comments = fake.comments(1);
+    assert!(comments[1].starts_with("<!-- dorfq: held -->\n"));
+    assert!(comments[1].contains("Waiting in the merge queue: own CI pending."));
+
+    passed(&fake, &head);
+    forge.observe().unwrap();
+    fake.pr(1).mergeable = None;
+    forge.observe().unwrap();
+    fake.set_checks(&head, vec![result("lint", CheckOutcome::Failed)]);
+    forge.observe().unwrap();
+    forge.observe().unwrap();
+    assert_eq!(
+        sink.lines()[2..],
+        ["message to pr 1: held: own CI failed, mergeability unknown"]
+    );
+}
+
+#[test]
+fn a_pull_request_waiting_only_on_mergeability_is_told_nothing() {
+    // GitHub recomputes mergeability each time trunk moves.
+    let fake = FakeGitHub::new();
+    ready_pr(&fake, 1);
+    let head = fake.open_pr(2);
+    passed(&fake, &head);
+    fake.pr(2).mergeable = None;
+    let (mut forge, sink) = forge(&fake);
+    forge.observe().unwrap();
+
+    fake.pr(1).mergeable = None;
+    fake.pr(2).mergeable = Some(true);
+    forge.observe().unwrap();
+    fake.pr(1).mergeable = Some(true);
+    forge.observe().unwrap();
+    forge.observe().unwrap();
+    assert_eq!(
+        sink.lines(),
+        ["message to pr 1: queued", "message to pr 2: queued"]
+    );
+}
+
+#[test]
+fn a_first_sighting_already_told_held_is_not_told_again() {
+    let fake = FakeGitHub::new();
+    fake.open_pr(1);
+    fake.state()
+        .comments
+        .insert(1, vec![marker("queued"), marker("held")]);
+    let (mut forge, sink) = forge(&fake);
+
+    forge.observe().unwrap();
+    forge.observe().unwrap();
+    assert_eq!(fake.comments(1).len(), 2);
+    assert!(sink.lines().is_empty());
+}
+
+#[test]
 fn a_last_marker_of_landed_ejected_or_withdrawn_is_greeted() {
     for last in ["landed", "ejected", "withdrawn"] {
         let fake = FakeGitHub::new();
-        fake.open_pr(1);
+        ready_pr(&fake, 1);
         fake.state()
             .comments
             .insert(1, vec![marker("queued"), marker(last)]);
@@ -672,7 +848,7 @@ fn a_pull_request_observed_twice_lists_its_comments_once() {
 fn a_known_pull_request_that_vanishes_is_told_withdrawn() {
     for how in ["unlabelled", "closed", "retargeted"] {
         let fake = FakeGitHub::new();
-        fake.open_pr(1);
+        ready_pr(&fake, 1);
         let (mut forge, sink) = forge(&fake);
         forge.observe().unwrap();
 
@@ -696,9 +872,162 @@ fn a_known_pull_request_that_vanishes_is_told_withdrawn() {
 }
 
 #[test]
+fn departed_says_how_each_pull_request_left_asking_only_about_the_rest() {
+    let fake = FakeGitHub::new();
+    let heads = queued(&fake, 7);
+    let (mut forge, sink) = observed(&fake);
+    forge.start_batch(&start(1, &fake.trunk(), &[1])).unwrap();
+    let tip = fake.get(&batch_ref(1)).expect("published");
+    passed(&fake, &tip);
+    forge.observe().unwrap();
+
+    // 1 lands, and GitHub marks it merged; 2 is ejected; 3 is unlabelled,
+    // 4 closed, 5 retargeted, 6 merged by another hand, 7 retargeted and
+    // merged there.
+    forge.land(BatchId(1)).unwrap();
+    {
+        let mut one = fake.pr(1);
+        one.open = false;
+        one.merged = true;
+    }
+    forge.eject(PrNumber(2), &CONFLICTS_WITH_TRUNK).unwrap();
+    fake.pr(3).labels.clear();
+    fake.pr(4).open = false;
+    fake.pr(5).base = "release".to_owned();
+    {
+        let mut six = fake.pr(6);
+        six.open = false;
+        six.merged = true;
+    }
+    {
+        let mut seven = fake.pr(7);
+        seven.base = "release".to_owned();
+        seven.open = false;
+        seven.merged = true;
+    }
+    sink.0.borrow_mut().clear();
+    let asked_before = fake.calls_to(&["get_pr"]).len();
+    let observation = forge.observe().unwrap();
+
+    let how = |n: usize, how| Departure::new(PrNumber(n as u64), heads[n - 1].clone(), how);
+    assert_eq!(
+        observation.departed,
+        [
+            how(1, Departed::Landed { batch: BatchId(1) }),
+            how(2, Departed::Ejected),
+            how(3, Departed::Withdrawn(Withdrawal::IntentCleared)),
+            how(4, Departed::Withdrawn(Withdrawal::Closed)),
+            how(5, Departed::Withdrawn(Withdrawal::Retargeted)),
+            how(6, Departed::Merged),
+            how(7, Departed::Withdrawn(Withdrawal::Retargeted)),
+        ]
+    );
+    assert_eq!(
+        fake.calls_to(&["get_pr"])[asked_before..],
+        ["get_pr 3", "get_pr 4", "get_pr 5", "get_pr 6", "get_pr 7"]
+    );
+    forge.observe().unwrap();
+    assert_eq!(
+        sink.lines(),
+        (3..=7)
+            .map(|n| format!("message to pr {n}: withdrawn"))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_pull_request_listed_twice_at_one_head_is_reported_once() {
+    // A pull request opened between two page reads shifts the item on the
+    // boundary onto the next page too.
+    let fake = FakeGitHub::new();
+    let heads = queued(&fake, 2);
+    fake.state().listed_again.push((1, heads[0].clone()));
+    let (mut forge, _) = forge(&fake);
+
+    let observation = forge.observe().unwrap();
+    let numbers: Vec<PrNumber> = observation.prs.iter().map(|p| p.number).collect();
+    assert_eq!(numbers, [PrNumber(1), PrNumber(2)]);
+    assert_eq!(fake.calls_to(&["get_pr"]), ["get_pr 1", "get_pr 2"]);
+}
+
+#[test]
+fn a_pull_request_listed_at_two_heads_is_listed_again_next_tick() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    let (mut forge, sink) = observed(&fake);
+    let moved = fake.commit(&[fake.trunk()]);
+    fake.state().listed_again.push((1, moved));
+
+    let error = forge.observe().unwrap_err();
+    assert!(matches!(error, ForgeError::Transient(_)), "{error}");
+    assert!(error.to_string().contains("#1"), "{error}");
+    fake.state().listed_again.clear();
+    assert!(forge.observe().unwrap().departed.is_empty());
+    assert!(sink.lines().is_empty());
+}
+
+#[test]
+fn an_enqueued_pull_request_the_listing_left_out_is_listed_again_next_tick() {
+    // A pull request closed between two page reads shifts the item on the
+    // boundary onto the earlier page, which was already read.
+    let fake = FakeGitHub::new();
+    queued(&fake, 2);
+    let (mut forge, sink) = observed(&fake);
+    fake.state().unlisted.insert(1);
+
+    let error = forge.observe().unwrap_err();
+    assert!(matches!(error, ForgeError::Transient(_)), "{error}");
+    assert!(error.to_string().contains("#1"), "{error}");
+    fake.state().unlisted.clear();
+    let observation = forge.observe().unwrap();
+    assert!(observation.departed.is_empty());
+    assert_eq!(observation.prs.len(), 2);
+    forge.observe().unwrap();
+    assert!(sink.lines().is_empty());
+}
+
+#[test]
+fn a_record_an_earlier_build_published_at_its_base_is_permanent() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    let base = fake.trunk();
+    put_record(&fake, 3, &[1], RecordState::Testing { tip: base.clone() });
+    fake.set_ref(&batch_ref(3), &base);
+    let (mut forge, _) = forge(&fake);
+
+    let error = forge.observe().unwrap_err();
+    assert!(is_permanent(&error, "batch 3's tip is its base"), "{error}");
+}
+
+#[test]
+fn a_departure_the_queue_completed_at_retire_is_landed() {
+    // The landing's bookkeeping was cut short, so retire completes it for a
+    // member still enqueued; that member departs after its batch is gone.
+    let fake = FakeGitHub::new();
+    let (mut forge, _, _) = passed_batch(&fake, 1);
+    fake.fail_on("create_commit", "state: landed", Failure::Transient);
+    assert!(forge.land(BatchId(1)).is_err());
+    let observation = forge.observe().unwrap();
+    assert_eq!(observation.prs.len(), 1);
+    forge.retire(BatchId(1)).unwrap();
+    let asked_before = fake.calls_to(&["get_pr"]).len();
+    let observation = forge.observe().unwrap();
+    assert!(observation.batches.is_empty());
+    assert_eq!(
+        observation.departed,
+        [Departure::new(
+            PrNumber(1),
+            fake.pr(1).head.clone(),
+            Departed::Landed { batch: BatchId(1) }
+        )]
+    );
+    assert_eq!(fake.calls_to(&["get_pr"]).len(), asked_before);
+}
+
+#[test]
 fn a_withdrawn_pull_request_relabelled_is_greeted_again() {
     let fake = FakeGitHub::new();
-    fake.open_pr(1);
+    ready_pr(&fake, 1);
     let (mut forge, sink) = forge(&fake);
     forge.observe().unwrap();
     fake.pr(1).labels.clear();
@@ -720,8 +1049,8 @@ fn a_withdrawn_pull_request_relabelled_is_greeted_again() {
 #[test]
 fn a_known_pull_request_that_vanishes_with_its_batch_landed_is_told_landed() {
     let fake = FakeGitHub::new();
-    fake.open_pr(1);
-    fake.open_pr(2);
+    ready_pr(&fake, 1);
+    ready_pr(&fake, 2);
     let (mut forge, sink) = forge(&fake);
     forge.observe().unwrap();
 
@@ -754,7 +1083,7 @@ fn a_known_pull_request_that_vanishes_with_its_batch_landed_is_told_landed() {
 #[test]
 fn a_landed_member_still_enqueued_is_told_nothing_at_observe() {
     let fake = FakeGitHub::new();
-    fake.open_pr(1);
+    ready_pr(&fake, 1);
     let (mut forge, sink) = forge(&fake);
     forge.observe().unwrap();
 
@@ -768,7 +1097,7 @@ fn a_landed_member_still_enqueued_is_told_nothing_at_observe() {
 #[test]
 fn a_vanished_member_of_an_unlanded_batch_is_told_withdrawn() {
     let fake = FakeGitHub::new();
-    fake.open_pr(1);
+    ready_pr(&fake, 1);
     let (mut forge, sink) = forge(&fake);
     forge.observe().unwrap();
 
@@ -787,7 +1116,7 @@ fn a_vanished_member_of_an_unlanded_batch_is_told_withdrawn() {
 #[test]
 fn a_failed_observation_changes_nothing_known() {
     let fake = FakeGitHub::new();
-    fake.open_pr(1);
+    ready_pr(&fake, 1);
     let (mut forge, sink) = forge(&fake);
     fake.fail("list_comments", Failure::Transient);
     assert!(matches!(forge.observe(), Err(ForgeError::Transient(_))));
@@ -799,8 +1128,8 @@ fn a_failed_observation_changes_nothing_known() {
 #[test]
 fn the_outbox_keeps_a_comment_through_a_transient_failure() {
     let fake = FakeGitHub::new();
-    fake.open_pr(1);
-    fake.open_pr(2);
+    ready_pr(&fake, 1);
+    ready_pr(&fake, 2);
     let (mut forge, sink) = forge(&fake);
     forge.observe().unwrap();
 
@@ -822,8 +1151,8 @@ fn the_outbox_keeps_a_comment_through_a_transient_failure() {
 #[test]
 fn the_outbox_drops_a_comment_github_refuses_for_good() {
     let fake = FakeGitHub::new();
-    fake.open_pr(1);
-    fake.open_pr(2);
+    ready_pr(&fake, 1);
+    ready_pr(&fake, 2);
     let (mut forge, sink) = forge(&fake);
     forge.observe().unwrap();
 
@@ -857,19 +1186,20 @@ fn observed(fake: &FakeGitHub) -> (GitHubForge, Buffer) {
     (forge, sink)
 }
 
+const CONFLICTS_WITH_TRUNK: EjectReason = EjectReason::Conflicts {
+    with: ConflictWith::Trunk,
+};
+
 fn start(id: u64, base: &Sha, prs: &[u64]) -> BatchStart {
-    BatchStart {
-        id: BatchId(id),
-        base: base.clone(),
-        prs: prs.iter().map(|&n| PrNumber(n)).collect(),
-    }
+    BatchStart::new(
+        BatchId(id),
+        base.clone(),
+        prs.iter().map(|&n| PrNumber(n)).collect(),
+    )
 }
 
 fn member(pr: u64, head: &Sha) -> BatchMember {
-    BatchMember {
-        pr: PrNumber(pr),
-        head: head.clone(),
-    }
+    BatchMember::new(PrNumber(pr), head.clone())
 }
 
 fn record_of(fake: &FakeGitHub, id: u64) -> Record {
@@ -1002,20 +1332,85 @@ fn a_member_with_nothing_to_merge_stays_in_the_batch() {
 }
 
 #[test]
-fn a_batch_with_nothing_to_merge_is_published_at_its_base() {
+fn a_batch_with_nothing_to_merge_ends_on_an_empty_commit_of_its_own() {
     let fake = FakeGitHub::new();
     queued(&fake, 1);
     let base = fake.trunk();
     fake.pr(1).head = base.clone();
+    passed(&fake, &base);
     let (mut forge, _) = observed(&fake);
 
     forge.start_batch(&start(1, &base, &[1])).unwrap();
 
-    assert_eq!(fake.get(&batch_ref(1)), Some(base.clone()));
+    let tip = fake.get(&batch_ref(1)).expect("published");
+    assert_ne!(tip, base);
+    let commit = fake.state().commits[&tip].clone();
+    assert_eq!(commit.parents, std::slice::from_ref(&base));
+    assert_eq!(commit.tree, fake.state().commits[&base].tree);
+    assert_eq!(commit.message, "dorfq batch 1");
     assert_eq!(
         record_of(&fake, 1).state,
-        RecordState::Testing { tip: base }
+        RecordState::Testing { tip: tip.clone() }
     );
+    let observation = forge.observe().unwrap();
+    assert_eq!(
+        observation.batches[0].state,
+        BatchState::Testing {
+            tip,
+            ci: CiStatus::Pending
+        }
+    );
+}
+
+#[test]
+fn a_probe_publishes_an_empty_commit_on_its_base_and_tells_nobody() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    let base = fake.trunk();
+    let (mut first, sink) = observed(&fake);
+    sink.0.borrow_mut().clear();
+
+    first.start_batch(&start(1, &base, &[])).unwrap();
+
+    let tip = fake.get(&batch_ref(1)).expect("published");
+    assert_ne!(tip, base);
+    let commit = fake.state().commits[&tip].clone();
+    assert_eq!(commit.parents, std::slice::from_ref(&base));
+    assert_eq!(commit.tree, fake.state().commits[&base].tree);
+    assert_eq!(commit.message, "dorfq probe 1");
+    assert!(fake.get(&branch("dorfq/build/1")).is_none());
+    let record = record_of(&fake, 1);
+    assert!(record.members.is_empty());
+    assert_eq!(record.state, RecordState::Testing { tip: tip.clone() });
+    assert!(sink.lines().is_empty(), "{:?}", sink.lines());
+
+    let (mut restarted, _) = forge(&fake);
+    let observation = restarted.observe().unwrap();
+    assert!(observation.batches[0].members.is_empty());
+    assert_eq!(
+        observation.batches[0].state,
+        BatchState::Testing {
+            tip,
+            ci: CiStatus::Pending
+        }
+    );
+}
+
+#[test]
+fn land_on_a_passed_probe_is_permanent_and_writes_nothing() {
+    let fake = FakeGitHub::new();
+    let (mut forge, _, _) = passed_batch(&fake, 0);
+    let trunk = fake.trunk();
+    let record = fake.get("refs/dorfq/batches/1");
+
+    match forge.land(BatchId(1)) {
+        Err(ForgeError::Permanent(e)) => assert!(e.to_string().contains("probe"), "{e}"),
+        other => panic!("expected a permanent error, got {other:?}"),
+    }
+    assert_eq!(fake.trunk(), trunk);
+    assert_eq!(fake.get("refs/dorfq/batches/1"), record);
+    forge.retire(BatchId(1)).unwrap();
+    assert!(forge.observe().unwrap().batches.is_empty());
 }
 
 /// Starts batch 1 over `prs` and returns what its record says it
@@ -1071,16 +1466,21 @@ fn a_conflict_at_the_first_member_is_with_trunk() {
 }
 
 #[test]
-fn a_later_member_observed_conflicting_is_with_trunk_without_a_probe() {
+fn start_rejects_a_member_not_ready_before_any_write() {
     let fake = FakeGitHub::new();
-    let heads = queued(&fake, 2);
+    queued(&fake, 3);
     fake.pr(2).mergeable = Some(false);
-    fake.state().conflicts_with_trunk.insert(heads[1].clone());
-    let (mut forge, sink) = observed(&fake);
+    fake.pr(3).mergeable = None;
+    let (mut forge, _) = observed(&fake);
+    let writes = fake.writes().len();
 
-    let state = conflict_of(&fake, &mut forge, &sink, &[1, 2]);
-    assert_eq!(state, conflict(2, ConflictWith::Trunk));
-    assert_eq!(probes(&fake), 0);
+    for n in [2, 3] {
+        let error = forge
+            .start_batch(&start(1, &fake.trunk(), &[1, n]))
+            .unwrap_err();
+        assert!(is_permanent(&error, "which is not ready"), "{error}");
+    }
+    assert_eq!(fake.writes().len(), writes);
 }
 
 #[test]
@@ -1163,7 +1563,6 @@ fn a_start_violating_rule_5_is_permanent_and_writes_nothing() {
 
     for (bad, needle) in [
         (start(1, &trunk, &[1, 9]), "pr 9"),
-        (start(1, &trunk, &[]), "no members"),
         (start(1, &trunk, &[1, 1]), "twice"),
         (start(1, &stray, &[1]), "base"),
     ] {
@@ -1236,7 +1635,7 @@ fn a_landing_fast_forwards_trunk_and_completes_every_member() {
 }
 
 #[test]
-fn a_batch_whose_tip_is_its_base_lands_as_a_no_op_update() {
+fn a_batch_with_nothing_to_merge_lands_its_empty_commit() {
     let fake = FakeGitHub::new();
     queued(&fake, 1);
     let base = fake.trunk();
@@ -1244,21 +1643,17 @@ fn a_batch_whose_tip_is_its_base_lands_as_a_no_op_update() {
     passed(&fake, &base);
     let (mut forge, sink) = observed(&fake);
     forge.start_batch(&start(1, &base, &[1])).unwrap();
+    let tip = fake.get(&batch_ref(1)).expect("published");
+    passed(&fake, &tip);
     forge.observe().unwrap();
     sink.0.borrow_mut().clear();
 
     forge.land(BatchId(1)).unwrap();
 
-    assert_eq!(
-        fake.calls_to(&["update_ref"])
-            .iter()
-            .filter(|c| c.starts_with("update_ref refs/heads/main "))
-            .collect::<Vec<_>>(),
-        [&format!("update_ref refs/heads/main {base} force=false")]
-    );
-    assert_eq!(fake.trunk(), base);
+    assert_eq!(fake.trunk(), tip);
+    assert_eq!(fake.state().commits[&tip].parents, [base]);
     assert!(fake.pr(1).labels.is_empty());
-    assert_eq!(sink.lines(), landed_lines(&base, &[1]));
+    assert_eq!(sink.lines(), landed_lines(&tip, &[1]));
 }
 
 fn refused(fake: &FakeGitHub, forge: &mut GitHubForge, sink: &Buffer, tip: &Sha) -> LandRefusal {
@@ -1551,18 +1946,20 @@ fn retire_of_an_unknown_batch_is_permanent_and_writes_nothing() {
 fn eject_removes_the_label_and_tells_the_reason() {
     let reasons = [
         (
-            EjectReason::ConflictsWithTrunk,
-            "conflicts with `main`",
+            CONFLICTS_WITH_TRUNK,
+            "conflicts with trunk. Merge or rebase onto `main`",
             "conflicts with trunk",
         ),
         (
-            EjectReason::ConflictsWith { pr: PrNumber(2) },
+            EjectReason::Conflicts {
+                with: ConflictWith::Pr(PrNumber(2)),
+            },
             "conflicts with #2",
-            "conflicts with pr 2",
+            "conflicts with #2",
         ),
         (
             EjectReason::BatchFailed { batch: BatchId(5) },
-            "batch 5 failed its checks",
+            "batch 5 failed. The batch failed its checks on `dorfq/batch/5`",
             "batch 5 failed",
         ),
     ];
@@ -1590,9 +1987,7 @@ fn eject_tolerates_a_label_already_removed() {
     let (mut forge, sink) = observed(&fake);
     fake.pr(1).labels.clear();
 
-    forge
-        .eject(PrNumber(1), &EjectReason::ConflictsWithTrunk)
-        .unwrap();
+    forge.eject(PrNumber(1), &CONFLICTS_WITH_TRUNK).unwrap();
     forge.observe().unwrap();
     forge.observe().unwrap();
     assert_eq!(
@@ -1605,9 +2000,7 @@ fn eject_tolerates_a_label_already_removed() {
 fn eject_of_an_unknown_pull_request_is_permanent_and_writes_nothing() {
     let fake = FakeGitHub::new();
     let (mut forge, _) = observed(&fake);
-    let error = forge
-        .eject(PrNumber(3), &EjectReason::ConflictsWithTrunk)
-        .unwrap_err();
+    let error = forge.eject(PrNumber(3), &CONFLICTS_WITH_TRUNK).unwrap_err();
     assert!(is_permanent(&error, "pr 3"), "{error}");
     assert!(fake.writes().is_empty());
 }
@@ -1617,9 +2010,7 @@ fn an_ejected_pull_request_relabelled_is_greeted_again() {
     let fake = FakeGitHub::new();
     queued(&fake, 1);
     let (mut forge, sink) = observed(&fake);
-    forge
-        .eject(PrNumber(1), &EjectReason::ConflictsWithTrunk)
-        .unwrap();
+    forge.eject(PrNumber(1), &CONFLICTS_WITH_TRUNK).unwrap();
     assert!(forge.observe().unwrap().prs.is_empty());
 
     fake.pr(1).labels.push("queue".to_owned());

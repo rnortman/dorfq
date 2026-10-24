@@ -4,10 +4,20 @@
 //! at which pull requests arrive, are re-pushed or withdraw as the scenario
 //! says, and pending CI runs count down to their verdict. Commits are
 //! synthetic, minted from a counter, so every run of a scenario is
-//! identical. Effects check rules 5 and 6 of the [`dorfq_core`] contract
-//! through a [`Ledger`], and answer a violation with
-//! [`ForgeError::Permanent`] carrying a
+//! identical. Observations are checked against rule 8 and effects against
+//! rules 5 and 6 of the [`dorfq_core`] contract through a [`Ledger`], and
+//! a defect is answered with [`ForgeError::Permanent`] carrying a
+//! [`Malformed`](dorfq_core::ledger::Malformed) or a
 //! [`Violation`](dorfq_core::ledger::Violation).
+//!
+//! A batch with no members is a probe: its tip is minted over its base like
+//! any other, and it passes unless the scenario sets `trunk_broken`, which
+//! fails every batch and every probe.
+//!
+//! A scenario pull request may be based on another. It is reported with
+//! that base while the base is enqueued and reported, with `base: Trunk`
+//! once the base has landed, and not at all otherwise: a pull request
+//! reported before departs `Withdrawn(Blocked)` and its author is told.
 //!
 //! Rule 9 is a message log: every message the mock would send an author is
 //! written to the sink as one line when it happens and kept in
@@ -15,17 +25,18 @@
 
 mod scenario;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Write;
 
 use dorfq_core::ledger::Ledger;
 use dorfq_core::{
-    BatchId, BatchMember, BatchStart, BatchState, BatchStatus, CiStatus, ConflictWith, EjectReason,
-    Forge, ForgeError, LandRefusal, Mergeable, Observation, PrNumber, PrSnapshot, Sha,
+    BatchId, BatchMember, BatchStart, BatchState, BatchStatus, CiStatus, ConflictWith, Departed,
+    EjectReason, Failure, Forge, ForgeError, Hold, LandRefusal, Observation, PrBase, PrNumber,
+    PrSnapshot, PrStatus, Sha, StackPolicy, Timestamp, Withdrawal,
 };
 
-use scenario::PrSpec;
+use scenario::{OwnCi, PrSpec};
 pub use scenario::{Scenario, ScenarioError};
 
 /// Something the mock told a pull request's author.
@@ -40,6 +51,8 @@ pub struct Message {
 pub enum Event {
     /// The pull request entered the queue.
     Queued,
+    /// The pull request is enqueued but held back for `holds`.
+    Held { holds: BTreeSet<Hold> },
     /// The pull request is in a batch under test.
     Testing { batch: BatchId },
     /// The pull request landed; trunk is now `tip`.
@@ -48,6 +61,8 @@ pub enum Event {
     Ejected { reason: EjectReason },
     /// The pull request's intent was cleared before it landed or was ejected.
     Withdrawn,
+    /// The pull request left the queue because its base `on` did.
+    Blocked { on: PrNumber },
 }
 
 impl fmt::Display for Message {
@@ -55,18 +70,15 @@ impl fmt::Display for Message {
         write!(f, "message to pr {}: ", self.pr.0)?;
         match &self.event {
             Event::Queued => f.write_str("queued"),
+            Event::Held { holds } => {
+                let holds: Vec<String> = holds.iter().map(ToString::to_string).collect();
+                write!(f, "held: {}", holds.join(", "))
+            }
             Event::Testing { batch } => write!(f, "testing in batch {}", batch.0),
             Event::Landed { tip } => write!(f, "landed as {tip}"),
-            Event::Ejected { reason } => match reason {
-                EjectReason::ConflictsWithTrunk => f.write_str("ejected: conflicts with trunk"),
-                EjectReason::ConflictsWith { pr } => {
-                    write!(f, "ejected: conflicts with pr {}", pr.0)
-                }
-                EjectReason::BatchFailed { batch } => {
-                    write!(f, "ejected: batch {} failed", batch.0)
-                }
-            },
+            Event::Ejected { reason } => write!(f, "ejected: {reason}"),
             Event::Withdrawn => f.write_str("withdrawn"),
+            Event::Blocked { on } => write!(f, "blocked on #{}", on.0),
         }
     }
 }
@@ -99,6 +111,7 @@ struct MockBatch {
 /// The mock forge.
 pub struct MockForge {
     ci_ticks: u64,
+    trunk_broken: bool,
     prs: BTreeMap<PrNumber, MockPr>,
     batches: BTreeMap<BatchId, MockBatch>,
     trunk: Sha,
@@ -126,6 +139,7 @@ impl MockForge {
             .collect();
         MockForge {
             ci_ticks: scenario.ci_ticks,
+            trunk_broken: scenario.trunk_broken,
             prs,
             batches: BTreeMap::new(),
             trunk: commit(1),
@@ -184,6 +198,10 @@ impl MockForge {
                 self.set_pr(number, Lifecycle::Enqueued, Some(head));
                 lifecycle = Lifecycle::Enqueued;
                 self.tell(number, Event::Queued)?;
+                let spec = &self.prs[&number].spec;
+                if let Some(holds) = spec.mergeable.then(|| holds(spec)).flatten() {
+                    self.tell(number, Event::Held { holds })?;
+                }
             }
             if repushes && lifecycle == Lifecycle::Enqueued {
                 let head = self.mint();
@@ -202,7 +220,7 @@ impl MockForge {
             {
                 batch.remaining = batch.remaining.saturating_sub(1);
                 if batch.remaining == 0 {
-                    *ci = batch.verdict;
+                    *ci = batch.verdict.clone();
                 }
             }
         }
@@ -218,43 +236,78 @@ impl MockForge {
         }
     }
 
-    fn snapshot(&self) -> Observation {
-        let prs = self
-            .prs
-            .iter()
-            .filter(|(_, pr)| pr.lifecycle == Lifecycle::Enqueued)
-            .map(|(&number, pr)| PrSnapshot {
-                number,
-                head: pr
-                    .head
-                    .clone()
-                    .expect("an enqueued pull request has a head"),
-                mergeable: if pr.spec.mergeable {
-                    Mergeable::Clean
-                } else {
-                    Mergeable::Conflicting
-                },
-                head_ci: pr.spec.own_ci,
-            })
-            .collect();
-        let batches = self.batches.values().map(|b| b.status.clone()).collect();
-        Observation {
-            trunk: self.trunk.clone(),
-            prs,
-            batches,
+    /// The base `number` is reported with, or `None` when it is not
+    /// reported: not enqueued, or based on a pull request that is neither
+    /// reported nor landed.
+    fn reported_base(&self, number: PrNumber) -> Option<PrBase> {
+        let pr = &self.prs[&number];
+        if pr.lifecycle != Lifecycle::Enqueued {
+            return None;
+        }
+        match pr.spec.base {
+            None => Some(PrBase::Trunk),
+            Some(base) if self.prs[&base].lifecycle == Lifecycle::Merged => Some(PrBase::Trunk),
+            Some(base) => self.reported_base(base).map(|_| PrBase::Pr(base)),
         }
     }
 
-    /// Merges the members in order: the first that conflicts ends the build.
+    /// The observation at `now`. A departure the queue did not cause is the
+    /// scenario's `dequeue_at`, a withdrawal of intent, or a base that left.
+    fn snapshot(&self, now: Timestamp) -> Result<Observation, ForgeError> {
+        let prs: Vec<PrSnapshot> = self
+            .prs
+            .iter()
+            .filter_map(|(&number, pr)| {
+                let base = self.reported_base(number)?;
+                let snapshot = PrSnapshot::new(
+                    number,
+                    pr.head
+                        .clone()
+                        .expect("an enqueued pull request has a head"),
+                    base,
+                    status(&pr.spec, base),
+                );
+                Some(if pr.spec.atomic {
+                    snapshot.with_stack(StackPolicy::Atomic)
+                } else {
+                    snapshot
+                })
+            })
+            .collect();
+        let batches: Vec<BatchStatus> = self.batches.values().map(|b| b.status.clone()).collect();
+        let departed = self
+            .ledger
+            .departures(&prs, &batches, |gone| {
+                let pr = &self.prs[&gone.number];
+                match (pr.lifecycle, pr.spec.base) {
+                    (Lifecycle::Withdrawn, _) => Ok(Departed::Withdrawn(Withdrawal::IntentCleared)),
+                    (Lifecycle::Enqueued, Some(on)) => {
+                        Ok(Departed::Withdrawn(Withdrawal::Blocked { on }))
+                    }
+                    (lifecycle, _) => Err(ForgeError::Permanent(
+                    format!(
+                        "pr {} left the queue {lifecycle:?} with no batch landed or ejection to show for it",
+                        gone.number.0
+                    )
+                    .into(),
+                    )),
+                }
+            })?;
+        Ok(Observation::new(
+            now,
+            self.trunk.clone(),
+            prs,
+            batches,
+            departed,
+        ))
+    }
+
+    /// Merges the members in order: the first that conflicts with an earlier
+    /// member ends the build. Conflicts with trunk are not checked: a member
+    /// that conflicts with trunk is never `Ready`, so no valid plan starts it.
     fn build(&self, prs: &[PrNumber]) -> Option<BatchState> {
         for (i, number) in prs.iter().enumerate() {
             let spec = &self.prs[number].spec;
-            if !spec.mergeable {
-                return Some(BatchState::Conflict {
-                    pr: *number,
-                    with: ConflictWith::Trunk,
-                });
-            }
             if let Some(earlier) = prs[..i].iter().find(|e| spec.conflicts_with.contains(e)) {
                 return Some(BatchState::Conflict {
                     pr: *number,
@@ -265,13 +318,17 @@ impl MockForge {
         None
     }
 
+    /// Failed when trunk is broken or a member is bad or breaks with another
+    /// member; passed otherwise, a probe included.
     fn verdict(&self, prs: &[PrNumber]) -> CiStatus {
-        let fails = prs.iter().any(|number| {
-            let spec = &self.prs[number].spec;
-            spec.bad || prs.iter().any(|other| spec.breaks_with.contains(other))
-        });
+        let fails = self.trunk_broken
+            || prs.iter().any(|number| {
+                let spec = &self.prs[number].spec;
+                spec.bad || prs.iter().any(|other| spec.breaks_with.contains(other))
+            });
         if fails {
-            CiStatus::Failed
+            // The scenario names no checks, so a failure carries none.
+            CiStatus::Failed(Failure::new(BTreeSet::new()))
         } else {
             CiStatus::Passed
         }
@@ -284,11 +341,32 @@ impl MockForge {
             });
         }
         status.members.iter().find_map(|member| {
-            let pr = &self.prs[&member.pr];
-            let still_there =
-                pr.lifecycle == Lifecycle::Enqueued && pr.head.as_ref() == Some(&member.head);
+            let still_there = self.reported_base(member.pr).is_some()
+                && self.prs[&member.pr].head.as_ref() == Some(&member.head);
             (!still_there).then_some(LandRefusal::MemberGone { pr: member.pr })
         })
+    }
+}
+
+/// A scenario pull request's admission on `base`: `Conflicting` with its
+/// base when it does not merge, else held while its own CI is pending or
+/// failed, else `Ready`.
+fn status(spec: &PrSpec, base: PrBase) -> PrStatus {
+    if !spec.mergeable {
+        return PrStatus::Conflicting(match base {
+            PrBase::Trunk => ConflictWith::Trunk,
+            PrBase::Pr(pr) => ConflictWith::Pr(pr),
+        });
+    }
+    holds(spec).map_or(PrStatus::Ready, PrStatus::Waiting)
+}
+
+/// What holds a scenario pull request back, if anything: its own CI.
+fn holds(spec: &PrSpec) -> Option<BTreeSet<Hold>> {
+    match spec.own_ci {
+        OwnCi::Passed => None,
+        OwnCi::Pending => Some(BTreeSet::from([Hold::OwnCiPending])),
+        OwnCi::Failed => Some(BTreeSet::from([Hold::OwnCiFailed])),
     }
 }
 
@@ -300,9 +378,15 @@ fn commit(n: u64) -> Sha {
 impl Forge for MockForge {
     fn observe(&mut self) -> Result<Observation, ForgeError> {
         self.advance()?;
+        let now = Timestamp(self.tick);
         self.tick += 1;
-        let observation = self.snapshot();
-        self.ledger.observed(&observation);
+        let observation = self.snapshot(now)?;
+        self.ledger.observed(&observation)?;
+        for departure in &observation.departed {
+            if let Departed::Withdrawn(Withdrawal::Blocked { on }) = departure.how {
+                self.tell(departure.pr, Event::Blocked { on })?;
+            }
+        }
         Ok(observation)
     }
 
@@ -311,12 +395,12 @@ impl Forge for MockForge {
         let members = batch
             .prs
             .iter()
-            .map(|&pr| BatchMember {
-                pr,
-                head: self.prs[&pr]
+            .map(|&pr| {
+                let head = self.prs[&pr]
                     .head
                     .clone()
-                    .expect("an observed pull request has a head"),
+                    .expect("an observed pull request has a head");
+                BatchMember::new(pr, head)
             })
             .collect();
         let verdict = self.verdict(&batch.prs);
@@ -325,7 +409,7 @@ impl Forge for MockForge {
             None => BatchState::Testing {
                 tip: self.mint(),
                 ci: if self.ci_ticks == 0 {
-                    verdict
+                    verdict.clone()
                 } else {
                     CiStatus::Pending
                 },
@@ -335,12 +419,7 @@ impl Forge for MockForge {
         self.batches.insert(
             batch.id,
             MockBatch {
-                status: BatchStatus {
-                    id: batch.id,
-                    base: batch.base.clone(),
-                    members,
-                    state,
-                },
+                status: BatchStatus::new(batch.id, batch.base.clone(), members, state),
                 verdict,
                 remaining: self.ci_ticks,
             },
@@ -355,9 +434,7 @@ impl Forge for MockForge {
     }
 
     fn land(&mut self, batch: BatchId) -> Result<(), ForgeError> {
-        let BatchState::Testing { tip, .. } = self.ledger.check_land(batch)?.state.clone() else {
-            unreachable!("check_land returns a batch reported as testing");
-        };
+        let tip = self.ledger.check_land(batch)?.tip;
         self.ledger.landing(batch);
         let status = self.batches[&batch].status.clone();
         if let Some(reason) = self.refusal(&status) {

@@ -1,7 +1,9 @@
 //! Required-check evaluation: the results on one commit, reduced to a
 //! [`CiStatus`] by the check names the configuration requires.
 
-use dorfq_core::CiStatus;
+use std::collections::BTreeSet;
+
+use dorfq_core::{CheckName, CiStatus, Failure};
 
 use crate::api::{CheckOutcome, CheckResult};
 
@@ -9,19 +11,25 @@ use crate::api::{CheckOutcome, CheckResult};
 ///
 /// Each required name is decided by its newest result, so a re-run
 /// supersedes the run it repeats; a name with no result is pending. Any
-/// required name failed makes the whole `Failed`, since the commit cannot
-/// pass whatever is still running; otherwise any pending makes it
-/// `Pending`. Results under names that are not required are ignored.
+/// required name failed makes the whole `Failed`, naming every required
+/// check that failed, since the commit cannot pass whatever is still
+/// running; otherwise any pending makes it `Pending`. Results under names
+/// that are not required are ignored.
 pub fn evaluate(required: &[String], results: &[CheckResult]) -> CiStatus {
     let mut pending = false;
+    let mut failed = BTreeSet::new();
     for name in required {
         match results.iter().find(|r| &r.name == name).map(|r| r.outcome) {
-            Some(CheckOutcome::Failed) => return CiStatus::Failed,
+            Some(CheckOutcome::Failed) => {
+                failed.insert(CheckName(name.clone()));
+            }
             Some(CheckOutcome::Passed) => {}
             Some(CheckOutcome::Pending) | None => pending = true,
         }
     }
-    if pending {
+    if !failed.is_empty() {
+        CiStatus::Failed(Failure::new(failed))
+    } else if pending {
         CiStatus::Pending
     } else {
         CiStatus::Passed
@@ -41,6 +49,12 @@ mod tests {
 
     fn names(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    fn failed(names: &[&str]) -> CiStatus {
+        CiStatus::Failed(Failure::new(
+            names.iter().map(|n| CheckName((*n).to_owned())).collect(),
+        ))
     }
 
     #[test]
@@ -73,7 +87,21 @@ mod tests {
         ];
         assert_eq!(
             evaluate(&names(&["build", "test"]), &results),
-            CiStatus::Failed
+            failed(&["test"])
+        );
+    }
+
+    #[test]
+    fn failed_names_every_failed_required_check_and_no_other() {
+        let results = [
+            result("build", CheckOutcome::Failed),
+            result("lint", CheckOutcome::Failed),
+            result("test", CheckOutcome::Failed),
+            result("docs", CheckOutcome::Passed),
+        ];
+        assert_eq!(
+            evaluate(&names(&["test", "build", "docs"]), &results),
+            failed(&["build", "test"])
         );
     }
 

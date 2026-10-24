@@ -3,7 +3,9 @@
 //! The boundary is data in both directions, one call in each: a [`Forge`]
 //! produces an [`Observation`], a [`Scheduler`] turns it into a [`Plan`], and
 //! the application's driver executes the plan through the forge. The
-//! scheduler never calls the forge; the forge never sees the scheduler.
+//! scheduler never calls the forge; the forge never sees the scheduler. The
+//! forge reports facts and owns admission (whether a pull request may land,
+//! [`PrStatus`]); the scheduler decides what to test, land and eject.
 //!
 //! Two terms the rules use. The **latest observation** is the one most
 //! recently returned by [`Forge::observe`]. A pull request or batch is
@@ -15,74 +17,160 @@
 //!
 //! # Rules
 //!
+//! Each rule closes with what enforces it.
+//!
 //! 1. **Facts flow one way.** [`Forge::observe`] is the only source of
 //!    facts. Effects return `Ok(())`; their consequences appear in the next
 //!    observation. A forge keeps a batch in [`Observation::batches`] from
 //!    [`Forge::start_batch`] until [`Forge::retire`], whatever its state.
-//! 2. **The forge enforces the two landing invariants, whatever the
-//!    scheduler asks.** `land(b)` is accepted only for a batch the latest
-//!    observation reported as `Testing { ci: Passed }`; anything else is a
-//!    scheduler bug (rule 6). The forge then fast-forwards trunk to `b`'s tip
-//!    only if `b`'s base equals the current trunk and every member is still
-//!    enqueued at the head it was built with; otherwise the batch becomes
+//!    *Enforced by* the types (an effect returns `Result<(), ForgeError>`)
+//!    and each forge's tests, which observe a batch after every effect
+//!    until it is retired.
+//! 2. **The forge enforces the landing invariants, whatever the scheduler
+//!    asks.** `land(b)` is accepted only for a batch with members that the
+//!    latest observation reported as `Testing { ci: Passed }`; a probe never
+//!    lands (rule 6). The forge fast-forwards trunk to `b`'s tip only if
+//!    `b`'s base is the current trunk and every member is still enqueued at
+//!    the head it was built with; otherwise the batch becomes
 //!    [`BatchState::LandRefused`] with the reason, and the call returns
-//!    `Ok(())`. Only the exact tree that passed CI on top of the current
-//!    trunk ever lands, and nothing lands that its owner has withdrawn. The
-//!    forge does not re-check CI at `land`: the tip is immutable and the tree
-//!    passed.
-//! 3. **Plan items are requests, and the scheduler assumes nothing about
-//!    their execution.** The scheduler learns facts only from observations;
-//!    it never takes an effect to have happened because it was planned. It
-//!    may remember what it has emitted, never what it inferred the forge did
-//!    with it. A batch id that never appears in an observation was never
-//!    started. Rule 7 makes a partially executed plan harmless: every plan
-//!    item is driven by a fact that is still in the next observation if the
-//!    item did not run.
+//!    `Ok(())`. The forge re-checks neither CI nor admission at `land`:
+//!    admission is judged at the latest observation (`Ready`) and again at
+//!    `start` (rule 5), and the window from the latest observation to `land`
+//!    is one tick. Only the exact tree that passed CI on top of the current
+//!    trunk ever lands. *Enforced by* [`ledger::Ledger::check_land`] and each
+//!    forge's refusal tests.
+//! 3. **Plan items are requests.** The scheduler learns facts only from
+//!    observations; it may remember what it has emitted, never what it
+//!    inferred the forge did with it. A batch id that never appears in an
+//!    observation was never started. Rule 7 makes a partially executed plan
+//!    harmless only because of this: every plan item is driven by a fact
+//!    that is still in the next observation if the item did not run.
+//!    *Enforced by* review: [`Scheduler::step`] sees only the observation,
+//!    so the only way to break this is to remember a plan as if it ran.
 //! 4. **The scheduler is deterministic.** [`Scheduler::step`] reads no
 //!    clock, no randomness and no I/O; its output is a function of its own
-//!    state and the observations it has been given, in order.
+//!    state and the observations it has been given, in order. Time is
+//!    [`Observation::now`] and nothing else. *Enforced by* each policy's
+//!    `equal_inputs_give_equal_plans` test and the simulator's seeded
+//!    replications.
 //! 5. **Plans are well-formed, and batch ids are the scheduler's.** A
 //!    [`BatchStart::id`] must not equal the id of any batch in the latest
-//!    observation. [`BatchStart::prs`] is non-empty, without duplicates, and
-//!    every member is known; [`BatchStart::base`] is the latest observation's
-//!    `trunk` or the tip of one of its batches. Within one plan, `eject` names
-//!    each pull request at most once, each of `start`, `land` and `retire`
-//!    names a batch id at most once, and no member of a batch that `land`
-//!    names is named by `start` or `eject`: a plan does not land a pull
-//!    request and also build on it or eject it, whether or not the landing is
-//!    refused. The forge answers a violation with [`ForgeError::Permanent`]:
-//!    it is a scheduler bug, and the process stops (rule 7).
+//!    observation. [`BatchStart::prs`] has no duplicates, and every member
+//!    is known and reported [`PrStatus::Ready`] by the latest observation.
+//!    There may be no members: a **probe**, a batch that tests its base's
+//!    tree alone on a tip of its own (rule 8). [`BatchStart::base`] is the
+//!    latest observation's `trunk` or the tip of one of its batches.
+//!    **Stacks:** every member whose base is `PrBase::Pr(a)` has `a` as an
+//!    earlier member of the same batch or as a member of a batch on the walk
+//!    from the new batch's base down to trunk, through tracked batches' tips
+//!    and bases. **Atomic:** `land` on a batch that holds an ancestor of an
+//!    enqueued [`StackPolicy::Atomic`] pull request but not that pull
+//!    request itself is a violation; testing the ancestor alone is not.
+//!    Within one plan, `eject` names each pull request at most once, each of
+//!    `start`, `land` and `retire` names a batch id at most once, `land` and
+//!    `retire` do not name the same batch (a landed batch is reported
+//!    `Landed` before it is retired, which [`Observation::departed`] relies
+//!    on), and no member of a batch that `land` names is named by `start` or
+//!    `eject`, whether or not the landing is refused. A violation is
+//!    [`ForgeError::Permanent`]: a scheduler bug, and the process stops
+//!    (rule 7). *Enforced by* the ledger's `check_start`, `check_land`,
+//!    `check_retire` and `check_eject`.
 //! 6. **Effects on unknown things are bugs.** `land` or `retire` on a batch
 //!    that is not known; `land` on a batch the latest observation did not
-//!    report as `Testing { ci: Passed }`; `eject` on a pull request that is
-//!    not known — all [`ForgeError::Permanent`]. "Known" is judged against
-//!    the latest observation and the forge's own effects since it, not
-//!    against whatever the world has done meanwhile: a pull request whose
-//!    owner cleared the intent after the observation is still known, and
-//!    `eject` on it succeeds.
+//!    report as `Testing { ci: Passed }`, or on a probe; `eject` on a pull
+//!    request that is not known — all [`ForgeError::Permanent`]. "Known" is
+//!    judged against the latest observation and the forge's own effects
+//!    since it, not against whatever the world has done meanwhile: a pull
+//!    request whose owner cleared the intent after the observation is still
+//!    known, and `eject` on it succeeds. *Enforced by* the same ledger
+//!    checks.
 //! 7. **The driver executes a plan in a fixed order and stops at the first
 //!    error.** Order: `land`, `start`, `eject`, `retire`. Landings come first
 //!    so that a refused landing is visible before anything is built on its
 //!    tip; `retire` comes last, so a plan cut short leaves the batch, and the
 //!    facts that drove the plan, in the next observation. On
 //!    [`ForgeError::Transient`] the driver abandons the rest of the plan and
-//!    ticks again; on [`ForgeError::Permanent`] it stops the process.
-//! 8. **Ordering is canonical.** [`Observation::prs`] is sorted by number and
-//!    [`Observation::batches`] by id, so two forges reporting the same facts
-//!    produce equal observations.
-//! 9. **The forge talks to authors.** The forge tells a pull request's author
-//!    about every transition the queue causes or observes on it: entry into
-//!    the queue, inclusion in a batch, landing, ejection with the scheduler's
-//!    reason, and leaving the queue by neither. The scheduler decides the
-//!    ejection reason and nothing else about messaging; nothing about
-//!    messages crosses the boundary.
+//!    ticks again; on [`ForgeError::Permanent`] or a [`SchedulerError`] it
+//!    stops the process. `retire` on a `Testing { ci: Pending }` batch is its
+//!    cancellation: the forge drops the batch and, where the platform
+//!    allows, its run. *Enforced by* the driver's tests and the simulator
+//!    loop's tests.
+//! 8. **Observations are well-formed and canonical.** [`Observation::prs`]
+//!    is sorted by number and [`Observation::batches`] by id, each without
+//!    duplicates, so two forges reporting the same facts produce equal
+//!    observations. `prs` is closed under [`PrSnapshot::base`] and the base
+//!    relation over it is acyclic; a [`PrStatus::Waiting`] set is non-empty;
+//!    a [`PrStatus::Conflicting`] pull request conflicts with its base
+//!    (`ConflictWith::Trunk` on `PrBase::Trunk`, `ConflictWith::Pr(b)` on
+//!    `PrBase::Pr(b)`). [`Observation::departed`] is sorted by number and
+//!    names exactly the pull requests the previous observation reported and
+//!    this one does not, each at the head the previous observation gave it;
+//!    it is empty when there is no previous observation. **Tips:** a batch
+//!    that has a tip (`Testing`, `Landed`, `LandRefused`) has one that is
+//!    not its own base and that no other batch has, and following bases from
+//!    a batch through the batches whose tips they are always ends at a sha
+//!    no batch has as tip: every walk over batches terminates, a probe's
+//!    included. A forge whose observation breaks this reports
+//!    [`ForgeError::Permanent`]. *Enforced by* [`ledger::Ledger::observed`].
+//! 9. **Nothing about messages crosses the boundary.** The forge tells
+//!    authors about every transition the queue causes or observes; which
+//!    events, in what words, is each forge's own documentation. The
+//!    scheduler contributes an [`EjectReason`], worded through its
+//!    `Display`, and nothing else. *Enforced by* the types: no message type
+//!    exists here.
 //!
-//! Forges enforce rules 5 and 6 through [`ledger::Ledger`], which holds the
-//! latest observation and the effects performed since it, so every forge
-//! judges knownness by the same code.
+//! Forges enforce rules 2, 5, 6 and 8 through [`ledger::Ledger`], which
+//! holds the latest observation and the effects performed since it, so
+//! every forge judges knownness by the same code and a forge bug stops at
+//! the forge.
+//!
+//! # Changing the contract
+//!
+//! Every record struct but [`Plan`] is `#[non_exhaustive]` and is built
+//! through its `new` and `with_` methods outside this crate; [`Plan`] is
+//! built from `Plan::default()` by pushes or functional update. The
+//! identifier newtypes ([`PrNumber`], [`BatchId`], [`Timestamp`],
+//! [`CheckName`]) are built directly, and [`Sha`] through [`Sha::parse`].
+//! An enum a consumer must act on ([`PrStatus`], [`BatchState`],
+//! [`CiStatus`], [`Departed`], [`PrBase`], [`StackPolicy`]) is exhaustive;
+//! one a consumer may ignore, because the forge renders it through
+//! `Display` and nobody's behaviour depends on its variant ([`Hold`],
+//! [`ConflictWith`], [`LandRefusal`], [`EjectReason`], [`Withdrawal`]), is
+//! `#[non_exhaustive]`. A change is one of three kinds.
+//!
+//! **Additive: one pull request touching this crate only.** A new optional
+//! fact (an `Option<T>` for "the forge may not know", or a value with a
+//! neutral default the forge defines, like [`StackPolicy::Splittable`]): a
+//! field plus a `with_` method. A new variant of an open enum, with its
+//! `Display` arm. A new method on an existing type. Each side picks it up at
+//! its next rebase with no edits. A default that would stand in for a fact
+//! the forge should have supplied is not neutral and is not allowed: such a
+//! fact is required.
+//!
+//! **Required: one pull request touching this crate and one site per
+//! consumer.** A new required fact is a `new` parameter: every forge's
+//! construction site and every test-support helper fail to compile and are
+//! fixed in the same pull request, each with the honest value; a forge that
+//! cannot supply it returns [`ForgeError::Permanent`] from `observe` saying
+//! so, never a placeholder. A new variant of an exhaustive enum fails to
+//! compile at every match, and each consumer's arm is written in the same
+//! pull request. A new effect is a [`Plan`] field and a [`Forge`] method
+//! without a default body, so every forge implements it explicitly.
+//!
+//! **Never.** A renamed or re-typed field, a changed meaning behind an
+//! unchanged name, a default body on a [`Forge`] method, or a `_` arm in a
+//! `match` over an exhaustive contract enum outside tests. A positive
+//! `matches!` naming the variants it is true for is allowed: its answer for
+//! a variant it does not name is "not that one", and the crate holding it
+//! also holds an exhaustive `match` over the same enum, so a new variant
+//! still fails to compile there.
+//!
+//! The contract change lands on `main` first, as one pull request of the
+//! kind above, and each line of work rebases onto it.
 
 pub mod ledger;
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
@@ -139,48 +227,217 @@ impl fmt::Display for InvalidSha {
 
 impl Error for InvalidSha {}
 
+/// A point in time, in seconds, on the forge's clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Timestamp(pub u64);
+
+/// A required check's name, as the forge knows it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CheckName(pub String);
+
+impl fmt::Display for CheckName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Everything the forge reports in one tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Observation {
-    /// The current tip of the managed branch.
+    /// The forge's clock at this observation: wall time on a real forge,
+    /// simulated time in a simulation. A scheduler uses only differences of
+    /// `now`, and treats a value that did not increase since the previous
+    /// observation as no time having passed.
+    pub now: Timestamp,
+    /// The current tip of the managed branch. A `trunk` that differs from
+    /// the previous observation's and from every tracked batch's `Landed`
+    /// tip was moved by a hand other than the queue's.
     pub trunk: Sha,
-    /// Every open pull request targeting trunk that carries the intent
-    /// marker, sorted by number.
+    /// Every enqueued pull request, sorted by number, closed under
+    /// [`PrSnapshot::base`]: every `PrBase::Pr(n)` names a pull request in
+    /// `prs`.
     pub prs: Vec<PrSnapshot>,
     /// Every batch the forge tracks (started, not yet retired), sorted by id.
     pub batches: Vec<BatchStatus>,
+    /// Exactly the pull requests the previous observation reported in `prs`
+    /// and this one does not, sorted by number, each at the head the
+    /// previous observation gave it. Empty on a forge's first observation.
+    pub departed: Vec<Departure>,
+}
+
+impl Observation {
+    /// A `Observation` with the given fields.
+    pub fn new(
+        now: Timestamp,
+        trunk: Sha,
+        prs: Vec<PrSnapshot>,
+        batches: Vec<BatchStatus>,
+        departed: Vec<Departure>,
+    ) -> Observation {
+        Observation {
+            now,
+            trunk,
+            prs,
+            batches,
+            departed,
+        }
+    }
+
+    /// The first `Atomic` pull request, by number, that this observation
+    /// reports and `batch` omits while holding one of its ancestors: landing
+    /// `batch` would split that stack (rule 5).
+    ///
+    /// # Panics
+    ///
+    /// If `prs` is not sorted by number and closed under `base` (rule 8).
+    pub fn split_atomic(&self, batch: &BatchStatus) -> Option<PrNumber> {
+        let members: BTreeSet<PrNumber> = batch.members.iter().map(|m| m.pr).collect();
+        self.prs
+            .iter()
+            .filter(|p| p.stack == StackPolicy::Atomic && !members.contains(&p.number))
+            .find(|p| {
+                let mut at = p.base;
+                // Rule 8 makes the walk acyclic.
+                while let PrBase::Pr(n) = at {
+                    if members.contains(&n) {
+                        return true;
+                    }
+                    let i = self
+                        .prs
+                        .binary_search_by_key(&n, |p| p.number)
+                        .expect("rule 8: prs is sorted and closed under base");
+                    at = self.prs[i].base;
+                }
+                false
+            })
+            .map(|p| p.number)
+    }
 }
 
 /// One enqueued pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PrSnapshot {
     pub number: PrNumber,
     pub head: Sha,
-    /// Whether it merges into trunk, as the forge knows it.
-    pub mergeable: Mergeable,
-    /// The pull request's own required checks on `head`.
-    pub head_ci: CiStatus,
+    /// What it merges into: trunk, or another enqueued pull request.
+    pub base: PrBase,
+    /// Whether the forge would land it now, as the forge judges admission.
+    pub status: PrStatus,
+    /// Whether its ancestors may land without it. Default
+    /// [`StackPolicy::Splittable`].
+    pub stack: StackPolicy,
 }
 
-/// Whether a pull request merges cleanly into trunk.
+impl PrSnapshot {
+    /// A `PrSnapshot` with the given fields.
+    pub fn new(number: PrNumber, head: Sha, base: PrBase, status: PrStatus) -> PrSnapshot {
+        PrSnapshot {
+            number,
+            head,
+            base,
+            status,
+            stack: StackPolicy::Splittable,
+        }
+    }
+
+    /// The same pull request with `stack` as its stack policy.
+    pub fn with_stack(self, stack: StackPolicy) -> PrSnapshot {
+        PrSnapshot { stack, ..self }
+    }
+}
+
+/// A pull request's base branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mergeable {
-    Clean,
-    Conflicting,
-    /// The forge has not computed it yet.
-    Unknown,
+pub enum PrBase {
+    Trunk,
+    /// Another enqueued pull request's branch.
+    Pr(PrNumber),
+}
+
+/// Whether a stacked pull request's ancestors may land without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackPolicy {
+    /// Any base-closed part of its stack may land on its own.
+    Splittable,
+    /// It and every ancestor land in one batch or not at all: no ancestor
+    /// lands without it while it is enqueued.
+    Atomic,
+}
+
+/// The forge's admission verdict on a pull request at its head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrStatus {
+    /// The forge would land it now at this head.
+    Ready,
+    /// Not yet; the world may change it. Never empty.
+    Waiting(BTreeSet<Hold>),
+    /// It does not merge into its base; the author must act. `Trunk` for a
+    /// pull request based on trunk, `Pr(base)` for one based on a pull
+    /// request.
+    Conflicting(ConflictWith),
+}
+
+/// What holds a pull request back. Open: every scheduler's response to a
+/// hold is to wait, whatever it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum Hold {
+    /// Its own required checks have not finished on its head.
+    OwnCiPending,
+    /// Its own required checks failed on its head.
+    OwnCiFailed,
+    /// The forge has not yet computed whether it merges into its base.
+    MergeabilityUnknown,
+    /// The platform's review requirement is not met.
+    Review,
+    /// It is a draft.
+    Draft,
+    /// Its own CI did not cover ancestor `pr`'s current head.
+    AncestorMoved { pr: PrNumber },
+}
+
+impl fmt::Display for Hold {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Hold::OwnCiPending => f.write_str("own CI pending"),
+            Hold::OwnCiFailed => f.write_str("own CI failed"),
+            Hold::MergeabilityUnknown => f.write_str("mergeability unknown"),
+            Hold::Review => f.write_str("review required"),
+            Hold::Draft => f.write_str("draft"),
+            Hold::AncestorMoved { pr } => write!(f, "ancestor #{} moved", pr.0),
+        }
+    }
 }
 
 /// The state of a set of CI checks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CiStatus {
     Pending,
     Passed,
-    Failed,
+    Failed(Failure),
+}
+
+/// What failed in a CI run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Failure {
+    /// The required checks that failed. Empty when the forge cannot say
+    /// which, such as a run it timed out itself.
+    pub checks: BTreeSet<CheckName>,
+}
+
+impl Failure {
+    /// A `Failure` with the given fields.
+    pub fn new(checks: BTreeSet<CheckName>) -> Failure {
+        Failure { checks }
+    }
 }
 
 /// One tracked batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BatchStatus {
     pub id: BatchId,
     /// The base it was started on, echoed from the [`BatchStart`].
@@ -190,11 +447,36 @@ pub struct BatchStatus {
     pub state: BatchState,
 }
 
+impl BatchStatus {
+    /// A `BatchStatus` with the given fields.
+    pub fn new(
+        id: BatchId,
+        base: Sha,
+        members: Vec<BatchMember>,
+        state: BatchState,
+    ) -> BatchStatus {
+        BatchStatus {
+            id,
+            base,
+            members,
+            state,
+        }
+    }
+}
+
 /// A batch member and the head the batch was built with.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BatchMember {
     pub pr: PrNumber,
     pub head: Sha,
+}
+
+impl BatchMember {
+    /// A `BatchMember` with the given fields.
+    pub fn new(pr: PrNumber, head: Sha) -> BatchMember {
+        BatchMember { pr, head }
+    }
 }
 
 /// Where a batch is in its life.
@@ -210,21 +492,127 @@ pub enum BatchState {
     LandRefused { tip: Sha, reason: LandRefusal },
 }
 
-/// What a conflicting member conflicted with.
+impl BatchState {
+    /// The batch's tip, in every state but `Conflict`.
+    pub fn tip(&self) -> Option<&Sha> {
+        match self {
+            BatchState::Testing { tip, .. }
+            | BatchState::Landed { tip }
+            | BatchState::LandRefused { tip, .. } => Some(tip),
+            BatchState::Conflict { .. } => None,
+        }
+    }
+}
+
+/// What a pull request or a batch member conflicts with. Open: a consumer
+/// copies it or renders it through `Display`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConflictWith {
     Trunk,
-    /// An earlier member of the same batch.
+    /// A pull request: an earlier member of the same batch, or the base of
+    /// a stacked pull request.
     Pr(PrNumber),
 }
 
-/// Why the forge declined to land a batch.
+impl fmt::Display for ConflictWith {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConflictWith::Trunk => f.write_str("trunk"),
+            ConflictWith::Pr(pr) => write!(f, "#{}", pr.0),
+        }
+    }
+}
+
+/// Why the forge declined to land a batch. Open: every consumer's response
+/// to a refusal is the same, whatever the reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LandRefusal {
     /// The batch's base is no longer trunk.
     TrunkMoved { trunk: Sha },
     /// A member is no longer enqueued at the head the batch was built with.
     MemberGone { pr: PrNumber },
+}
+
+impl fmt::Display for LandRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LandRefusal::TrunkMoved { trunk } => write!(f, "trunk moved to {trunk}"),
+            LandRefusal::MemberGone { pr } => write!(f, "#{} is gone", pr.0),
+        }
+    }
+}
+
+/// A pull request that left the queue between two observations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Departure {
+    pub pr: PrNumber,
+    /// Its head at the previous observation.
+    pub head: Sha,
+    pub how: Departed,
+}
+
+impl Departure {
+    /// A `Departure` with the given fields.
+    pub fn new(pr: PrNumber, head: Sha, how: Departed) -> Departure {
+        Departure { pr, head, how }
+    }
+}
+
+/// How a pull request left the queue. A forge classifies in this order: a
+/// member of a batch the observation reports `Landed` is `Landed`; one the
+/// forge ejected since the previous observation is `Ejected`; the rest are
+/// `Merged` when the platform says its content reached trunk, else
+/// `Withdrawn`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Departed {
+    /// The queue landed it with `batch`.
+    Landed { batch: BatchId },
+    /// Its content reached trunk by a hand other than the queue's.
+    Merged,
+    /// The forge ejected it at the scheduler's request.
+    Ejected,
+    /// It left without its content reaching trunk.
+    Withdrawn(Withdrawal),
+}
+
+impl fmt::Display for Departed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Departed::Landed { batch } => write!(f, "landed in batch {}", batch.0),
+            Departed::Merged => f.write_str("merged outside the queue"),
+            Departed::Ejected => f.write_str("ejected"),
+            Departed::Withdrawn(why) => write!(f, "withdrawn: {why}"),
+        }
+    }
+}
+
+/// Why a pull request left without landing or ejection. Open: a scheduler
+/// treats every withdrawal alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Withdrawal {
+    /// Its intent was cleared.
+    IntentCleared,
+    /// It was closed unmerged.
+    Closed,
+    /// Its base pull request is no longer enqueued.
+    Blocked { on: PrNumber },
+    /// It no longer targets trunk or an enqueued pull request.
+    Retargeted,
+}
+
+impl fmt::Display for Withdrawal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Withdrawal::IntentCleared => f.write_str("intent cleared"),
+            Withdrawal::Closed => f.write_str("closed"),
+            Withdrawal::Blocked { on } => write!(f, "blocked on #{}", on.0),
+            Withdrawal::Retargeted => f.write_str("retargeted"),
+        }
+    }
 }
 
 /// What the scheduler asks the forge to do in one tick, executed in the
@@ -249,33 +637,91 @@ impl Plan {
 
 /// A request to build, push and track a batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BatchStart {
     pub id: BatchId,
     /// Trunk, or the tip of a tracked batch (rule 5).
     pub base: Sha,
-    /// The members in merge order; non-empty, no duplicates.
+    /// The members in merge order, no duplicates; none for a probe.
     pub prs: Vec<PrNumber>,
+}
+
+impl BatchStart {
+    /// A `BatchStart` with the given fields.
+    pub fn new(id: BatchId, base: Sha, prs: Vec<PrNumber>) -> BatchStart {
+        BatchStart { id, base, prs }
+    }
 }
 
 /// A request to clear a pull request's intent and tell its author why.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Ejection {
     pub pr: PrNumber,
     pub reason: EjectReason,
 }
 
-/// Why a pull request leaves the queue without landing.
+impl Ejection {
+    /// A `Ejection` with the given fields.
+    pub fn new(pr: PrNumber, reason: EjectReason) -> Ejection {
+        Ejection { pr, reason }
+    }
+}
+
+/// Why a pull request leaves the queue without landing. Open: a forge words
+/// the variants it knows as it likes and renders the rest through `Display`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EjectReason {
-    ConflictsWithTrunk,
-    ConflictsWith { pr: PrNumber },
+    /// It does not merge into what the [`ConflictWith`] names.
+    Conflicts { with: ConflictWith },
+    /// It is held responsible for `batch`'s failure.
     BatchFailed { batch: BatchId },
+    /// It fails only together with `pr`; `batch` singled the pair out.
+    InteractsWith { pr: PrNumber, batch: BatchId },
+}
+
+impl fmt::Display for EjectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EjectReason::Conflicts { with } => write!(f, "conflicts with {with}"),
+            EjectReason::BatchFailed { batch } => write!(f, "batch {} failed", batch.0),
+            EjectReason::InteractsWith { pr, batch } => {
+                write!(f, "fails together with #{} (batch {})", pr.0, batch.0)
+            }
+        }
+    }
 }
 
 /// The decision side of the boundary.
 pub trait Scheduler {
     /// Turns the latest observation into a plan. Deterministic (rule 4).
-    fn step(&mut self, observation: &Observation) -> Plan;
+    /// An error is fatal: the scheduler cannot decide, and the process
+    /// stops rather than act on a guess.
+    fn step(&mut self, observation: &Observation) -> Result<Plan, SchedulerError>;
+}
+
+/// A scheduler that cannot produce a plan. Always fatal.
+#[derive(Debug)]
+pub struct SchedulerError(Box<dyn Error + Send + Sync>);
+
+impl SchedulerError {
+    /// A `SchedulerError` carrying `cause`.
+    pub fn new(cause: impl Into<Box<dyn Error + Send + Sync>>) -> SchedulerError {
+        SchedulerError(cause.into())
+    }
+}
+
+impl fmt::Display for SchedulerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "scheduler error: {}", self.0)
+    }
+}
+
+impl Error for SchedulerError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.0.as_ref())
+    }
 }
 
 /// The fact-and-effect side of the boundary.
@@ -373,6 +819,154 @@ mod tests {
             permanent.to_string(),
             "permanent forge error: unknown batch 3"
         );
+    }
+
+    #[test]
+    fn scheduler_error_wraps_and_displays_its_cause() {
+        let error = SchedulerError::new("posterior underflow");
+        assert_eq!(error.to_string(), "scheduler error: posterior underflow");
+        assert_eq!(error.source().unwrap().to_string(), "posterior underflow");
+    }
+
+    #[test]
+    fn timestamps_and_check_names_order_by_value() {
+        assert!(Timestamp(3) < Timestamp(10));
+        let names = BTreeSet::from([CheckName("lint".into()), CheckName("build".into())]);
+        let words: Vec<String> = names.iter().map(ToString::to_string).collect();
+        assert_eq!(words, ["build", "lint"]);
+    }
+
+    #[test]
+    fn reasons_display_their_data() {
+        let sha = Sha::parse(GOOD).unwrap();
+        assert_eq!(ConflictWith::Trunk.to_string(), "trunk");
+        assert_eq!(ConflictWith::Pr(PrNumber(12)).to_string(), "#12");
+        assert_eq!(
+            LandRefusal::TrunkMoved { trunk: sha }.to_string(),
+            format!("trunk moved to {GOOD}")
+        );
+        assert_eq!(
+            LandRefusal::MemberGone { pr: PrNumber(3) }.to_string(),
+            "#3 is gone"
+        );
+        let holds = [
+            Hold::OwnCiPending,
+            Hold::OwnCiFailed,
+            Hold::MergeabilityUnknown,
+            Hold::Review,
+            Hold::Draft,
+            Hold::AncestorMoved { pr: PrNumber(3) },
+        ];
+        let words: Vec<String> = holds.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            words,
+            [
+                "own CI pending",
+                "own CI failed",
+                "mergeability unknown",
+                "review required",
+                "draft",
+                "ancestor #3 moved",
+            ]
+        );
+        let reasons = [
+            EjectReason::Conflicts {
+                with: ConflictWith::Trunk,
+            },
+            EjectReason::Conflicts {
+                with: ConflictWith::Pr(PrNumber(12)),
+            },
+            EjectReason::BatchFailed { batch: BatchId(7) },
+            EjectReason::InteractsWith {
+                pr: PrNumber(12),
+                batch: BatchId(7),
+            },
+        ];
+        let words: Vec<String> = reasons.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            words,
+            [
+                "conflicts with trunk",
+                "conflicts with #12",
+                "batch 7 failed",
+                "fails together with #12 (batch 7)",
+            ]
+        );
+        let departures = [
+            Departed::Landed { batch: BatchId(7) },
+            Departed::Merged,
+            Departed::Ejected,
+            Departed::Withdrawn(Withdrawal::IntentCleared),
+            Departed::Withdrawn(Withdrawal::Closed),
+            Departed::Withdrawn(Withdrawal::Blocked { on: PrNumber(3) }),
+            Departed::Withdrawn(Withdrawal::Retargeted),
+        ];
+        let words: Vec<String> = departures.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            words,
+            [
+                "landed in batch 7",
+                "merged outside the queue",
+                "ejected",
+                "withdrawn: intent cleared",
+                "withdrawn: closed",
+                "withdrawn: blocked on #3",
+                "withdrawn: retargeted",
+            ]
+        );
+    }
+
+    #[test]
+    fn constructors_set_every_field() {
+        let sha = Sha::parse(GOOD).unwrap();
+        let status = PrStatus::Waiting(BTreeSet::from([Hold::OwnCiPending]));
+        let pr = PrSnapshot::new(
+            PrNumber(3),
+            sha.clone(),
+            PrBase::Pr(PrNumber(2)),
+            status.clone(),
+        );
+        assert_eq!(
+            (pr.number, &pr.head, pr.base, &pr.status),
+            (PrNumber(3), &sha, PrBase::Pr(PrNumber(2)), &status)
+        );
+        assert_eq!(pr.stack, StackPolicy::Splittable);
+        let atomic = pr.clone().with_stack(StackPolicy::Atomic);
+        assert_eq!(atomic.stack, StackPolicy::Atomic);
+        assert_eq!(atomic.number, pr.number);
+        let member = BatchMember::new(PrNumber(2), sha.clone());
+        assert_eq!((member.pr, &member.head), (PrNumber(2), &sha));
+        let start = BatchStart::new(BatchId(4), sha.clone(), vec![PrNumber(2)]);
+        assert_eq!(
+            (start.id, &start.base, start.prs.as_slice()),
+            (BatchId(4), &sha, [PrNumber(2)].as_slice())
+        );
+        let reason = EjectReason::BatchFailed { batch: BatchId(4) };
+        let ejection = Ejection::new(PrNumber(2), reason.clone());
+        assert_eq!((ejection.pr, &ejection.reason), (PrNumber(2), &reason));
+        let departure = Departure::new(PrNumber(5), sha.clone(), Departed::Merged);
+        assert_eq!(
+            (departure.pr, &departure.head, &departure.how),
+            (PrNumber(5), &sha, &Departed::Merged)
+        );
+        let observation = Observation::new(
+            Timestamp(9),
+            sha.clone(),
+            vec![pr.clone()],
+            vec![],
+            vec![departure.clone()],
+        );
+        assert_eq!(
+            (
+                observation.now,
+                &observation.trunk,
+                observation.prs.as_slice(),
+                observation.departed.as_slice()
+            ),
+            (Timestamp(9), &sha, [pr].as_slice(), [departure].as_slice())
+        );
+        let checks = BTreeSet::from([CheckName("build".into())]);
+        assert_eq!(Failure::new(checks.clone()).checks, checks);
     }
 
     #[test]

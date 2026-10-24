@@ -1,7 +1,8 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use dorfq_core::{
-    BatchId, BatchMember, BatchStart, BatchStatus, Ejection, PrNumber, PrSnapshot, Sha,
+    BatchId, BatchMember, BatchStart, BatchStatus, CheckName, ConflictWith, Departed, Departure,
+    EjectReason, Ejection, Failure, Hold, PrNumber, PrSnapshot, Sha, Timestamp, Withdrawal,
 };
 
 use super::*;
@@ -86,72 +87,98 @@ impl ScriptedScheduler {
 }
 
 impl Scheduler for ScriptedScheduler {
-    fn step(&mut self, _observation: &Observation) -> Plan {
+    fn step(&mut self, _observation: &Observation) -> Result<Plan, SchedulerError> {
         self.seen += 1;
-        self.plans.pop_front().unwrap_or_default()
+        Ok(self.plans.pop_front().unwrap_or_default())
+    }
+}
+
+/// Never decides.
+struct Stumped;
+
+impl Scheduler for Stumped {
+    fn step(&mut self, _observation: &Observation) -> Result<Plan, SchedulerError> {
+        Err(SchedulerError::new("posterior underflow"))
     }
 }
 
 fn busy_observation() -> Observation {
-    Observation {
-        trunk: sha(1),
-        prs: vec![PrSnapshot {
-            number: PrNumber(1),
-            head: sha(2),
-            mergeable: Mergeable::Clean,
-            head_ci: CiStatus::Passed,
-        }],
-        batches: vec![BatchStatus {
-            id: BatchId(1),
-            base: sha(1),
-            members: vec![BatchMember {
-                pr: PrNumber(1),
-                head: sha(2),
-            }],
-            state: BatchState::Testing {
-                tip: sha(3),
-                ci: CiStatus::Passed,
-            },
-        }],
-    }
+    let pr = PrSnapshot::new(PrNumber(1), sha(2), PrBase::Trunk, PrStatus::Ready);
+    let holds = BTreeSet::from([Hold::OwnCiPending, Hold::MergeabilityUnknown]);
+    let held = PrSnapshot::new(
+        PrNumber(2),
+        sha(4),
+        PrBase::Pr(PrNumber(1)),
+        PrStatus::Waiting(holds),
+    );
+    let conflicting = PrSnapshot::new(
+        PrNumber(3),
+        sha(5),
+        PrBase::Trunk,
+        PrStatus::Conflicting(ConflictWith::Trunk),
+    );
+    let batch = BatchStatus::new(
+        BatchId(1),
+        sha(1),
+        vec![BatchMember::new(PrNumber(1), sha(2))],
+        BatchState::Testing {
+            tip: sha(3),
+            ci: CiStatus::Passed,
+        },
+    );
+    let checks = BTreeSet::from([CheckName("lint".into()), CheckName("build".into())]);
+    let failed = BatchStatus::new(
+        BatchId(2),
+        sha(3),
+        vec![BatchMember::new(PrNumber(9), sha(9))],
+        BatchState::Testing {
+            tip: sha(6),
+            ci: CiStatus::Failed(Failure::new(checks)),
+        },
+    );
+    let silent = BatchStatus::new(
+        BatchId(3),
+        sha(6),
+        vec![BatchMember::new(PrNumber(10), sha(10))],
+        BatchState::Testing {
+            tip: sha(7),
+            ci: CiStatus::Failed(Failure::new(BTreeSet::new())),
+        },
+    );
+    Observation::new(
+        Timestamp(42),
+        sha(1),
+        vec![pr, held, conflicting],
+        vec![batch, failed, silent],
+        vec![
+            Departure::new(PrNumber(4), sha(8), Departed::Merged),
+            Departure::new(PrNumber(5), sha(9), Departed::Withdrawn(Withdrawal::Closed)),
+        ],
+    )
 }
 
 fn empty_observation() -> Observation {
-    Observation {
-        trunk: sha(1),
-        prs: Vec::new(),
-        batches: Vec::new(),
-    }
+    Observation::new(Timestamp(7), sha(1), Vec::new(), Vec::new(), Vec::new())
 }
 
 /// A plan with two items of every kind.
 fn full_plan() -> Plan {
-    Plan {
+    let mut plan = Plan {
         start: vec![
-            BatchStart {
-                id: BatchId(5),
-                base: sha(1),
-                prs: vec![PrNumber(1)],
-            },
-            BatchStart {
-                id: BatchId(6),
-                base: sha(1),
-                prs: vec![PrNumber(2)],
-            },
+            BatchStart::new(BatchId(5), sha(1), vec![PrNumber(1)]),
+            BatchStart::new(BatchId(6), sha(1), vec![PrNumber(2)]),
         ],
         land: vec![BatchId(1), BatchId(2)],
         retire: vec![BatchId(3), BatchId(4)],
-        eject: vec![
-            Ejection {
-                pr: PrNumber(7),
-                reason: EjectReason::ConflictsWithTrunk,
-            },
-            Ejection {
-                pr: PrNumber(8),
-                reason: EjectReason::BatchFailed { batch: BatchId(3) },
-            },
-        ],
-    }
+        ..Plan::default()
+    };
+    let trunk = EjectReason::Conflicts {
+        with: ConflictWith::Trunk,
+    };
+    plan.eject.push(Ejection::new(PrNumber(7), trunk));
+    let failed = EjectReason::BatchFailed { batch: BatchId(3) };
+    plan.eject.push(Ejection::new(PrNumber(8), failed));
+    plan
 }
 
 #[test]
@@ -180,7 +207,10 @@ fn transient_on_start_abandons_the_plan_and_the_next_tick_proceeds() {
     {
         let mut driver = Driver::new(&mut forge, &mut scheduler);
         let error = driver.tick().unwrap_err();
-        assert!(matches!(error, ForgeError::Transient(_)));
+        assert!(matches!(
+            error,
+            DriverError::Forge(ForgeError::Transient(_))
+        ));
         let report = driver.tick().unwrap();
         assert_eq!(report.tick, 1);
     }
@@ -200,7 +230,10 @@ fn transient_on_eject_leaves_retire_uncalled() {
     forge.fail = Some(("eject", Kind::Transient));
     let mut scheduler = ScriptedScheduler::new(vec![full_plan()]);
     let error = Driver::new(&mut forge, &mut scheduler).tick().unwrap_err();
-    assert!(matches!(error, ForgeError::Transient(_)));
+    assert!(matches!(
+        error,
+        DriverError::Forge(ForgeError::Transient(_))
+    ));
     assert_eq!(
         forge.calls,
         [
@@ -215,7 +248,10 @@ fn permanent_is_returned() {
     forge.fail = Some(("land", Kind::Permanent));
     let mut scheduler = ScriptedScheduler::new(vec![full_plan()]);
     let error = Driver::new(&mut forge, &mut scheduler).tick().unwrap_err();
-    assert!(matches!(error, ForgeError::Permanent(_)));
+    assert!(matches!(
+        error,
+        DriverError::Forge(ForgeError::Permanent(_))
+    ));
     assert_eq!(error.to_string(), "permanent forge error: land refused");
     assert_eq!(forge.calls, ["observe ", "land 1"]);
 }
@@ -226,8 +262,20 @@ fn failed_observation_skips_the_scheduler() {
     forge.fail = Some(("observe", Kind::Transient));
     let mut scheduler = ScriptedScheduler::new(vec![full_plan()]);
     let error = Driver::new(&mut forge, &mut scheduler).tick().unwrap_err();
-    assert!(matches!(error, ForgeError::Transient(_)));
+    assert!(matches!(
+        error,
+        DriverError::Forge(ForgeError::Transient(_))
+    ));
     assert_eq!(scheduler.seen, 0);
+    assert_eq!(forge.calls, ["observe "]);
+}
+
+#[test]
+fn a_scheduler_error_is_returned_and_nothing_is_executed() {
+    let mut forge = FakeForge::new(busy_observation());
+    let error = Driver::new(&mut forge, &mut Stumped).tick().unwrap_err();
+    assert!(matches!(error, DriverError::Scheduler(_)));
+    assert_eq!(error.to_string(), "scheduler error: posterior underflow");
     assert_eq!(forge.calls, ["observe "]);
 }
 
@@ -260,11 +308,25 @@ fn report_renders_one_line_per_tick_and_per_effect() {
     assert_eq!(
         lines[0],
         format!(
-            "tick 3 trunk {} | pr 1 {} clean ci passed | batch 1 [1] on {} testing {} ci passed",
+            "tick 3 now 42 trunk {} | pr 1 {} ready \
+             | pr 2 {} on #1 waiting:own CI pending,mergeability unknown \
+             | pr 3 {} conflicting:trunk | batch 1 [1] on {} testing {} ci passed \
+             | batch 2 [9] on {} testing {} ci failed:build,lint \
+             | batch 3 [10] on {} testing {} ci failed \
+             | departed pr 4 {} merged outside the queue \
+             | departed pr 5 {} withdrawn: closed",
             sha(1),
             sha(2),
+            sha(4),
+            sha(5),
             sha(1),
-            sha(3)
+            sha(3),
+            sha(3),
+            sha(6),
+            sha(6),
+            sha(7),
+            sha(8),
+            sha(9)
         )
     );
     assert_eq!(lines[1], "  land batch 1");
@@ -279,5 +341,8 @@ fn report_renders_one_line_per_tick_and_per_effect() {
         plan: Plan::default(),
         idle: true,
     };
-    assert_eq!(idle.to_string(), format!("tick 0 trunk {} | idle", sha(1)));
+    assert_eq!(
+        idle.to_string(),
+        format!("tick 0 now 7 trunk {} | idle", sha(1))
+    );
 }

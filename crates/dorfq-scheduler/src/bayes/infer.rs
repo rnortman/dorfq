@@ -1,6 +1,8 @@
 //! Exact posteriors over the evidence, by inclusion–exclusion.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fmt;
 
 use super::model::{Cause, Model};
 
@@ -9,8 +11,29 @@ pub(crate) const MAX_COMPONENT_RUNS: usize = 12;
 
 /// The largest estimated rounding error a posterior may carry. A component
 /// whose failure is too improbable for the alternating sum to resolve
-/// exceeds it, and inference panics rather than return noise.
+/// exceeds it, and inference fails rather than return noise.
 const MAX_ERROR: f64 = 1e-2;
+
+/// A component whose posteriors the alternating sum cannot resolve to
+/// [`MAX_ERROR`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Unresolved {
+    runs: usize,
+    error: f64,
+    fail: f64,
+}
+
+impl fmt::Display for Unresolved {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "posteriors over {} runs cannot be resolved: error estimate {:e}, P(fail) {:e}",
+            self.runs, self.error, self.fail
+        )
+    }
+}
+
+impl Error for Unresolved {}
 
 /// Posteriors of every cause in the evidence, and the components the
 /// evidence falls into.
@@ -28,7 +51,7 @@ pub(crate) struct Inference {
 
 impl Inference {
     /// Infers over `model`'s evidence.
-    pub(crate) fn of(model: &Model) -> Inference {
+    pub(crate) fn of(model: &Model) -> Result<Inference, Unresolved> {
         let effective: Vec<BTreeSet<Cause>> = model
             .evidence()
             .iter()
@@ -49,14 +72,14 @@ impl Inference {
                 &sets,
                 |cause| model.belief(cause),
                 model.priors.p_flake,
-            ));
+            )?);
         }
-        Inference {
+        Ok(Inference {
             posterior,
             effective,
             components,
             component_of,
-        }
+        })
     }
 
     /// The posterior of `cause`: its belief when no run inference read
@@ -85,7 +108,7 @@ impl Inference {
         &self,
         model: &Model,
         extra: &BTreeSet<Cause>,
-    ) -> (Vec<usize>, BTreeMap<Cause, f64>) {
+    ) -> Result<(Vec<usize>, BTreeMap<Cause, f64>), Unresolved> {
         let joined: BTreeSet<usize> = extra
             .iter()
             .filter_map(|cause| self.component_of.get(cause).copied())
@@ -98,8 +121,8 @@ impl Inference {
         let kept = runs.split_off(runs.len().saturating_sub(MAX_COMPONENT_RUNS - 1));
         let mut sets: Vec<&BTreeSet<Cause>> = kept.iter().map(|&r| &self.effective[r]).collect();
         sets.push(extra);
-        let posterior = posteriors(&sets, |cause| model.belief(cause), model.priors.p_flake);
-        (kept, posterior)
+        let posterior = posteriors(&sets, |cause| model.belief(cause), model.priors.p_flake)?;
+        Ok((kept, posterior))
     }
 }
 
@@ -140,14 +163,14 @@ fn components(effective: &[BTreeSet<Cause>]) -> Vec<Vec<usize>> {
 /// subset sums over a mask of at most [`MAX_COMPONENT_RUNS`] runs; causes
 /// with one mask share a weight.
 ///
-/// Panics when the sums cannot be resolved to [`MAX_ERROR`]: `P(F fail)` is
+/// Fails when the sums cannot be resolved to [`MAX_ERROR`]: `P(F fail)` is
 /// not positive, not finite, or small against the terms that cancel to give
 /// it.
 fn posteriors(
     runs: &[&BTreeSet<Cause>],
     belief: impl Fn(Cause) -> f64,
     p_flake: f64,
-) -> BTreeMap<Cause, f64> {
+) -> Result<BTreeMap<Cause, f64>, Unresolved> {
     let n = runs.len();
     assert!(n <= MAX_COMPONENT_RUNS, "component of {n} runs");
     let size = 1usize << n;
@@ -181,19 +204,22 @@ fn posteriors(
     // factor that varies with the component.
     let error = f64::EPSILON * magnitude / fail;
     // TODO(bayes-posterior-precision): a component explained only by
-    // low-belief causes cannot be resolved, so the process stops here
-    // rather than eject on noise; recovering instead is unbuilt.
-    assert!(
-        fail > 0.0 && error < MAX_ERROR,
-        "posteriors over {n} runs cannot be resolved: error estimate {error:e}, P(fail) {fail:e}"
-    );
-    masks
+    // low-belief causes cannot be resolved, so inference fails here rather
+    // than eject on noise; recovering instead is unbuilt.
+    if !(fail > 0.0 && error < MAX_ERROR) {
+        return Err(Unresolved {
+            runs: n,
+            error,
+            fail,
+        });
+    }
+    Ok(masks
         .into_iter()
         .map(|(cause, mask)| {
             let p = belief(cause) * g[full & !mask] / fail;
             (cause, p.clamp(0.0, 1.0))
         })
-        .collect()
+        .collect())
 }
 
 /// Replaces each `v[T]` with `Σ_{S ⊆ T} v[S]`.
@@ -223,7 +249,7 @@ mod tests {
     /// Hand-built runs of `Bad` causes at the prior 0.05.
     fn infer(runs: &[BTreeSet<Cause>]) -> BTreeMap<Cause, f64> {
         let refs: Vec<&BTreeSet<Cause>> = runs.iter().collect();
-        posteriors(&refs, |_| 0.05, priors().p_flake)
+        posteriors(&refs, |_| 0.05, priors().p_flake).unwrap()
     }
 
     /// `P(c | every run failed)` by summing over every assignment of the
@@ -298,7 +324,7 @@ mod tests {
             .iter()
             .map(|run| model.effective(run).collect())
             .collect();
-        let inference = Inference::of(model);
+        let inference = Inference::of(model).unwrap();
         let got: BTreeMap<Cause, f64> = runs
             .iter()
             .flatten()
@@ -341,7 +367,10 @@ mod tests {
         // A grandchild that passes clears the whole chain: a flake.
         model.passed(&members(&[1, 2, 3]));
         assert!(model.evidence().is_empty());
-        assert_eq!(Inference::of(&model).posterior(&model, bad(3)), FLOOR);
+        assert_eq!(
+            Inference::of(&model).unwrap().posterior(&model, bad(3)),
+            FLOOR
+        );
     }
 
     #[test]
@@ -351,7 +380,7 @@ mod tests {
         model.passed(&members(&[1]));
         model.passed(&members(&[2]));
         assert_model_matches_brute_force(&model);
-        let p = Inference::of(&model).posterior(&model, pair(1, 2));
+        let p = Inference::of(&model).unwrap().posterior(&model, pair(1, 2));
         assert!(
             (p - 0.002 / (0.002 + 0.998 * priors().p_flake)).abs() < 1e-12,
             "{p}"
@@ -365,7 +394,10 @@ mod tests {
         model.failed(BatchId(2), &members(&[3, 4]));
         model.passed(&members(&[2]));
         assert_model_matches_brute_force(&model);
-        assert_eq!(Inference::of(&model).posterior(&model, bad(2)), FLOOR);
+        assert_eq!(
+            Inference::of(&model).unwrap().posterior(&model, bad(2)),
+            FLOOR
+        );
     }
 
     #[test]
@@ -411,7 +443,7 @@ mod tests {
             .flat_map(|a| (11..=20).map(move |b| pair(a, b)))
             .collect();
         let refs = [&cross];
-        let posterior = posteriors(&refs, |_| 0.002, priors().p_flake);
+        let posterior = posteriors(&refs, |_| 0.002, priors().p_flake).unwrap();
         let exact = 0.002 / (1.0 - 0.98 * 0.998f64.powi(100));
         assert_eq!(posterior.len(), 100);
         for p in posterior.values() {
@@ -428,7 +460,7 @@ mod tests {
         model.failed(BatchId(3), &members(&[2, 3]));
         model.failed(BatchId(4), &members(&[5]));
         model.failed(BatchId(5), &members(&[4, 5]));
-        let inference = Inference::of(&model);
+        let inference = Inference::of(&model).unwrap();
         assert_eq!(inference.components(), &[vec![0, 2], vec![1, 3, 4]]);
     }
 
@@ -440,7 +472,7 @@ mod tests {
         for id in 3..=14 {
             model.failed(BatchId(id), &members(&[2]));
         }
-        let inference = Inference::of(&model);
+        let inference = Inference::of(&model).unwrap();
         assert_eq!(inference.components(), &[(0..14).collect::<Vec<_>>()]);
         // 1 appears only in the two runs left out, so it keeps its belief.
         assert_eq!(inference.posterior(&model, bad(1)), 0.05);
@@ -458,7 +490,7 @@ mod tests {
     fn twelve_chained_runs_at_the_prior_match_brute_force() {
         let runs = chain_of(12);
         let refs: Vec<&BTreeSet<Cause>> = runs.iter().collect();
-        let got = posteriors(&refs, |_| 0.05, priors().p_flake);
+        let got = posteriors(&refs, |_| 0.05, priors().p_flake).unwrap();
         for (cause, p) in brute_force(&runs, |_| 0.05) {
             assert!(
                 (got[&cause] - p).abs() < 1e-6,
@@ -469,23 +501,35 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "cannot be resolved")]
-    fn chained_runs_too_improbable_to_resolve_panic() {
+    fn chained_runs_too_improbable_to_resolve_are_an_error() {
         // Exact posteriors near 0.035; the alternating sum returns 0.
         let runs = chain_of(11);
         let refs: Vec<&BTreeSet<Cause>> = runs.iter().collect();
-        posteriors(&refs, |_| 0.002, priors().p_flake);
+        let error = posteriors(&refs, |_| 0.002, priors().p_flake).unwrap_err();
+        assert_eq!(error.runs, 11);
+        assert!(
+            error
+                .to_string()
+                .contains("over 11 runs cannot be resolved"),
+            "{error}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "cannot be resolved")]
-    fn a_certain_cause_panics_rather_than_return_nan() {
+    fn a_certain_cause_is_an_error_rather_than_nan() {
         let runs = [bads(&[1, 2]), bads(&[2, 3])];
         let refs: Vec<&BTreeSet<Cause>> = runs.iter().collect();
-        posteriors(
+        let result = posteriors(
             &refs,
             |c| if c == bad(1) { 1.0 } else { 0.05 },
             priors().p_flake,
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be resolved"),
+            "a certain cause resolves"
         );
     }
 }

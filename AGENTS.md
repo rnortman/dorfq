@@ -6,6 +6,10 @@ DorfQ is a merge queue for large monorepos that pools pull requests into
 batched CI runs and infers the culprit when a batch fails. Charter and status:
 `README.md`. Read it first.
 
+The scheduler–forge contract and its rules are documented in
+`crates/dorfq-core`; the GitHub forge's repository layout in
+`crates/dorfq-forge-github`.
+
 ## Build: Bazel, and only Bazel
 
 Bazel is the build. The Makefile is a frontend whose every target is a
@@ -73,81 +77,6 @@ bypassed gate is not recoverable once it has been pushed.
   missing authority.
 - No over-engineering, no premature abstraction, no hypothetical features.
   Scope discipline: do what was asked.
-- The queue's own invariants are written here when the code that has them
-  arrives.
-
-## Boundary
-
-The scheduler and the forge meet only in `crates/dorfq-core`: the forge
-reports an `Observation`, the scheduler turns it into a `Plan`, and the
-driver in `crates/dorfq` executes the plan through the forge. The scheduler
-never calls the forge; the forge never sees the scheduler. The **latest
-observation** is the one `observe()` most recently returned; a pull request
-or batch is **known** when the latest observation reported it and no effect
-since has removed it: `eject` removes the pull request, `retire` the batch,
-and a successful `land` every member of the batch it landed; a refused
-landing removes nothing.
-
-1. **Facts flow one way.** `observe()` is the only source of facts. Effects
-   return `Ok(())`; their consequences appear in the next observation. A
-   forge keeps a batch in `batches` from `start_batch` until `retire`,
-   whatever its state.
-2. **The forge enforces the landing invariants.** `land(b)` is accepted
-   only for a batch the latest observation reported as
-   `Testing { ci: Passed }`. Trunk is fast-forwarded to its tip only if its
-   base is the current trunk and every member is still enqueued at the head
-   it was built with; otherwise the batch becomes `LandRefused` and the call
-   returns `Ok(())`. The forge does not re-check CI at `land`.
-3. **Plan items are requests.** The scheduler learns facts only from
-   observations and never assumes a planned effect happened. It may remember
-   what it emitted, never what it inferred the forge did with it. A batch id
-   that never appears in an observation was never started.
-4. **The scheduler is deterministic.** `step` reads no clock, randomness or
-   I/O; its output is a function of its own state and the observations it
-   has been given, in order. Time, when needed, arrives as an observation
-   field.
-5. **Plans are well-formed; batch ids are the scheduler's.** A new batch id
-   is not in the latest observation; members are non-empty, distinct and
-   known; the base is the latest trunk or a tracked batch's tip. Within a
-   plan, `eject` names a pull request at most once, each of `start`, `land`,
-   `retire` names a batch at most once, and no member of a batch `land`
-   names is named by `start` or `eject`, whether or not the landing is
-   refused. A violation is `Permanent`.
-6. **Effects on unknown things are bugs.** `land` or `retire` on an unknown
-   batch, `land` on a batch not reported `Testing { ci: Passed }`, `eject`
-   on an unknown pull request: all `Permanent`. Knownness is judged against
-   the latest observation and the forge's own effects since, not against
-   what the world did meanwhile.
-7. **The driver executes `land`, `start`, `eject`, `retire`, in that order,
-   and stops at the first error.** `Transient` abandons the rest of the plan
-   and ticks again; `Permanent` stops the process.
-8. **Ordering is canonical.** `prs` is sorted by number, `batches` by id.
-9. **The forge talks to authors** about every transition the queue causes
-   or observes: entry, inclusion in a batch, landing, ejection with the
-   scheduler's reason, and leaving by neither. Nothing about messages
-   crosses the boundary.
-
-A new field or variant in the contract is a coordinated change of
-`dorfq-core` and both sides, landed on `main` before either builds on it.
-
-## GitHub layout
-
-The GitHub forge (`crates/dorfq-forge-github`) keeps every piece of queue
-state in the repository it serves, so a restarted process recovers from one
-observation. These names are the queue's:
-
-| Name | What it is |
-|---|---|
-| the configured label | intent: an open pull request against trunk carrying it is enqueued |
-| `refs/heads/dorfq/batch/<id>` | a tracked batch's tip; exists from the end of a successful build until `retire`; CI must run on pushes to it |
-| `refs/heads/dorfq/build/<id>` | the branch a batch's merges are made on; exists only during `start_batch` |
-| `refs/heads/dorfq/probe/<id>` | the branch conflict attribution uses; exists only during `start_batch` |
-| `refs/dorfq/batches/<id>` | the batch's record, a commit whose message is the record text |
-
-`<id>` is the decimal batch id. While the queue runs, nobody pushes to,
-deletes or creates anything under `dorfq/` or `refs/dorfq/` by hand: the
-forge reads a foreign or moved ref there as `Permanent` and stops. Trunk
-moves only by fast-forward.
 
 ## Code standards
 
@@ -158,7 +87,8 @@ moves only by fast-forward.
   every test.
 - No unused code. No backwards-compatibility shims.
 - Schedulers use ordered collections (`BTreeMap`, `BTreeSet`); `HashMap`'s
-  iteration order is per-process random and would break rule 4.
+  iteration order is per-process random and would make `step`
+  nondeterministic.
 - Default branch: `main`.
 
 ## TODO system

@@ -37,11 +37,11 @@ fn add(w: &mut World, bad: bool, conflicts: bool, key: u64) -> u64 {
 }
 
 fn start(w: &mut World, id: u64, base: &Sha, prs: &[u64]) -> Result<(), ForgeError> {
-    w.start_batch(&BatchStart {
-        id: BatchId(id),
-        base: base.clone(),
-        prs: prs.iter().map(|&n| PrNumber(n)).collect(),
-    })
+    w.start_batch(&BatchStart::new(
+        BatchId(id),
+        base.clone(),
+        prs.iter().map(|&n| PrNumber(n)).collect(),
+    ))
 }
 
 fn state(o: &Observation, id: u64) -> BatchState {
@@ -96,7 +96,7 @@ fn only_first_two_interact() -> (u64, u64, u64) {
 }
 
 #[test]
-fn an_arrival_appears_with_passed_ci_and_its_drawn_mergeability() {
+fn an_arrival_appears_on_trunk_with_its_drawn_mergeability() {
     let mut cfg = config(1, 0.0, 0.0);
     cfg.arrivals_per_hour = 100.0;
     cfg.p_conflict = 1.0;
@@ -105,8 +105,8 @@ fn an_arrival_appears_with_passed_ci_and_its_drawn_mergeability() {
     w.advance_to(t);
     let o = w.observe().unwrap();
     assert_eq!(o.prs.len(), 1);
-    assert_eq!(o.prs[0].head_ci, CiStatus::Passed);
-    assert_eq!(o.prs[0].mergeable, Mergeable::Conflicting);
+    assert_eq!(o.prs[0].base, PrBase::Trunk);
+    assert_eq!(o.prs[0].status, PrStatus::Conflicting(ConflictWith::Trunk));
     assert_eq!(w.take_trace(), ["arrive 1"]);
 }
 
@@ -116,7 +116,10 @@ fn a_run_fails_for_a_bad_member_and_passes_without_one() {
     let good = add(&mut w, false, false, 1);
     let bad = add(&mut w, true, false, 2);
     assert_eq!(verdict_of(&mut w, 1, &[good]), CiStatus::Passed);
-    assert_eq!(verdict_of(&mut w, 2, &[good, bad]), CiStatus::Failed);
+    assert!(matches!(
+        verdict_of(&mut w, 2, &[good, bad]),
+        CiStatus::Failed(_)
+    ));
     let trace = ["arrive 1", "arrive 2", "ci 1 passed", "ci 2 failed"];
     assert_eq!(w.take_trace(), trace);
 }
@@ -129,7 +132,10 @@ fn a_run_fails_for_an_interacting_own_member_pair() {
     let pb = add(&mut w, false, false, b);
     let pc = add(&mut w, false, false, c);
     assert_eq!(verdict_of(&mut w, 1, &[pa, pc]), CiStatus::Passed);
-    assert_eq!(verdict_of(&mut w, 2, &[pa, pb]), CiStatus::Failed);
+    assert!(matches!(
+        verdict_of(&mut w, 2, &[pa, pb]),
+        CiStatus::Failed(_)
+    ));
 }
 
 #[test]
@@ -139,7 +145,10 @@ fn a_run_fails_for_a_member_interacting_with_a_landed_pull_request() {
     let second = add(&mut w, false, false, 2);
     assert_eq!(verdict_of(&mut w, 1, &[first]), CiStatus::Passed);
     w.land(BatchId(1)).unwrap();
-    assert_eq!(verdict_of(&mut w, 2, &[second]), CiStatus::Failed);
+    assert!(matches!(
+        verdict_of(&mut w, 2, &[second]),
+        CiStatus::Failed(_)
+    ));
 }
 
 #[test]
@@ -157,7 +166,10 @@ fn a_pair_whose_queue_times_did_not_overlap_does_not_fail_a_run() {
 fn a_flake_fails_a_clean_run() {
     let mut w = world(1, 0.0, 1.0);
     let good = add(&mut w, false, false, 1);
-    assert_eq!(verdict_of(&mut w, 1, &[good]), CiStatus::Failed);
+    assert!(matches!(
+        verdict_of(&mut w, 1, &[good]),
+        CiStatus::Failed(_)
+    ));
 }
 
 #[test]
@@ -172,14 +184,56 @@ fn a_child_fails_with_its_parents_tree() {
         let child = add(&mut w, false, false, c);
         let o = w.observe().unwrap();
         start(&mut w, 1, &o.trunk, &members).unwrap();
-        let unobserved = tip(&w.snapshot(), 1);
+        let unobserved = tip(&w.snapshot().unwrap(), 1);
         start(&mut w, 2, &unobserved, &[child]).unwrap_err();
         // The child's base must be in the latest observation.
         let o = w.observe().unwrap();
         start(&mut w, 2, &tip(&o, 1), &[child]).unwrap();
         finish(&mut w);
-        assert_eq!(ci(&mut w, 2), CiStatus::Failed, "parent {parent:?}");
+        assert!(
+            matches!(ci(&mut w, 2), CiStatus::Failed(_)),
+            "parent {parent:?}"
+        );
     }
+}
+
+#[test]
+fn a_probe_runs_on_its_base_tree_alone() {
+    let (a, b, c) = only_first_two_interact();
+    let mut w = world(4, 0.5, 0.0);
+    let pa = add(&mut w, false, false, a);
+    let pb = add(&mut w, false, false, b);
+    let pc = add(&mut w, false, false, c);
+    let o = w.observe().unwrap();
+    start(&mut w, 1, &o.trunk, &[pa, pb]).unwrap();
+    start(&mut w, 2, &o.trunk, &[pa, pc]).unwrap();
+    let o = w.observe().unwrap();
+    start(&mut w, 3, &o.trunk, &[]).unwrap();
+    start(&mut w, 4, &tip(&o, 1), &[]).unwrap();
+    start(&mut w, 5, &tip(&o, 2), &[]).unwrap();
+    let o = w.observe().unwrap();
+    for id in [3, 4, 5] {
+        let probe = o.batches.iter().find(|b| b.id == BatchId(id)).unwrap();
+        assert!(probe.members.is_empty());
+        assert_ne!(tip(&o, id), probe.base);
+    }
+    finish(&mut w);
+    assert_eq!(ci(&mut w, 3), CiStatus::Passed);
+    assert!(matches!(ci(&mut w, 4), CiStatus::Failed(_)));
+    assert_eq!(ci(&mut w, 5), CiStatus::Passed);
+    let probes: Vec<&RunRecord> = w.runs().iter().filter(|r| r.batch.0 >= 3).collect();
+    assert!(probes.iter().all(|r| r.members == 0), "{probes:?}");
+    assert_eq!(probes[1].tree, [pa, pb].map(PrNumber));
+}
+
+#[test]
+fn a_passed_probe_cannot_land() {
+    let mut w = world(1, 0.0, 0.0);
+    add(&mut w, false, false, 1);
+    assert_eq!(verdict_of(&mut w, 1, &[]), CiStatus::Passed);
+    assert!(violation_of(w.land(BatchId(1))).contains("is a probe"));
+    w.retire(BatchId(1)).unwrap();
+    assert!(w.observe().unwrap().batches.is_empty());
 }
 
 #[test]
@@ -276,21 +330,50 @@ fn land_refuses_trunk_moved_and_member_gone_and_lands_a_chain_in_order() {
 }
 
 #[test]
-fn a_conflicting_member_makes_a_conflict_batch_with_no_run() {
+fn departed_matches_each_exit_and_is_traced() {
+    let mut w = world(1, 0.0, 0.0);
+    let prs: Vec<u64> = (0..3).map(|k| add(&mut w, false, false, k)).collect();
+    let o = w.observe().unwrap();
+    assert!(o.departed.is_empty());
+    let heads: Vec<Sha> = o.prs.iter().map(|p| p.head.clone()).collect();
+    start(&mut w, 1, &o.trunk, &[prs[0]]).unwrap();
+    finish(&mut w);
+    w.observe().unwrap();
+    w.land(BatchId(1)).unwrap();
+    let reason = EjectReason::BatchFailed { batch: BatchId(1) };
+    w.eject(PrNumber(prs[1]), &reason).unwrap();
+    w.fire(Event::Withdraw(PrNumber(prs[2])));
+    w.take_trace();
+    let o = w.observe().unwrap();
+    let how = [
+        Departed::Landed { batch: BatchId(1) },
+        Departed::Ejected,
+        Departed::Withdrawn(Withdrawal::IntentCleared),
+    ];
+    let expected: Vec<dorfq_core::Departure> = (0..3)
+        .map(|i| dorfq_core::Departure::new(PrNumber(prs[i]), heads[i].clone(), how[i].clone()))
+        .collect();
+    assert_eq!(o.departed, expected);
+    assert_eq!(
+        w.take_trace(),
+        [
+            "depart 1 landed in batch 1",
+            "depart 2 ejected",
+            "depart 3 withdrawn: intent cleared"
+        ]
+    );
+    assert!(w.observe().unwrap().departed.is_empty());
+}
+
+#[test]
+fn a_pull_request_conflicting_with_trunk_cannot_join_a_batch() {
     let mut w = world(1, 0.0, 0.0);
     let p = add(&mut w, false, false, 1);
     let q = add(&mut w, false, true, 2);
     let o = w.observe().unwrap();
-    start(&mut w, 1, &o.trunk, &[p, q]).unwrap();
-    let o = w.observe().unwrap();
-    let with = ConflictWith::Trunk;
-    assert_eq!(
-        state(&o, 1),
-        BatchState::Conflict {
-            pr: PrNumber(q),
-            with
-        }
-    );
+    assert_eq!(o.prs[0].status, PrStatus::Ready);
+    let message = violation_of(start(&mut w, 1, &o.trunk, &[p, q]));
+    assert!(message.contains("not ready"), "{message}");
     assert_eq!((w.runs().len(), w.next_event()), (0, None));
 }
 
@@ -303,14 +386,18 @@ fn every_violation_is_permanent_and_named() {
     start(&mut w, 1, &trunk, &[p]).unwrap();
     let cases: Vec<(Result<(), ForgeError>, &str)> = vec![
         (start(&mut w, 1, &trunk, &[q]), "already in use"),
-        (start(&mut w, 2, &trunk, &[]), "has no members"),
         (start(&mut w, 3, &trunk, &[q, q]), "twice"),
         (start(&mut w, 4, &trunk, &[99]), "not known"),
         (start(&mut w, 5, &commit(999), &[q]), "neither trunk"),
         (w.land(BatchId(1)), "batch 1 is not known"),
         (w.retire(BatchId(7)), "retire: batch 7 is not known"),
         (
-            w.eject(PrNumber(99), &EjectReason::ConflictsWithTrunk),
+            w.eject(
+                PrNumber(99),
+                &EjectReason::Conflicts {
+                    with: ConflictWith::Trunk,
+                },
+            ),
             "pr 99 is not known",
         ),
     ];
@@ -325,8 +412,11 @@ fn every_violation_is_permanent_and_named() {
     w.land(BatchId(1)).unwrap();
     assert!(violation_of(w.land(BatchId(1))).contains("already landed"));
     assert!(violation_of(start(&mut w, 8, &trunk, &[p])).contains("this plan lands"));
-    let reason = EjectReason::ConflictsWithTrunk;
+    let reason = EjectReason::Conflicts {
+        with: ConflictWith::Trunk,
+    };
     assert!(violation_of(w.eject(PrNumber(p), &reason)).contains("this plan lands"));
+    assert!(violation_of(w.retire(BatchId(1))).contains("is landed in this plan"));
 }
 
 #[test]
@@ -347,7 +437,9 @@ fn an_ejection_is_justified_only_by_the_truth() {
     let good = add(&mut w, false, false, 1);
     let bad = add(&mut w, true, false, 2);
     w.observe().unwrap();
-    let reason = EjectReason::ConflictsWithTrunk;
+    let reason = EjectReason::Conflicts {
+        with: ConflictWith::Trunk,
+    };
     w.eject(PrNumber(good), &reason).unwrap();
     w.eject(PrNumber(bad), &reason).unwrap();
     let m = w.metrics();

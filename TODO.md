@@ -9,20 +9,6 @@ Every entry is public writing.
 
 ## Open
 
-### quality-check-land-returns-status-callers-re-match
-
-`Ledger::check_land` in `crates/dorfq-core/src/ledger.rs` matches
-`Testing { ci: Passed, .. }` and then returns the whole `BatchStatus`, so
-each forge's `land` matches the state again to read the tip and carries an
-`unreachable!` for the other arms (the mock's `land` in
-`crates/dorfq-forge-mock/src/lib.rs` does today; the GitHub forge's `land`
-will need the same). Returning what the check proved — the tip alongside
-the status, as a pair or a small struct — removes the panic branch from
-every forge. Deferred because the shape of `check_land`'s return is a
-fixed interface of the forge work in progress and changing it is a design
-decision. The `TODO(quality-check-land-returns-status-callers-re-match)`
-comment sits above `check_land`.
-
 ### efficiency-conflict-recovery-reads-for-unreachable-leftovers
 
 When `observe` reads a batch record in the `conflict` state, the GitHub
@@ -88,36 +74,11 @@ cannot merge. Ways to close the gap:
 - treat a head change on a labelled pull request as leaving the queue;
 - require the labeller to hold write permission;
 - require an approved review decision on the current head.
-Each adds API calls and puts review policy into the forge. Which one
-production needs, and whether the forge or the scheduler should own it, is a
-design decision. The
+Each adds API calls. Admission is the forge's: a pull request it would not
+land is reported `Waiting`, and `Hold::Review` is the slot for a missing
+review. Which policy production needs is a design decision. The
 `TODO(security-label-grants-unreviewed-landing-on-any-later-head)` comment
 sits above the label check in `fetch_world`.
-### eject-reason-display
-
-`EjectReason` has no rendering of its own in `dorfq-core`, so three crates
-spell it by hand: the driver's plan log (`crates/dorfq/src/driver.rs`), the
-mock's author messages (`crates/dorfq-forge-mock/src/lib.rs`) and the
-simulator's trace, where the `TODO(eject-reason-display)` comment sits. The
-first two use the same words independently; the trace needs a form without
-spaces. Give `EjectReason` a `Display` (and a token form if the trace keeps
-one) and have all three call it, so a new variant is worded once. Deferred
-because it changes `dorfq-core`, which is a coordinated contract change
-landed on `main`, and which form each audience gets is a decision for that
-change.
-
-### eject-reason-interacts-with
-
-When the Bayesian scheduler singles out a pair of pull requests that fail
-only together, it ejects the newer one with `EjectReason::BatchFailed`
-naming the run that singled the pair out. The honest reason is "fails
-together with #N": the author hears less than the scheduler knows. Add
-`EjectReason::InteractsWith { pr, batch }` to `dorfq-core`, render it in the
-mock forge's author messages and the driver's plan log, and have the
-scheduler emit it where the `TODO(eject-reason-interacts-with)` comment sits
-in `crates/dorfq-scheduler/src/bayes/policy.rs`. Deferred because it is a
-contract change, landed on `main` with both sides of the boundary.
-
 ### bayes-pair-search
 
 The Bayesian scheduler's culprit finders search a set of materialised cross
@@ -131,6 +92,31 @@ strategy is design work: which subsets to run, how their verdicts update
 the pair beliefs, and how a finder of several pull requests is scored
 against the chain.
 
+### scheduler-stacks
+
+`Bisect` and `Bayes` batch only pull requests based on trunk, and hold back
+every ancestor of an `Atomic` pull request with it, so a stacked pull
+request waits in the queue for as long as it is stacked. Stack-aware
+growth, splitting and culprit finding belong here: a consistent chain as
+one unit, its base-closed prefixes as valid members, and the break where an
+ancestor moved. The `TODO(scheduler-stacks)` comments sit at the pool each
+policy builds with `batchable`, in `crates/dorfq-scheduler/src/bisect.rs`
+and `crates/dorfq-scheduler/src/bayes/policy.rs`. Deferred because how these
+policies batch, split and blame members of a stack is scheduler design that
+has not been done yet.
+
+### bayes-landing-transfers-pair-belief
+
+When a pull request leaves the Bayesian scheduler's model because its
+content reached trunk (`Departed::Landed` or `Departed::Merged`), every
+pair it belonged to is dropped. A pair `Interact(A, B)` holding belief
+when A lands says that B now fails on trunk, so that belief should fold
+into `Bad(B)` rather than vanish. The `TODO(bayes-landing-transfers-pair-belief)`
+comment sits where `sync` in `crates/dorfq-scheduler/src/bayes/model.rs`
+drops a departed pull request's pairs. Deferred because it changes the
+model's posteriors, and how much belief transfers, and with what effect on
+ejections, needs a simulated world to size it.
+
 ### bayes-posterior-precision
 
 The Bayesian scheduler's exact inference sums an alternating series over
@@ -143,9 +129,10 @@ to give it, and the posteriors become noise. That is the shape a CI outage
 or a long flaky spell produces, with the same pull requests retried on
 culprit finders. Today the guard where the `TODO(bayes-posterior-precision)`
 comment sits in `crates/dorfq-scheduler/src/bayes/infer.rs` estimates the
-error and stops the process once the estimate reaches 1%, rather than
-eject a pull request on noise; the estimate runs well above the true
-error, so the stop comes a run or two before the posteriors are noise. It
+error and, once the estimate reaches 1%, has `step` return a
+`SchedulerError`, which stops the process, rather than eject a pull request
+on noise; the estimate runs well above the true error, so the stop comes a
+run or two before the posteriors are noise. It
 is reached two ways. Inferring over the evidence reaches it at a chain of
 about nine or more such linked runs at the shipped priors. Scoring a
 candidate batch by the posteriors its failure would give reaches it
@@ -163,9 +150,7 @@ oldest runs until the sum is significant, or fall back to exact
 enumeration over the component's causes when there are few of them.
 Deferred because either changes what the posteriors are in a regime no
 simulated world has reached, so choosing and sizing one is model design
-with a world that exercises it; and because the scheduler contract gives
-`step` no way to report that it cannot compute, so the alternative to a
-stop is a contract change. Scoring has a third, exact remedy for the
+with a world that exercises it. Scoring has a third, exact remedy for the
 union: components share no cause, so the hypothetical run's failure can be
 scored against each component separately and the results combined, which
 leaves the posteriors unchanged and moves the scoring stop back to where a
