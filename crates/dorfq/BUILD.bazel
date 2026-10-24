@@ -43,6 +43,8 @@ rust_test(
     compile_data = [
         "examples/github.toml",
         "examples/scenario.toml",
+        # A GitHub App key, read with `include_str!`.
+        "//crates/dorfq-forge-github:testdata/app-key.pkcs1.pem",
     ],
     crate = ":dorfq_lib",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),

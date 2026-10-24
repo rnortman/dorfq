@@ -7,6 +7,16 @@
 # the repository, so the service runs as a throwaway user with no files of
 # its own; systemd reads the token file as root before dropping to it.
 #
+# As a GitHub App instead of a token: keep the app's key root-only as
+#   /etc/dorfq/app-key.pem              the app's private key, mode 0600
+# swap the EnvironmentFile= line for the commented LoadCredential= line, and
+# set in the configuration
+#   [forge.auth]
+#   kind = "app"
+#   client_id = "<the app's Client ID>"
+#   private_key_file = "/run/credentials/dorfq.service/app-key"
+# systemd copies the key there for the unit's dynamic user at start.
+#
 # dorfq exits only on a Permanent error, which a restart does not cure; the
 # delay keeps a restart loop slow while the cause is found.
 
@@ -18,6 +28,7 @@ After=network-online.target
 [Service]
 ExecStart=/usr/local/bin/dorfq run --config /etc/dorfq/dorfq.toml
 EnvironmentFile=/etc/dorfq/token.env
+#LoadCredential=app-key:/etc/dorfq/app-key.pem
 DynamicUser=yes
 Restart=on-failure
 RestartSec=5min

@@ -3,7 +3,7 @@
 //! `DORFQ_EXAMPLE_CONFIG`; this test does not build under `cargo test`.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[test]
@@ -165,10 +165,10 @@ fn github_with_empty_token_variable_exits_one_naming_it() {
     });
 }
 
-/// Runs `dorfq run` on a `github` configuration whose token is read from
-/// `var`, with an `api_base` nothing listens on, and expects exit 1, no
-/// stdout, and `var` named on stderr.
-fn exits_one_naming_token_variable(var: &str, file: &str, set_token: impl FnOnce(&mut Command)) {
+/// Writes a `github` configuration with `api_base` nothing listens on and
+/// the given `[forge.auth]` body to `file` under the test's temporary
+/// directory, and returns its path.
+fn github_config(file: &str, auth: &str) -> PathBuf {
     let dir = PathBuf::from(std::env::var("TEST_TMPDIR").expect("TEST_TMPDIR under bazel test"));
     let config = dir.join(file);
     fs::write(
@@ -176,17 +176,42 @@ fn exits_one_naming_token_variable(var: &str, file: &str, set_token: impl FnOnce
         format!(
             "[forge]\nkind = \"github\"\napi_base = \"https://127.0.0.1:1\"\n\
              owner = \"alice\"\nrepo = \"widgets\"\ntrunk = \"main\"\nlabel = \"queue\"\n\
-             checks = [\"check\"]\ntoken_env = \"{var}\"\n\n\
+             checks = [\"check\"]\n\n[forge.auth]\n{auth}\n\
              [scheduler]\nkind = \"all-at-once\"\n\n[driver]\ntick_millis = 0\n"
         ),
     )
     .expect("write config");
+    config
+}
+
+/// Runs `dorfq run` on `config` and expects exit 1, no stdout, and `named`
+/// on stderr.
+fn run_exits_one_naming(config: &Path, named: &str, prepare: impl FnOnce(&mut Command)) {
     let mut command = Command::new(env!("DORFQ_BIN"));
-    command.args(["run", "--config"]).arg(&config);
-    set_token(&mut command);
+    command.args(["run", "--config"]).arg(config);
+    prepare(&mut command);
     let output = command.output().expect("spawn dorfq");
     assert_eq!(output.status.code(), Some(1), "dorfq run: {output:?}");
     assert!(output.stdout.is_empty(), "dorfq run: {output:?}");
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
-    assert!(stderr.contains(var), "stderr: {stderr:?}");
+    assert!(stderr.contains(named), "stderr: {stderr:?}");
+}
+
+/// Runs `dorfq run` on a `github` configuration whose token is read from
+/// `var`, and expects exit 1, no stdout, and `var` named on stderr.
+fn exits_one_naming_token_variable(var: &str, file: &str, set_token: impl FnOnce(&mut Command)) {
+    let config = github_config(file, &format!("kind = \"token\"\nenv = \"{var}\"\n"));
+    run_exits_one_naming(&config, var, set_token);
+}
+
+#[test]
+fn github_app_with_missing_key_file_exits_one_naming_it() {
+    let config = github_config(
+        "github-app-missing-key.toml",
+        "kind = \"app\"\nclient_id = \"Iv23liTEST\"\n\
+         private_key_file = \"no-such-app-key.pem\"\n",
+    );
+    // The relative path resolves against the configuration's directory.
+    let key = config.with_file_name("no-such-app-key.pem");
+    run_exits_one_naming(&config, &key.display().to_string(), |_| {});
 }

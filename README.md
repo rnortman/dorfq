@@ -60,37 +60,49 @@ with GitHub is the live lane, so run that before pointing the queue at any
 repository you care about. The steps, all done by the operator:
 
 1. Create the intent label (`queue` in the example) in the repository.
-2. Create a fine-grained personal access token for the repository with
-   Contents: read/write, Pull requests: read/write, Issues: read, Metadata:
-   read and Workflows: read/write, and export it as `DORFQ_GITHUB_TOKEN`
-   where the queue runs. Comments and merge commits appear under the
-   token's account. Workflows is needed because GitHub refuses a merge or a
-   ref update that adds or changes a file under `.github/workflows/` to a
-   token without it, and the queue makes both for every queued pull request
-   that touches CI; without it the first such batch stops the queue.
+2. Choose the queue's credential. As a GitHub App (below), the queue has an
+   identity of its own: comments and merge commits appear as
+   `<app name>[bot]`, and what it holds at rest is a private key from which
+   it mints its own short-lived tokens. As a token, it acts as a person:
+   create a fine-grained personal access token for the repository with
+   Contents: read/write, Pull requests: read/write, Issues: read, Checks:
+   read, Metadata: read and Workflows: read/write, export it as
+   `DORFQ_GITHUB_TOKEN` where the queue runs, and set `[forge.auth]` to
+   `kind = "token"`, `env = "DORFQ_GITHUB_TOKEN"`; comments and merge
+   commits appear under the token's account. Under either credential,
+   Workflows is needed because GitHub refuses a merge or a ref update that
+   adds or changes a file under `.github/workflows/` to a credential
+   without it, and the queue makes both for every queued pull request that
+   touches CI; without it the first such batch stops the queue. Checks is
+   what GitHub's permission reference names for listing a commit's check
+   runs, which the queue does on every observation.
 3. Run the live lane: create a throwaway repository whose name contains
    `scratch` or `playground`, with a `main` branch holding at least one
-   commit; give the
-   token access to it as well, with Commit statuses: read/write added; then
+   commit; give the credential access to it as well, with Commit statuses:
+   read/write added; then
 
    ```sh
    DORFQ_LIVE_REPO=<owner>/<name> make live-test
    ```
 
-   It refuses any repository whose name contains neither, and
-   treats the one it accepts as disposable: it closes every open labelled
-   pull request, deletes every queue ref, and lands commits on `main`.
-   `DORFQ_LIVE_API_BASE` points it at GitHub Enterprise.
-4. If trunk is protected, the token's identity must be allowed to push to it
-   (landing is a direct fast-forward, not a pull-request merge), and trunk's
-   required status checks should be the names in `checks`.
+   with either `DORFQ_GITHUB_TOKEN`, or `DORFQ_GITHUB_APP_CLIENT_ID` and
+   `DORFQ_GITHUB_APP_KEY_FILE` (the key's absolute path), in the
+   environment; exactly one of the two. Under an app this is the one check
+   that GitHub accepts its tokens and lets it comment, label, set statuses
+   and push trunk. It refuses any repository whose name contains neither,
+   and treats the one it accepts as disposable: it closes every open
+   labelled pull request, deletes every queue ref, and lands commits on
+   `main`. `DORFQ_LIVE_API_BASE` points it at GitHub Enterprise.
+4. If trunk is protected, the credential's identity must be allowed to push
+   to it (landing is a direct fast-forward, not a pull-request merge), and
+   trunk's required status checks should be the names in `checks`.
 5. CI must run on `dorfq/batch/**` pushes and report under the names in
    `checks`. GitHub reads a push workflow from the pushed commit, and a
    batch branch carries trunk's workflows, so the trigger has to be on
    trunk before batch branches get checks; until then batches stay pending.
    dorfq's own `.github/workflows/ci.yml` has the trigger.
-6. Copy `crates/dorfq/examples/github.toml`, set `owner` and `repo`, and run
-   it wherever outbound HTTPS is available:
+6. Copy `crates/dorfq/examples/github.toml`, set `owner`, `repo` and
+   `[forge.auth]`, and run it wherever outbound HTTPS is available:
 
    ```sh
    make optimised   # then: dorfq run --config <your github.toml>
@@ -101,8 +113,8 @@ repository you care about. The steps, all done by the operator:
    `tick_millis` is the polling interval.
 7. To keep it running, `crates/dorfq/examples/systemd/` has a user unit and
    a system unit; each says where it expects the binary, the configuration
-   and the token. `make local-deploy` installs the binary where the user
-   unit expects it and restarts the unit if it is running.
+   and the token or the app's key. `make local-deploy` installs the binary
+   where the user unit expects it and restarts the unit if it is running.
 
 While the queue runs, nobody pushes to, deletes or creates anything under
 `dorfq/` or `refs/dorfq/` by hand: the queue reads a foreign or moved ref
@@ -120,10 +132,47 @@ The label is what authorises a merge. Anyone who can apply it lands the pull
 request, and on GitHub the Triage role is enough. The pull request lands at
 whatever head it has when its batch is built, which may include commits
 pushed after it was labelled. Branch protection's review rules do not apply,
-because landing is a push by the token's identity. Batch CI runs the pull
-request's own workflow files as a push to this repository, with this
-repository's secrets, and that holds for pull requests from forks too. So
+because landing is a push by the queue's own identity, the token's account
+or the app. Batch CI runs the pull request's own workflow files as a push to
+this repository, with this repository's secrets, and that holds for pull requests from forks too. So
 read a pull request's current head, workflows included, before you label it.
+
+### As a GitHub App
+
+1. Create the app: the account's *Settings → Developer settings → GitHub
+   Apps → New GitHub App*. Give it a name (its comments appear as
+   `<name>[bot]`) and any homepage URL, deactivate *Webhook* (dorfq polls),
+   and under *Where can this GitHub App be installed?* choose only this
+   account.
+2. Repository permissions: Contents read/write, Pull requests read/write,
+   Issues read, Checks read, Metadata read, Workflows read/write; add
+   Commit statuses read/write if the live lane will run under the app.
+3. *Generate a private key*. GitHub downloads a `.pem`; store it where the
+   queue runs, mode 0600, and note the *Client ID* from the app's page.
+4. *Install App* on the repository the queue serves, and only that one
+   (plus the live lane's throwaway repository while you run it).
+5. If trunk is protected by branch protection or a ruleset, add the app to
+   *Restrict who can push* and to the bypass list of any rule requiring a
+   pull request: landing is a direct fast-forward push by the app. Trunk's
+   required status checks are the names in `checks`.
+6. In the configuration:
+
+   ```toml
+   [forge.auth]
+   kind = "app"
+   client_id = "<the app's Client ID>"
+   private_key_file = "<path to the .pem>"   # relative to the configuration
+   ```
+
+7. Run the live lane under the app (step 3 above) before pointing the queue
+   at a repository you care about.
+
+The queue mints an installation token scoped to the one repository at
+startup, and a new one before each expires. It fails at startup, naming the
+cause, if the key is unreadable or not a key, the app is not installed on
+the repository, or GitHub rejects its signature (a wrong client id, a key
+that is not the app's, or this host's clock more than a minute ahead or
+five minutes behind GitHub's).
 
 ## Building
 

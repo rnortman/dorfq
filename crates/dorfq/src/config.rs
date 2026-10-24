@@ -45,8 +45,27 @@ pub enum ForgeConfig {
         /// The check names that must pass, on pull request heads and batch
         /// tips.
         checks: Vec<String>,
+        /// The credential the forge runs under.
+        auth: AuthConfig,
+    },
+}
+
+/// The credential the GitHub forge runs under.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum AuthConfig {
+    /// A fixed token read from the environment.
+    Token {
         /// The environment variable holding the token; never the token.
-        token_env: String,
+        env: String,
+    },
+    /// A GitHub App.
+    App {
+        /// The app's Client ID (the numeric App ID also works).
+        client_id: String,
+        /// The app's private key, PEM; relative paths are resolved against
+        /// the configuration file's directory at load.
+        private_key_file: PathBuf,
     },
 }
 
@@ -126,14 +145,29 @@ impl Config {
                 trunk,
                 label,
                 checks,
-                token_env,
+                auth,
             } => {
                 if !api_base.starts_with("https://") {
                     return Err(format!(
                         "forge.api_base {api_base:?} is not an https:// URL"
                     ));
                 }
-                for (field, value) in [("owner", owner), ("repo", repo), ("token_env", token_env)] {
+                let credential = match auth {
+                    AuthConfig::Token { env } => ("auth.env", env.as_str()),
+                    AuthConfig::App {
+                        client_id,
+                        private_key_file,
+                    } => {
+                        let resolved = dir.join(private_key_file.as_path());
+                        *private_key_file = resolved;
+                        ("auth.client_id", client_id.as_str())
+                    }
+                };
+                for (field, value) in [
+                    ("owner", owner.as_str()),
+                    ("repo", repo.as_str()),
+                    credential,
+                ] {
                     if value.is_empty() {
                         return Err(format!("forge.{field} is empty"));
                     }
@@ -246,7 +280,10 @@ repo = "dorfq"
 trunk = "main"
 label = "queue"
 checks = ["check"]
-token_env = "DORFQ_GITHUB_TOKEN"
+
+[forge.auth]
+kind = "token"
+env = "DORFQ_GITHUB_TOKEN"
 
 [scheduler]
 kind = "all-at-once"
@@ -267,30 +304,123 @@ tick_millis = 60000
                 trunk: "main".to_owned(),
                 label: "queue".to_owned(),
                 checks: vec!["check".to_owned()],
-                token_env: "DORFQ_GITHUB_TOKEN".to_owned(),
+                auth: AuthConfig::Token {
+                    env: "DORFQ_GITHUB_TOKEN".to_owned(),
+                },
             }
         );
         assert_eq!(config.driver, DriverConfig { tick_millis: 60000 });
+    }
+
+    const TOKEN_AUTH: &str = "kind = \"token\"\nenv = \"DORFQ_GITHUB_TOKEN\"\n";
+
+    /// [`GITHUB`] with the `[forge.auth]` body replaced by `auth`.
+    fn github_with_auth(auth: &str) -> String {
+        assert!(GITHUB.contains(TOKEN_AUTH));
+        GITHUB.replace(TOKEN_AUTH, auth)
+    }
+
+    fn auth_of(config: Config) -> AuthConfig {
+        match config.forge {
+            ForgeConfig::GitHub { auth, .. } => auth,
+            other => panic!("not a github forge: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn github_app_auth_parses_and_resolves_a_relative_key_path() {
+        let text = github_with_auth(
+            "kind = \"app\"\nclient_id = \"Iv23liABC\"\nprivate_key_file = \"dorfq-app.pem\"\n",
+        );
+        let config = Config::parse(&text, Path::new("conf")).unwrap();
+        assert_eq!(
+            auth_of(config),
+            AuthConfig::App {
+                client_id: "Iv23liABC".to_owned(),
+                private_key_file: PathBuf::from("conf/dorfq-app.pem"),
+            }
+        );
+    }
+
+    #[test]
+    fn github_app_absolute_key_path_is_kept() {
+        let text = github_with_auth(
+            "kind = \"app\"\nclient_id = \"Iv23liABC\"\nprivate_key_file = \"/run/key.pem\"\n",
+        );
+        let config = Config::parse(&text, Path::new("conf")).unwrap();
+        assert_eq!(
+            auth_of(config),
+            AuthConfig::App {
+                client_id: "Iv23liABC".to_owned(),
+                private_key_file: PathBuf::from("/run/key.pem"),
+            }
+        );
+    }
+
+    #[test]
+    fn github_missing_auth_is_rejected_naming_it() {
+        let text = github_with_auth("").replace("[forge.auth]\n", "");
+        let message = rejected(&text);
+        assert!(message.contains("auth"), "{message}");
+    }
+
+    #[test]
+    fn github_auth_unknown_kind_is_rejected_naming_it() {
+        let message = rejected(&github_with_auth("kind = \"oauth\"\n"));
+        assert!(message.contains("oauth"), "{message}");
+    }
+
+    #[test]
+    fn github_auth_unknown_field_is_rejected_naming_it() {
+        let message = rejected(&github_with_auth(&format!("{TOKEN_AUTH}scope = \"all\"\n")));
+        assert!(message.contains("scope"), "{message}");
+        // The token form's field is not accepted on the app form.
+        let message = rejected(&github_with_auth(
+            "kind = \"app\"\nclient_id = \"Iv23liABC\"\nprivate_key_file = \"k.pem\"\nenv = \"X\"\n",
+        ));
+        assert!(message.contains("env"), "{message}");
+    }
+
+    #[test]
+    fn github_auth_missing_field_is_rejected_naming_it() {
+        let message = rejected(&github_with_auth("kind = \"token\"\n"));
+        assert!(message.contains("env"), "{message}");
+        let message = rejected(&github_with_auth(
+            "kind = \"app\"\nclient_id = \"Iv23liABC\"\n",
+        ));
+        assert!(message.contains("private_key_file"), "{message}");
+        let message = rejected(&github_with_auth(
+            "kind = \"app\"\nprivate_key_file = \"k.pem\"\n",
+        ));
+        assert!(message.contains("client_id"), "{message}");
+    }
+
+    #[test]
+    fn github_auth_empty_field_is_rejected_naming_it() {
+        let message = rejected(&github_with_auth("kind = \"token\"\nenv = \"\"\n"));
+        assert_eq!(message, "forge.auth.env is empty");
+        let message = rejected(&github_with_auth(
+            "kind = \"app\"\nclient_id = \"\"\nprivate_key_file = \"k.pem\"\n",
+        ));
+        assert_eq!(message, "forge.auth.client_id is empty");
     }
 
     #[test]
     fn shipped_github_example_parses() {
         let text = include_str!("../examples/github.toml");
         let config = Config::parse(text, Path::new("")).unwrap();
-        assert!(matches!(config.forge, ForgeConfig::GitHub { .. }));
+        assert!(matches!(
+            config.forge,
+            ForgeConfig::GitHub {
+                auth: AuthConfig::App { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
     fn github_missing_field_is_rejected_naming_it() {
-        for field in [
-            "api_base",
-            "owner",
-            "repo",
-            "trunk",
-            "label",
-            "checks",
-            "token_env",
-        ] {
+        for field in ["api_base", "owner", "repo", "trunk", "label", "checks"] {
             let text: String = GITHUB
                 .lines()
                 .filter(|line| !line.starts_with(&format!("{field} =")))
@@ -308,7 +438,6 @@ tick_millis = 60000
             ("repo", "\"dorfq\""),
             ("trunk", "\"main\""),
             ("label", "\"queue\""),
-            ("token_env", "\"DORFQ_GITHUB_TOKEN\""),
         ] {
             let text = GITHUB.replace(&format!("{field} = {value}"), &format!("{field} = \"\""));
             let message = rejected(&text);
@@ -330,6 +459,17 @@ tick_millis = 60000
         assert_eq!(message, "forge.checks names no check");
         let message = rejected(&GITHUB.replace("[\"check\"]", "[\"check\", \"\"]"));
         assert_eq!(message, "forge.checks[1] is empty");
+    }
+
+    #[test]
+    fn github_token_env_of_the_old_form_is_rejected_naming_it() {
+        let old = GITHUB.replace(
+            "\n[forge.auth]\nkind = \"token\"\nenv = \"DORFQ_GITHUB_TOKEN\"\n",
+            "token_env = \"DORFQ_GITHUB_TOKEN\"\n",
+        );
+        assert_ne!(old, GITHUB);
+        let message = rejected(&old);
+        assert!(message.contains("token_env"), "{message}");
     }
 
     #[test]

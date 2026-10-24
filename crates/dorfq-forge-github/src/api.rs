@@ -3,11 +3,13 @@
 
 use std::error::Error;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use dorfq_core::{ForgeError, PrNumber, Sha};
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+use crate::app::AppKey;
 
 /// Every call the forge makes on a repository.
 pub trait GitHubApi {
@@ -177,6 +179,8 @@ impl fmt::Display for Method {
 struct HttpRequest<'a> {
     method: Method,
     url: &'a str,
+    /// The `Authorization` header's value.
+    authorization: &'a str,
     body: Option<&'a Value>,
 }
 
@@ -212,24 +216,80 @@ struct TransportError {
 
 type Transport = Box<dyn FnMut(&HttpRequest<'_>) -> Result<HttpResponse, TransportError>>;
 
+type Clock = Box<dyn Fn() -> SystemTime>;
+
+/// How requests are authorised.
+#[derive(Clone)]
+pub enum Auth {
+    /// A fixed token: `Bearer <token>` on every request.
+    Token(String),
+    /// A GitHub App: installation tokens minted from its key.
+    App(AppKey),
+}
+
+enum Credential {
+    /// The full header value.
+    Token(String),
+    App {
+        key: AppKey,
+        /// The repository's name, which the minted token is scoped to.
+        repo: String,
+        /// Found once and kept: an installation's id does not change while
+        /// the app stays installed.
+        installation: Option<u64>,
+        token: Option<InstallationToken>,
+    },
+}
+
+struct InstallationToken {
+    /// The full header value.
+    bearer: String,
+    /// The local clock, read before the mint request was sent.
+    minted: SystemTime,
+}
+
+/// GitHub's documented lifetime of an installation token. A token's age is
+/// measured on the local clock from a time read before the mint request, so
+/// the measure starts no later than GitHub's hour does and the offset
+/// between the two clocks does not enter. The response's `expires_at` is a
+/// time on GitHub's clock and is not read.
+const INSTALLATION_TOKEN_LIFETIME: Duration = Duration::from_secs(60 * 60);
+
+/// A token with no more than this left of its lifetime is replaced before
+/// the next request. It is ten times a request's thirty-second timeout, so a
+/// token that passed the check cannot expire before its request is answered.
+const INSTALLATION_TOKEN_MARGIN: Duration = Duration::from_secs(5 * 60);
+
+/// What GitHub's 401 to a JWT-authorised request means.
+const JWT_REJECTED: &str = "GitHub rejected the app's JWT: wrong client id, a key that is not \
+     this app's, or this host's clock more than a minute ahead or five minutes behind GitHub's";
+
+/// What GitHub's 401 to a request under a fresh installation token means.
+const INSTALLATION_TOKEN_REJECTED: &str = "the installation token was rejected: the app was \
+     suspended or uninstalled, its key revoked, or this host's clock stepped back";
+
 /// [`GitHubApi`] over GitHub's REST API (github.com or GitHub Enterprise).
 pub struct RestClient {
-    /// `{api_base}/repos/{owner}/{repo}`.
-    repo_url: String,
+    /// `api_base` without a trailing slash.
+    api_base: String,
+    /// `/repos/{owner}/{repo}`, encoded.
+    repo_path: String,
+    credential: Credential,
     transport: Transport,
+    now: Clock,
 }
 
 const PER_PAGE: &str = "per_page=100";
 
 impl RestClient {
     /// A client for one repository. `api_base` is `https://api.github.com`
-    /// or a GitHub Enterprise `https://<host>/api/v3`; `token` is sent as a
-    /// bearer token on every request.
+    /// or a GitHub Enterprise `https://<host>/api/v3`; `auth` says what
+    /// every request is authorised with.
     pub fn new(
         api_base: &str,
         owner: &str,
         repo: &str,
-        token: &str,
+        auth: Auth,
         user_agent: &str,
     ) -> RestClient {
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -242,22 +302,111 @@ impl RestClient {
             .user_agent(user_agent)
             .build()
             .into();
-        let authorization = format!("Bearer {token}");
-        let transport: Transport =
-            Box::new(move |request: &HttpRequest<'_>| send(&agent, &authorization, request));
-        RestClient::with_transport(api_base, owner, repo, transport)
+        let transport: Transport = Box::new(move |request: &HttpRequest<'_>| send(&agent, request));
+        RestClient::with_transport(
+            api_base,
+            owner,
+            repo,
+            auth,
+            transport,
+            Box::new(SystemTime::now),
+        )
     }
 
-    fn with_transport(api_base: &str, owner: &str, repo: &str, transport: Transport) -> RestClient {
+    fn with_transport(
+        api_base: &str,
+        owner: &str,
+        repo: &str,
+        auth: Auth,
+        transport: Transport,
+        now: Clock,
+    ) -> RestClient {
+        let credential = match auth {
+            Auth::Token(token) => Credential::Token(format!("Bearer {token}")),
+            Auth::App(key) => Credential::App {
+                key,
+                repo: repo.to_owned(),
+                installation: None,
+                token: None,
+            },
+        };
         RestClient {
-            repo_url: format!(
-                "{}/repos/{}/{}",
-                api_base.trim_end_matches('/'),
-                encode(owner),
-                encode(repo)
-            ),
+            api_base: api_base.trim_end_matches('/').to_owned(),
+            repo_path: format!("/repos/{}/{}", encode(owner), encode(repo)),
+            credential,
             transport,
+            now,
         }
+    }
+
+    fn repo_url(&self) -> String {
+        format!("{}{}", self.api_base, self.repo_path)
+    }
+
+    /// The `Authorization` value for the next request; under an app, mints
+    /// an installation token first when none is cached or the cached one is
+    /// within the margin of its lifetime.
+    fn authorization(&mut self) -> Result<String, ApiError> {
+        let RestClient {
+            api_base,
+            repo_path,
+            credential,
+            transport,
+            now,
+        } = self;
+        let (key, repo, installation, token) = match credential {
+            Credential::Token(bearer) => return Ok(bearer.clone()),
+            Credential::App {
+                key,
+                repo,
+                installation,
+                token,
+            } => (key, repo, installation, token),
+        };
+        let now = now();
+        if let Some(cached) = token {
+            // A clock that stepped back since the mint makes the token look
+            // younger, never older.
+            let age = now.duration_since(cached.minted).unwrap_or_default();
+            if age < INSTALLATION_TOKEN_LIFETIME - INSTALLATION_TOKEN_MARGIN {
+                return Ok(cached.bearer.clone());
+            }
+        }
+        let jwt = key
+            .jwt(now)
+            .map_err(|e| permanent(format!("signing the app's JWT: {e}")))?;
+        let jwt = format!("Bearer {jwt}");
+        let id = match installation {
+            Some(id) => *id,
+            None => {
+                let doing = "finding the app's installation";
+                let path = format!("{repo_path}/installation");
+                let url = format!("{api_base}{path}");
+                let found: InstallationJson =
+                    app_call(transport, doing, Method::Get, &path, &url, &jwt, None)?;
+                *installation = Some(found.id);
+                found.id
+            }
+        };
+        let doing = "minting an installation token";
+        let path = format!("/app/installations/{id}/access_tokens");
+        let url = format!("{api_base}{path}");
+        let body = json!({ "repositories": [repo.as_str()] });
+        let minted: AccessTokenJson = app_call(
+            transport,
+            doing,
+            Method::Post,
+            &path,
+            &url,
+            &jwt,
+            Some(&body),
+        )?;
+        let bearer = format!("Bearer {}", minted.token);
+        *token = Some(InstallationToken {
+            bearer: bearer.clone(),
+            minted: now,
+        });
+        Ok(bearer)
     }
 
     /// `GET {repo}{path}`; the decoded body.
@@ -300,7 +449,7 @@ impl RestClient {
         path: &str,
         body: Option<&Value>,
     ) -> Result<HttpResponse, ApiError> {
-        let url = format!("{}{path}", self.repo_url);
+        let url = format!("{}{path}", self.repo_url());
         self.call_url(method, path, &url, body)
     }
 
@@ -311,21 +460,21 @@ impl RestClient {
         url: &str,
         body: Option<&Value>,
     ) -> Result<HttpResponse, ApiError> {
-        let request = HttpRequest { method, url, body };
-        (self.transport)(&request).map_err(|e| {
-            let message = format!("{method} {path}: {}", e.message);
-            if e.transient {
-                ApiError::Transient(message.into())
-            } else {
-                ApiError::Permanent(message.into())
-            }
-        })
+        let authorization = self.authorization()?;
+        let response = exchange(&mut self.transport, method, path, url, &authorization, body)?;
+        if response.status == 401 && matches!(self.credential, Credential::App { .. }) {
+            return Err(permanent(format!(
+                "{method} {path}: HTTP 401: {} ({INSTALLATION_TOKEN_REJECTED})",
+                github_message(&response)
+            )));
+        }
+        Ok(response)
     }
 
     /// Every page of a list endpoint, following `Link: rel="next"`.
     fn get_pages(&mut self, path: &str) -> Result<Vec<Value>, ApiError> {
         let separator = if path.contains('?') { '&' } else { '?' };
-        let mut url = format!("{}{path}{separator}{PER_PAGE}", self.repo_url);
+        let mut url = format!("{}{path}{separator}{PER_PAGE}", self.repo_url());
         let mut pages = Vec::new();
         loop {
             let response = self.call_url(Method::Get, path, &url, None)?;
@@ -608,6 +757,60 @@ fn check_run_outcome(what: &str, run: &CheckRunJson) -> Result<CheckOutcome, Api
     }
 }
 
+/// One request through `transport`; any status is returned.
+fn exchange(
+    transport: &mut Transport,
+    method: Method,
+    path: &str,
+    url: &str,
+    authorization: &str,
+    body: Option<&Value>,
+) -> Result<HttpResponse, ApiError> {
+    let request = HttpRequest {
+        method,
+        url,
+        authorization,
+        body,
+    };
+    transport(&request).map_err(|e| {
+        let message = format!("{method} {path}: {}", e.message);
+        if e.transient {
+            ApiError::Transient(message.into())
+        } else {
+            ApiError::Permanent(message.into())
+        }
+    })
+}
+
+/// One request authorised by the app's JWT, decoded from a 2xx response.
+/// Every error says what was being `doing`.
+fn app_call<T: for<'de> Deserialize<'de>>(
+    transport: &mut Transport,
+    doing: &str,
+    method: Method,
+    path: &str,
+    url: &str,
+    jwt: &str,
+    body: Option<&Value>,
+) -> Result<T, ApiError> {
+    let in_context = |error: ApiError| match error {
+        ApiError::Transient(e) => ApiError::Transient(format!("{doing}: {e}").into()),
+        ApiError::Permanent(e) => ApiError::Permanent(format!("{doing}: {e}").into()),
+    };
+    let response = exchange(transport, method, path, url, jwt, body).map_err(in_context)?;
+    if response.status == 401 {
+        return Err(permanent(format!(
+            "{doing}: {method} {path}: HTTP 401: {} ({JWT_REJECTED})",
+            github_message(&response)
+        )));
+    }
+    if !(200..300).contains(&response.status) {
+        return Err(in_context(failure(method, path, &response)));
+    }
+    let what = format!("{doing}: {method} {path}");
+    decode(&what, response.json(&what)?)
+}
+
 /// The error a response with an unexpected status maps to.
 fn failure(method: Method, path: &str, response: &HttpResponse) -> ApiError {
     let status = response.status;
@@ -696,11 +899,8 @@ fn parse_sha(what: &str, text: &str) -> Result<Sha, ApiError> {
 }
 
 /// Sends one request through ureq; the status is never an error here.
-fn send(
-    agent: &ureq::Agent,
-    authorization: &str,
-    request: &HttpRequest<'_>,
-) -> Result<HttpResponse, TransportError> {
+fn send(agent: &ureq::Agent, request: &HttpRequest<'_>) -> Result<HttpResponse, TransportError> {
+    let authorization = request.authorization;
     fn headers<B>(
         builder: ureq::RequestBuilder<B>,
         authorization: &str,
@@ -754,6 +954,16 @@ fn transport_error(error: ureq::Error) -> TransportError {
         transient,
         message: error.to_string(),
     }
+}
+
+#[derive(Deserialize)]
+struct InstallationJson {
+    id: u64,
+}
+
+#[derive(Deserialize)]
+struct AccessTokenJson {
+    token: String,
 }
 
 #[derive(Deserialize)]
