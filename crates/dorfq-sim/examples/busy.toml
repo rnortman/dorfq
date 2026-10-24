@@ -2,57 +2,67 @@
 # runners, then twelve hours to drain, four replications. Run it with:
 #   make sim ARGS="run --config $PWD/crates/dorfq-sim/examples/busy.toml"
 #
-# Each pooling policy's max_batch was chosen by measurement in this world
-# without stacks: bisect lands the most, soonest, at max_batch = 1 — its
-# pooling does not pay here, so its column is the naive queue on all six
-# runners — and bayes is best at 4 to 6.
+# Each pooling policy's max_batch was chosen by measurement in this world,
+# PR CI and rebases included. Bisect does not keep up at any cap: its
+# runners are full and a quarter of the arrivals are still unfinished at the
+# end; caps 1 and 2 are a wash within the spread, larger ones land fewer, so
+# its pooling does not pay here and its column is the naive queue on all six
+# runners. Bayes is best at 4 to 6 and the only policy that comes close to
+# keeping up.
 
 seed = 1                   # master seed; every replication's streams derive from it
-replications = 4
+replications = 4           # independent runs per policy, each from its own seed; the table shows their mean [min–max]
 
 [world]
 hours = 72                 # arrivals stop after this many hours
 drain_hours = 12           # then the run drains, and stops at hours + drain_hours at the latest
-arrivals_per_hour = 5.0    # Poisson
-runners = 6                # concurrent CI runs; further runs wait for a runner
-ci_minutes = { min = 45, max = 75 }   # uniform run duration
+arrivals_per_hour = 5.0    # mean rate of new pull requests; arrivals are a Poisson process
+runners = 6                # concurrent CI runs, batch and PR CI alike; further runs wait for a runner, first come first served
+ci_minutes = { min = 45, max = 75 }   # uniform duration of a batch's CI run
+pr_ci_minutes = { min = 15, max = 25 }   # uniform duration of a pull request's own CI run, a lighter check than the batch run; a pull request is batchable only once it has passed on its current head, and setting it equal to the batch run needs more runners
+rebase_minutes = { min = 15, max = 120 }   # uniform delay from a rebase becoming necessary (a conflict with trunk, or under github admission a landed base) to the author's push of it
 p_bad = 0.05               # a pull request breaks on its own against trunk
 p_interact = 0.002         # a pair of pull requests whose queue time overlapped break only together
 p_flake = 0.02             # a run fails for no reason in the tree
 p_conflict = 0.02          # a pull request arrives with a textual conflict against trunk
-repush_per_hour = 0.02     # per queued pull request: head changes, intent kept
-withdraw_per_hour = 0.005  # per queued pull request: intent cleared
-p_stacked = 0.25           # an arrival is cut from a recent arrival's branch; it stacks on it only while that one is queued
+repush_per_hour = 0.02     # per open pull request, the rate at which its author pushes a new head; its intent to land is kept
+withdraw_per_hour = 0.005  # per open pull request, the rate at which its author takes it out of the queue for good
+p_stacked = 0.25           # an arrival is cut from a recent arrival's branch; it stacks on it only while that one is still open
 p_atomic = 0.2             # a stacked arrival lands only with its ancestors
 
 # What pooling costs with no failure response at all.
 [[policy]]
-name = "all-at-once"
-kind = "all-at-once"
+name = "all-at-once"         # the column's name in the table and on the page
+admission = "label"          # dorfq's: in the queue from arrival, held until its own CI passes
+kind = "all-at-once"         # the scheduler: one batch of everything ready, and on failure eject every member
 
 # GitHub's merge queue, approximately: each pull request built on top of
 # the ones ahead of it, up to five builds in flight; a failed one is removed
-# once everything ahead of it passed, and the rest rebuilt. Unlike GitHub's
-# queue, which refuses stacked pull requests, this column lands them.
+# once everything ahead of it passed, and the rest rebuilt. Admission is
+# GitHub's: a stacked pull request waits for its base to land, is rebased
+# and re-checked, then enters.
 [[policy]]
-name = "github-like"
-kind = "bisect"
-lanes = 5
-max_batch = 1
+name = "github-like"         # the column's name in the table and on the page
+admission = "github"         # the queue sees a pull request only on trunk, once its own CI passed
+kind = "bisect"              # the scheduler: pipelined batches, a failed one split in halves until the culprit is alone
+lanes = 5                    # most batches in flight at once
+max_batch = 1                # most pull requests one batch may hold
 
 # The pipelined bisect at its best measured cap here: no pooling.
 [[policy]]
-name = "bisect"
-kind = "bisect"
-lanes = 6
-max_batch = 1
+name = "bisect"              # the column's name in the table and on the page
+admission = "label"          # dorfq's: in the queue from arrival, held until its own CI passes
+kind = "bisect"              # the scheduler: pipelined batches, a failed one split in halves until the culprit is alone
+lanes = 6                    # most batches in flight at once
+max_batch = 1                # most pull requests one batch may hold
 
 # The Bayesian scheduler, its priors set equal to the world's rates.
 [[policy]]
-name = "bayes"
-kind = "bayes"
-lanes = 6
-max_batch = 4
+name = "bayes"               # the column's name in the table and on the page
+admission = "label"          # dorfq's: in the queue from arrival, held until its own CI passes
+kind = "bayes"               # the scheduler: batches chosen and culprits inferred from a posterior over who is bad
+lanes = 6                    # most batches in flight at once
+max_batch = 4                # most pull requests one batch may hold
 p_bad = 0.05               # prior: a pull request fails on its own against trunk
 p_interact = 0.002         # prior: a pair fails only together; also the per-landing decay
 p_flake = 0.02             # a run fails for no reason

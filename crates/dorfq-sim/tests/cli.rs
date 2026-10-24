@@ -55,7 +55,7 @@ fn json_writes_the_document_and_still_prints_the_table() {
     assert!(!table.contains("policy bisect"), "{table}");
     let document = fs::read_to_string(&path).expect("the document is written");
     assert!(
-        document.starts_with(r#"{"schema":1,"name":"sim","config":"#),
+        document.starts_with(r#"{"schema":2,"name":"sim","config":"#),
         "{document:.80}"
     );
     for name in ["all-at-once", "github-like", "bisect", "bayes"] {
@@ -63,6 +63,10 @@ fn json_writes_the_document_and_still_prints_the_table() {
         assert!(document.contains(&column), "no policy {name}");
     }
     assert!(document.contains(r#""trace":[{"kind":"step","t":0,"#));
+    assert!(
+        document.contains(r##""config_text":"# A week of arrivals"##),
+        "no config_text"
+    );
 }
 
 #[test]

@@ -12,7 +12,7 @@ use crate::trace::TraceEvent;
 
 /// The JSON document's schema number. It changes when a field changes
 /// meaning, not when one is added.
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 /// One policy's replications, in replication order.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,7 +32,7 @@ pub struct Report {
 /// A metric row: its name, the decimals it prints with, and its value.
 type Row = (&'static str, usize, fn(&Metrics) -> Option<f64>);
 
-const ROWS: [Row; 17] = [
+const ROWS: [Row; 20] = [
     ("arrived", 1, |m| Some(m.arrived as f64)),
     ("landed", 1, |m| Some(m.landed as f64)),
     ("ejected_bad", 1, |m| Some(m.ejected_bad as f64)),
@@ -40,9 +40,12 @@ const ROWS: [Row; 17] = [
     ("withdrawn", 1, |m| Some(m.withdrawn as f64)),
     ("blocked", 1, |m| Some(m.blocked as f64)),
     ("unfinished", 1, |m| Some(m.unfinished as f64)),
+    ("rebases", 1, |m| Some(m.rebases as f64)),
     ("runs", 1, |m| Some(m.runs as f64)),
     ("mean_batch_size", 2, |m| m.mean_batch_size),
+    ("pr_ci_runs", 1, |m| Some(m.pr_ci_runs as f64)),
     ("runner_hours", 1, |m| Some(m.runner_hours)),
+    ("pr_ci_hours", 1, |m| Some(m.pr_ci_hours)),
     ("runner_hours_per_landed", 2, |m| m.runner_hours_per_landed),
     ("wasted_fraction", 3, |m| m.wasted_fraction),
     ("land_p50_hours", 2, |m| m.land_p50_hours),
@@ -58,6 +61,7 @@ struct Document<'a> {
     schema: u32,
     name: &'a str,
     config: &'a SimConfig,
+    config_text: &'a str,
     policies: Vec<PolicyDocument<'a>>,
 }
 
@@ -85,9 +89,10 @@ impl Report {
     }
 
     /// The report as one JSON document: the schema number, `name`, the
-    /// `config` it was run from, and per policy every replication's metrics
-    /// or error and the trace. A metric no replication has is `null`.
-    pub fn to_json(&self, name: &str, config: &SimConfig) -> String {
+    /// `config` it was run from and `config_text`, the file's text as read,
+    /// and per policy every replication's metrics or error and the trace. A
+    /// metric no replication has is `null`.
+    pub fn to_json(&self, name: &str, config: &SimConfig, config_text: &str) -> String {
         let policies = self
             .policies
             .iter()
@@ -108,6 +113,7 @@ impl Report {
             schema: SCHEMA,
             name,
             config,
+            config_text,
             policies,
         };
         serde_json::to_string(&document).expect("the report serialises")
@@ -199,9 +205,12 @@ mod tests {
             withdrawn: 0,
             blocked: 1,
             unfinished: 10 - landed,
+            rebases: 0,
             runs: 2,
             mean_batch_size: Some(5.0),
+            pr_ci_runs: 3,
             runner_hours: 6.0,
+            pr_ci_hours: 1.5,
             runner_hours_per_landed: per_landed,
             wasted_fraction: Some(0.0),
             land_p50_hours: None,
@@ -278,6 +287,46 @@ mod tests {
     }
 
     #[test]
+    fn the_rows_are_in_order() {
+        let table = report().to_string();
+        let names: Vec<&str> = table
+            .lines()
+            .map(|l| l.split(' ').next().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "metric",
+                "arrived",
+                "landed",
+                "ejected_bad",
+                "ejected_good",
+                "withdrawn",
+                "blocked",
+                "unfinished",
+                "rebases",
+                "runs",
+                "mean_batch_size",
+                "pr_ci_runs",
+                "runner_hours",
+                "pr_ci_hours",
+                "runner_hours_per_landed",
+                "wasted_fraction",
+                "land_p50_hours",
+                "land_p95_hours",
+                "reject_p50_hours",
+                "reject_p95_hours",
+                "utilisation",
+                "failure",
+            ]
+        );
+        assert_eq!(
+            row(&table, "pr_ci_hours"),
+            ["pr_ci_hours", "1.5 [1.5–1.5]", "1.5 [1.5–1.5]"]
+        );
+    }
+
+    #[test]
     fn a_metric_no_replication_has_prints_a_dash() {
         let table = report().to_string();
         assert_eq!(row(&table, "land_p50_hours"), ["land_p50_hours", "-", "-"]);
@@ -303,13 +352,15 @@ mod tests {
 
     #[test]
     fn the_document_carries_schema_name_config_cells_and_traces() {
-        let config = SimConfig::parse(include_str!("../examples/sim.toml")).unwrap();
+        let text = include_str!("../examples/sim.toml");
+        let config = SimConfig::parse(text).unwrap();
         let mut report = report();
         report.policies[0].trace = vec![TraceEvent::Withdraw { t: 3, pr: 1 }];
         let document: serde_json::Value =
-            serde_json::from_str(&report.to_json("sim", &config)).unwrap();
-        assert_eq!(document["schema"], SCHEMA);
+            serde_json::from_str(&report.to_json("sim", &config, text)).unwrap();
+        assert_eq!(document["schema"], 2);
         assert_eq!(document["name"], "sim");
+        assert_eq!(document["config_text"], text);
         assert_eq!(document["config"]["seed"], 1);
         assert_eq!(document["config"]["policy"][0]["kind"], "all-at-once");
         let floor = &document["policies"][0];

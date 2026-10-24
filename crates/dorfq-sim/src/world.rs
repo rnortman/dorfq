@@ -6,28 +6,52 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use dorfq_core::ledger::Ledger;
 use dorfq_core::{
     BatchId, BatchMember, BatchStart, BatchState, BatchStatus, CiStatus, ConflictWith, Departed,
-    EjectReason, Failure, Forge, ForgeError, LandRefusal, Observation, PrBase, PrNumber,
+    EjectReason, Failure, Forge, ForgeError, Hold, LandRefusal, Observation, PrBase, PrNumber,
     PrSnapshot, PrStatus, Sha, StackPolicy, Timestamp, Withdrawal,
 };
 
-use crate::config::WorldConfig;
-use crate::metrics::{Exit, Metrics, PrRecord, RunRecord};
+use crate::config::{Admission, WorldConfig};
+use crate::metrics::{Exit, Metrics, PrCiRecord, PrRecord, RunRecord, RunningSeconds};
 use crate::rng::{SplitMix64, Streams, mix, unit};
-use crate::trace::{TraceEvent, Truth};
+use crate::trace::{Rebase, TraceEvent, Truth};
 
 const HOUR: f64 = crate::HOUR as f64;
+
+/// Work for a runner: a batch's run, or a pull request's own CI on its
+/// current head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Job {
+    Batch(BatchId),
+    PrCi(PrNumber),
+}
 
 /// A scheduled happening.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Event {
     Arrival,
-    CiDone(BatchId),
+    CiDone(Job),
     Repush(PrNumber),
     Withdraw(PrNumber),
+    /// The author pushes the rebase.
+    Rebase(PrNumber),
 }
 
 /// An event's place in the queue: its time, then scheduling order.
 type EventKey = (u64, u64);
+
+/// Why a present pull request is not in the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Out {
+    /// Its author is rebasing it, for `why`; `push` is the scheduled push.
+    Rebasing { why: Rebase, push: EventKey },
+    /// `label`: out with its base, which is rebasing; restacked at the push.
+    WithBase { on: PrNumber },
+    /// `github`: its own CI runs on its current head; it enters when that
+    /// passes.
+    Checking,
+    /// `github`: stacked on a pull request that has not landed.
+    Stacked,
+}
 
 struct SimPr {
     record: PrRecord,
@@ -38,12 +62,21 @@ struct SimPr {
     /// The earlier arrival whose branch it was cut from, whether or not it
     /// stacked on it.
     cut_from: Option<PrNumber>,
-    /// Whether it stacked on `cut_from`: that one was queued at arrival.
+    /// Whether it stacked on `cut_from`: that one was in the world at
+    /// arrival.
     stacked: bool,
     /// Lands only with its ancestors; only ever set on a stacked arrival.
     atomic: bool,
     repush: Option<EventKey>,
     withdraw: Option<EventKey>,
+    /// Its own clock, seeded from `key`: every PR CI duration and rebase
+    /// delay it draws.
+    own: SplitMix64,
+    /// Its own CI on its current head, from the request to the run's end.
+    ci: Option<Run>,
+    /// Why the queue does not see it while it is in the world; `None` when
+    /// it does.
+    out: Option<Out>,
 }
 
 impl SimPr {
@@ -52,8 +85,14 @@ impl SimPr {
         self.cut_from.filter(|_| self.stacked)
     }
 
-    fn queued(&self) -> bool {
+    /// In the world: arrived and not yet left for good.
+    fn present(&self) -> bool {
         self.record.left.is_none()
+    }
+
+    /// Present and seen by the queue.
+    fn enqueued(&self) -> bool {
+        self.present() && self.out.is_none()
     }
 
     fn landed(&self) -> bool {
@@ -61,7 +100,8 @@ impl SimPr {
     }
 }
 
-/// A batch's claim on a runner.
+/// A run's claim on a runner. A pull request's own run never reaches
+/// `Done`: it is dropped when it ends.
 enum Run {
     Waiting { duration: u64 },
     Running { run: usize, done: EventKey },
@@ -84,6 +124,7 @@ struct Commit {
 /// The simulated forge and the truth behind it.
 pub struct World {
     config: WorldConfig,
+    admission: Admission,
     streams: Streams,
     now: u64,
     prs: BTreeMap<PrNumber, SimPr>,
@@ -95,8 +136,9 @@ pub struct World {
     events: BTreeMap<EventKey, Event>,
     next_seq: u64,
     running: usize,
-    waiting: VecDeque<BatchId>,
+    waiting: VecDeque<Job>,
     runs: Vec<RunRecord>,
+    pr_ci_runs: Vec<PrCiRecord>,
     /// Rules 5, 6 and 8, against the latest observation.
     ledger: Ledger,
     /// Runner-seconds the runners have been busy.
@@ -116,8 +158,9 @@ fn delay(rng: &mut SplitMix64, per_hour: f64) -> u64 {
 }
 
 impl World {
-    /// A world at time 0 whose first arrival is drawn from `streams`.
-    pub fn new(config: WorldConfig, streams: Streams) -> World {
+    /// A world at time 0 under `admission` whose first arrival is drawn
+    /// from `streams`.
+    pub fn new(config: WorldConfig, admission: Admission, streams: Streams) -> World {
         let trunk = commit(1);
         let root = Commit {
             parent: None,
@@ -126,6 +169,7 @@ impl World {
         };
         let mut world = World {
             config,
+            admission,
             streams,
             now: 0,
             prs: BTreeMap::new(),
@@ -139,6 +183,7 @@ impl World {
             running: 0,
             waiting: VecDeque::new(),
             runs: Vec::new(),
+            pr_ci_runs: Vec::new(),
             ledger: Ledger::new(),
             busy: 0,
             trace: None,
@@ -200,11 +245,18 @@ impl World {
         &self.runs
     }
 
+    /// Every pull request's own CI run that reached a runner, in start
+    /// order.
+    pub fn pr_ci_runs(&self) -> &[PrCiRecord] {
+        &self.pr_ci_runs
+    }
+
     /// The replication's summary as of now.
     pub fn metrics(&self) -> Metrics {
         Metrics::summarise(
             &self.pr_records(),
             &self.runs,
+            &self.pr_ci_runs,
             self.running_elapsed(),
             self.config.runners,
             self.now,
@@ -212,14 +264,27 @@ impl World {
     }
 
     /// Runner-seconds used so far by the runs still running.
-    fn running_elapsed(&self) -> u64 {
-        self.batches
+    fn running_elapsed(&self) -> RunningSeconds {
+        let batches = self.batches.values().filter_map(|b| match b.run {
+            Run::Running { run, .. } => Some(self.now - self.runs[run].started_at),
+            _ => None,
+        });
+        let prs = self.prs.values().filter_map(|p| match p.ci {
+            Some(Run::Running { run, .. }) => Some(self.now - self.pr_ci_runs[run].started_at),
+            _ => None,
+        });
+        RunningSeconds {
+            batches: batches.sum(),
+            pr_ci: prs.sum(),
+        }
+    }
+
+    /// Present pull requests the queue does not see.
+    pub fn out(&self) -> usize {
+        self.prs
             .values()
-            .filter_map(|b| match b.run {
-                Run::Running { run, .. } => Some(self.now - self.runs[run].started_at),
-                _ => None,
-            })
-            .sum()
+            .filter(|p| p.present() && !p.enqueued())
+            .count()
     }
 
     /// Every pull request's arrival time, hidden truth (`bad`, conflicts
@@ -259,10 +324,11 @@ impl World {
         false
     }
 
-    /// The queued pull requests stacked on `pr`, directly or not, by number.
+    /// The present pull requests stacked on `pr`, directly or not, by
+    /// number.
     fn descendants(&self, pr: PrNumber) -> Vec<PrNumber> {
-        let queued = self.prs.iter().filter(|(_, p)| p.queued());
-        queued
+        let present = self.prs.iter().filter(|(_, p)| p.present());
+        present
             .filter(|&(&n, _)| self.descends(n, pr))
             .map(|(&n, _)| n)
             .collect()
@@ -270,10 +336,12 @@ impl World {
 
     /// Checks the world's invariants: nothing bad landed, no two landed pull
     /// requests interact, a landed pull request's base landed at or before
-    /// it, trunk's tree is exactly the landed set, the runner
-    /// time runs consumed is the time runners were busy, and no more runs
-    /// hold runners than there are.
+    /// it, trunk's tree is exactly the landed set, the runner time batch
+    /// and PR CI runs consumed is the time runners were busy, no more runs
+    /// of either kind hold runners than there are, and every present pull
+    /// request's place agrees with its admission (see `check_places`).
     pub fn check_invariants(&self) -> Result<(), String> {
+        self.check_places()?;
         let landed: Vec<PrNumber> = self
             .prs
             .iter()
@@ -302,24 +370,57 @@ impl World {
         if trunk_tree != landed {
             return Err("trunk's tree is not the landed set".to_owned());
         }
-        let busy = self
-            .batches
-            .values()
-            .filter(|b| matches!(b.run, Run::Running { .. }))
-            .count();
-        if busy != self.running || self.running > self.config.runners {
+        let batches = self.batches.values();
+        let busy = batches.filter(|b| matches!(b.run, Run::Running { .. }));
+        let prs = self.prs.values();
+        let pr_ci = prs.filter(|p| matches!(p.ci, Some(Run::Running { .. })));
+        let (busy, pr_ci) = (busy.count(), pr_ci.count());
+        if busy + pr_ci != self.running || self.running > self.config.runners {
             return Err(format!(
-                "{busy} batches running, {} runners held of {}",
+                "{busy} batches and {pr_ci} PR CI runs running, {} runners held of {}",
                 self.running, self.config.runners
             ));
         }
-        let consumed: u64 = self.runs.iter().map(|r| r.consumed).sum();
-        let elapsed = self.running_elapsed();
+        let consumed: u64 = self.runs.iter().map(|r| r.consumed).sum::<u64>()
+            + self.pr_ci_runs.iter().map(|r| r.consumed).sum::<u64>();
+        let running = self.running_elapsed();
+        let elapsed = running.batches + running.pr_ci;
         if consumed + elapsed != self.busy {
             return Err(format!(
                 "runs consumed {consumed}s and running runs {elapsed}s, runners were busy {}s",
                 self.busy
             ));
+        }
+        Ok(())
+    }
+
+    /// Checks where the present pull requests are: an enqueued one's base is
+    /// enqueued or landed; one out with its base has a base that is out;
+    /// under `github` an enqueued one has no run in flight and does not
+    /// conflict, and a stacked one has no run in flight.
+    fn check_places(&self) -> Result<(), String> {
+        let github = self.admission == Admission::Github;
+        for (n, p) in self.prs.iter().filter(|(_, p)| p.present()) {
+            let n = n.0;
+            match p.out {
+                None => {
+                    if let Some(b) = p.base()
+                        && !(self.prs[&b].enqueued() || self.prs[&b].landed())
+                    {
+                        return Err(format!("pr {n} is enqueued but its base {} is not", b.0));
+                    }
+                    if github && (p.ci.is_some() || p.conflicts_with_trunk) {
+                        return Err(format!("pr {n} is enqueued unchecked"));
+                    }
+                }
+                Some(Out::WithBase { on }) if self.prs[&on].enqueued() => {
+                    return Err(format!("pr {n} is out with its base {}, which is in", on.0));
+                }
+                Some(Out::Stacked) if p.ci.is_some() => {
+                    return Err(format!("pr {n} waits for its base with a run in flight"));
+                }
+                Some(_) => {}
+            }
         }
         Ok(())
     }
@@ -407,12 +508,13 @@ impl World {
                 let back = 1 + self.streams.stacks.exponential(std::f64::consts::LN_2) as u64;
                 let atomic = self.streams.stacks.bernoulli(self.config.p_atomic);
                 let cut_from = (cut && back < number.0).then(|| PrNumber(number.0 - back));
-                let stacked = cut_from.is_some_and(|b| self.prs[&b].queued());
+                let stacked = cut_from.is_some_and(|b| self.prs[&b].present());
                 let head = self.mint();
                 let record = PrRecord {
                     number,
                     arrived_at: self.now,
                     left: None,
+                    rebases: 0,
                 };
                 let pr = SimPr {
                     record,
@@ -427,6 +529,9 @@ impl World {
                     atomic: atomic && stacked,
                     repush: None,
                     withdraw: None,
+                    own: SplitMix64::new(key),
+                    ci: None,
+                    out: None,
                 };
                 let (base, atomic) = (pr.base(), pr.atomic);
                 let truth = Truth {
@@ -441,20 +546,55 @@ impl World {
                     atomic,
                     truth,
                 });
+                self.request_pr_ci(number);
+                match (self.admission, base) {
+                    (Admission::Github, _) => self.set_out(number, Some(Out::Checking)),
+                    (Admission::Label, Some(b)) if !self.prs[&b].enqueued() => {
+                        self.out_with_base(number);
+                    }
+                    (Admission::Label, _) => self.admit(number),
+                }
+                self.assign_runners();
                 self.schedule_repush(number);
                 self.schedule_withdraw(number);
                 self.schedule_arrival();
             }
-            Event::CiDone(batch) => self.complete(batch),
+            Event::CiDone(Job::Batch(batch)) => self.complete(batch),
+            Event::CiDone(Job::PrCi(pr)) => self.complete_pr_ci(pr),
             Event::Repush(pr) => {
-                // A restack: every branch stacked above the changed one is
-                // pushed too.
-                for p in std::iter::once(pr).chain(self.descendants(pr)) {
-                    let head = self.mint();
-                    self.prs.get_mut(&p).expect("arrived").head = head;
-                    self.note(|t| TraceEvent::Repush { t, pr: p.0 });
+                // Its author is mid-rebase, its own or its base's: no head.
+                let rebasing = matches!(
+                    self.prs[&pr].out,
+                    Some(Out::Rebasing { .. } | Out::WithBase { .. })
+                );
+                if !rebasing {
+                    let pushed = self.push(pr);
+                    if self.admission == Admission::Github {
+                        for p in pushed {
+                            let was_in = self.prs[&p].enqueued();
+                            self.set_out(p, Some(Out::Checking));
+                            if was_in {
+                                self.note(|t| TraceEvent::Recheck { t, pr: p.0 });
+                            }
+                        }
+                    }
+                    self.assign_runners();
                 }
                 self.schedule_repush(pr);
+            }
+            Event::Rebase(pr) => {
+                let p = self.prs.get_mut(&pr).expect("arrived");
+                debug_assert!(matches!(p.out, Some(Out::Rebasing { .. })));
+                p.conflicts_with_trunk = false;
+                p.record.rebases += 1;
+                let pushed = self.push(pr);
+                for p in pushed {
+                    match self.admission {
+                        Admission::Label => self.admit(p),
+                        Admission::Github => self.set_out(p, Some(Out::Checking)),
+                    }
+                }
+                self.assign_runners();
             }
             Event::Withdraw(pr) => {
                 self.note(|t| TraceEvent::Withdraw { t, pr: pr.0 });
@@ -463,12 +603,84 @@ impl World {
         }
     }
 
-    /// Records `pr` leaving now and cancels its churn clocks. Unless it
-    /// landed, every queued pull request stacked on it leaves `Blocked` on
+    /// Gives `pr` and every present pull request stacked on it a new head,
+    /// each with its own CI requested, and returns them, `pr` first. The
+    /// caller assigns runners.
+    fn push(&mut self, pr: PrNumber) -> Vec<PrNumber> {
+        let pushed: Vec<PrNumber> = std::iter::once(pr).chain(self.descendants(pr)).collect();
+        for &p in &pushed {
+            let head = self.mint();
+            self.prs.get_mut(&p).expect("arrived").head = head;
+            self.note(|t| TraceEvent::Repush { t, pr: p.0 });
+            self.request_pr_ci(p);
+        }
+        pushed
+    }
+
+    fn set_out(&mut self, pr: PrNumber, out: Option<Out>) {
+        self.prs.get_mut(&pr).expect("arrived").out = out;
+    }
+
+    /// The queue sees `pr` from now.
+    fn admit(&mut self, pr: PrNumber) {
+        self.set_out(pr, None);
+        let base = self.prs[&pr].base().filter(|b| self.prs[b].enqueued());
+        self.note(|t| TraceEvent::Admit {
+            t,
+            pr: pr.0,
+            base: base.map(|b| b.0),
+        });
+    }
+
+    /// `label`: `pr` goes out with its base, which is out, until the push
+    /// of the rebase below it.
+    fn out_with_base(&mut self, pr: PrNumber) {
+        let on = self.prs[&pr].base().expect("stacked");
+        self.set_out(pr, Some(Out::WithBase { on }));
+        self.note(|t| TraceEvent::Blocked {
+            t,
+            pr: pr.0,
+            on: on.0,
+            r#final: false,
+        });
+    }
+
+    /// `pr`'s author starts rebasing it for `why`; the push is drawn from
+    /// its own clock.
+    fn begin_rebase(&mut self, pr: PrNumber, why: Rebase) {
+        let (min, max) = (
+            self.config.rebase_minutes.min,
+            self.config.rebase_minutes.max,
+        );
+        let delay = self
+            .prs
+            .get_mut(&pr)
+            .expect("arrived")
+            .own
+            .uniform(min, max)
+            * 60;
+        let push = self.schedule(self.now + delay, Event::Rebase(pr));
+        self.set_out(pr, Some(Out::Rebasing { why, push }));
+        self.note(|t| TraceEvent::Rebase { t, pr: pr.0, why });
+    }
+
+    /// An ejection in the same plan supersedes a block of `pr` earlier in
+    /// this instant, final or not: the block's `blocked` event is taken
+    /// back out of the trace, so every pull request departs once.
+    fn untrace_blocked(&mut self, pr: PrNumber) {
+        let now = self.now;
+        if let Some(trace) = &mut self.trace {
+            trace.retain(
+                |e| !matches!(e, TraceEvent::Blocked { t, pr: p, .. } if *t == now && *p == pr.0),
+            );
+        }
+    }
+
+    /// Records `pr` leaving now for good and cancels its churn clocks and
+    /// any pending rebase push; its own CI run is not cancelled. Unless it
+    /// landed, every present pull request stacked on it leaves `Blocked` on
     /// it, recursively. A pull request blocked earlier in this instant may
-    /// leave again: an ejection in the same plan supersedes the block, and
-    /// the block's `blocked` event is taken back out of the trace, so every
-    /// pull request departs once.
+    /// leave again, superseding the block (see [`Self::untrace_blocked`]).
     fn leave(&mut self, pr: PrNumber, exit: Exit) {
         let now = self.now;
         let cascades = exit != Exit::Landed;
@@ -480,12 +692,14 @@ impl World {
             pr.0
         );
         p.record.left = Some((now, exit));
-        if superseded && let Some(trace) = &mut self.trace {
-            trace.retain(
-                |e| !matches!(e, TraceEvent::Blocked { t, pr: p, .. } if *t == now && *p == pr.0),
-            );
+        let push = match p.out.take() {
+            Some(Out::Rebasing { push, .. }) => Some(push),
+            _ => None,
+        };
+        let clocks = [p.repush.take(), p.withdraw.take(), push];
+        if superseded {
+            self.untrace_blocked(pr);
         }
-        let clocks = [p.repush.take(), p.withdraw.take()];
         for key in clocks.into_iter().flatten() {
             self.events.remove(&key);
         }
@@ -493,7 +707,7 @@ impl World {
             let children: Vec<PrNumber> = self
                 .prs
                 .iter()
-                .filter(|(_, c)| c.queued() && c.base() == Some(pr))
+                .filter(|(_, c)| c.present() && c.base() == Some(pr))
                 .map(|(&n, _)| n)
                 .collect();
             for child in children {
@@ -501,6 +715,7 @@ impl World {
                     t,
                     pr: child.0,
                     on: pr.0,
+                    r#final: true,
                 });
                 self.leave(child, Exit::Blocked { on: pr });
             }
@@ -529,7 +744,7 @@ impl World {
 
     fn start_run(&mut self, batch: BatchId, duration: u64) {
         let members = self.batches[&batch].status.members.len();
-        let done = self.schedule(self.now + duration, Event::CiDone(batch));
+        let done = self.schedule(self.now + duration, Event::CiDone(Job::Batch(batch)));
         self.runs.push(RunRecord {
             batch,
             members,
@@ -546,16 +761,115 @@ impl World {
         debug_assert!(self.running <= self.config.runners);
     }
 
+    /// Cancels `pr`'s own CI run, waiting or running, and requests one for
+    /// its current head, drawing the duration from its own clock. The
+    /// caller assigns runners.
+    fn request_pr_ci(&mut self, pr: PrNumber) {
+        self.cancel_pr_ci(pr);
+        let (min, max) = (self.config.pr_ci_minutes.min, self.config.pr_ci_minutes.max);
+        let p = self.prs.get_mut(&pr).expect("arrived");
+        let duration = p.own.uniform(min, max) * 60;
+        p.ci = Some(Run::Waiting { duration });
+        self.waiting.push_back(Job::PrCi(pr));
+        self.note(|t| TraceEvent::PrCi { t, pr: pr.0 });
+    }
+
+    /// Drops `pr`'s own CI run if it has one: off the runner queue, or cut
+    /// short with its elapsed time charged. The caller assigns runners.
+    fn cancel_pr_ci(&mut self, pr: PrNumber) {
+        let Some(run) = self.prs.get_mut(&pr).expect("arrived").ci.take() else {
+            return;
+        };
+        match run {
+            Run::Waiting { .. } => self.waiting.retain(|&j| j != Job::PrCi(pr)),
+            Run::Running { run, done } => {
+                self.events.remove(&done);
+                let record = &mut self.pr_ci_runs[run];
+                record.consumed = self.now - record.started_at;
+                record.cancelled = true;
+                self.running -= 1;
+            }
+            Run::Done { .. } => unreachable!("a pull request's run is dropped when it ends"),
+        }
+        self.note(|t| TraceEvent::PrCiEnd {
+            t,
+            pr: pr.0,
+            cancelled: true,
+        });
+    }
+
+    fn start_pr_ci(&mut self, pr: PrNumber, duration: u64) {
+        let done = self.schedule(self.now + duration, Event::CiDone(Job::PrCi(pr)));
+        let p = self.prs.get_mut(&pr).expect("arrived");
+        self.pr_ci_runs.push(PrCiRecord {
+            pr,
+            head: p.head.clone(),
+            started_at: self.now,
+            consumed: 0,
+            cancelled: false,
+        });
+        let run = self.pr_ci_runs.len() - 1;
+        p.ci = Some(Run::Running { run, done });
+        self.note(|t| TraceEvent::PrCiBegin { t, pr: pr.0 });
+        self.running += 1;
+        debug_assert!(self.running <= self.config.runners);
+    }
+
+    /// Ends `pr`'s own CI run: it passed. Whether the pull request is still
+    /// in the world does not matter; the run was paid for. Under `github` a
+    /// pull request checking goes on: out for a rebase if it conflicts,
+    /// waiting if its base is in the world, else into the queue.
+    fn complete_pr_ci(&mut self, pr: PrNumber) {
+        let p = self.prs.get_mut(&pr).expect("arrived");
+        let Some(Run::Running { run, .. }) = p.ci.take() else {
+            unreachable!("a completing PR CI run is running");
+        };
+        let record = &mut self.pr_ci_runs[run];
+        record.consumed = self.now - record.started_at;
+        self.note(|t| TraceEvent::PrCiEnd {
+            t,
+            pr: pr.0,
+            cancelled: false,
+        });
+        self.running -= 1;
+        let p = &self.prs[&pr];
+        if p.present() && p.out == Some(Out::Checking) {
+            if p.conflicts_with_trunk {
+                self.begin_rebase(pr, Rebase::Conflict);
+            } else if let Some(on) = p.base().filter(|b| self.prs[b].present()) {
+                self.set_out(pr, Some(Out::Stacked));
+                self.note(|t| TraceEvent::Wait {
+                    t,
+                    pr: pr.0,
+                    on: on.0,
+                });
+            } else {
+                self.admit(pr);
+            }
+        }
+        self.assign_runners();
+    }
+
     /// Gives every free runner to the head of the runner queue.
     fn assign_runners(&mut self) {
         while self.running < self.config.runners {
             let Some(next) = self.waiting.pop_front() else {
                 break;
             };
-            let Run::Waiting { duration } = self.batches[&next].run else {
-                unreachable!("a queued batch is waiting");
-            };
-            self.start_run(next, duration);
+            match next {
+                Job::Batch(batch) => {
+                    let Run::Waiting { duration } = self.batches[&batch].run else {
+                        unreachable!("a queued batch is waiting");
+                    };
+                    self.start_run(batch, duration);
+                }
+                Job::PrCi(pr) => {
+                    let Some(Run::Waiting { duration }) = self.prs[&pr].ci else {
+                        unreachable!("a queued PR CI run is waiting");
+                    };
+                    self.start_pr_ci(pr, duration);
+                }
+            }
         }
     }
 
@@ -597,23 +911,27 @@ impl World {
         self.assign_runners();
     }
 
-    /// The observation now. A departure the queue did not cause is a
-    /// withdrawal: of intent, or because a base left.
+    /// The observation now: the enqueued pull requests. One conflicting
+    /// with trunk is reported so, as the forge reports it whatever else
+    /// holds it; one whose own CI on its current head has not passed is
+    /// held `OwnCiPending`. A departure the queue did not cause is a
+    /// withdrawal: of intent, or because a base left or went out.
     fn snapshot(&self) -> Result<Observation, ForgeError> {
         let prs: Vec<PrSnapshot> = self
             .prs
             .values()
-            .filter(|p| p.queued())
+            .filter(|p| p.enqueued())
             .map(|p| {
                 let status = if p.conflicts_with_trunk {
                     PrStatus::Conflicting(ConflictWith::Trunk)
+                } else if p.ci.is_some() {
+                    PrStatus::Waiting(BTreeSet::from([Hold::OwnCiPending]))
                 } else {
                     PrStatus::Ready
                 };
-                // A base that left without landing took its descendants
-                // with it, so a base not queued has landed.
+                // An enqueued pull request's base is enqueued or landed.
                 let base = match p.base() {
-                    Some(b) if self.prs[&b].queued() => PrBase::Pr(b),
+                    Some(b) if self.prs[&b].enqueued() => PrBase::Pr(b),
                     _ => PrBase::Trunk,
                 };
                 let snapshot = PrSnapshot::new(p.record.number, p.head.clone(), base, status);
@@ -626,14 +944,21 @@ impl World {
             .collect();
         let batches: Vec<BatchStatus> = self.batches.values().map(|b| b.status.clone()).collect();
         let departed = self.ledger.departures(&prs, &batches, |gone| {
-            match &self.prs[&gone.number].record.left {
-                Some((_, Exit::Withdrawn)) => Ok(Departed::Withdrawn(Withdrawal::IntentCleared)),
-                Some((_, Exit::Blocked { on })) => {
+            let p = &self.prs[&gone.number];
+            match (&p.record.left, p.out) {
+                (Some((_, Exit::Withdrawn)), _) | (None, Some(Out::Checking)) => {
+                    Ok(Departed::Withdrawn(Withdrawal::IntentCleared))
+                }
+                (Some((_, Exit::Blocked { on })), _) => {
                     Ok(Departed::Withdrawn(Withdrawal::Blocked { on: *on }))
                 }
-                left => Err(ForgeError::Permanent(
+                (None, Some(Out::WithBase { on })) => {
+                    Ok(Departed::Withdrawn(Withdrawal::Blocked { on }))
+                }
+                (left, out) => Err(ForgeError::Permanent(
                     format!(
-                        "pr {} left as {left:?} with no batch landed or ejection to show for it",
+                        "pr {} left as {left:?}, out as {out:?}, with no batch landed or \
+                         ejection to show for it",
                         gone.number.0
                     )
                     .into(),
@@ -657,20 +982,20 @@ impl World {
         }
         status.members.iter().find_map(|m| {
             let p = &self.prs[&m.pr];
-            let still_there = p.queued() && p.head == m.head;
+            let still_there = p.enqueued() && p.head == m.head;
             (!still_there).then_some(LandRefusal::MemberGone { pr: m.pr })
         })
     }
 
-    /// Whether ejecting `pr` now is justified by the truth.
+    /// Whether ejecting `pr` for good now is justified by the truth: it is
+    /// bad or interacts with a pull request in the world or landed. A
+    /// conflict does not justify it; a conflict is a rebase.
     fn justified(&self, pr: PrNumber) -> bool {
-        let p = &self.prs[&pr];
-        p.bad
-            || p.conflicts_with_trunk
+        self.prs[&pr].bad
             || self
                 .prs
                 .iter()
-                .any(|(&j, other)| (other.queued() || other.landed()) && self.interacts(pr, j))
+                .any(|(&j, other)| (other.present() || other.landed()) && self.interacts(pr, j))
     }
 }
 
@@ -721,7 +1046,7 @@ impl Forge for World {
             base,
             members: batch.prs.iter().map(|p| p.0).collect(),
         });
-        self.waiting.push_back(batch.id);
+        self.waiting.push_back(Job::Batch(batch.id));
         self.assign_runners();
         Ok(())
     }
@@ -755,6 +1080,18 @@ impl Forge for World {
         for m in &status.members {
             self.leave(m.pr, Exit::Landed);
         }
+        if self.admission == Admission::Github {
+            let landed: BTreeSet<PrNumber> = status.members.iter().map(|m| m.pr).collect();
+            let children: Vec<PrNumber> = self
+                .prs
+                .iter()
+                .filter(|(_, c)| c.present() && c.base().is_some_and(|b| landed.contains(&b)))
+                .map(|(&n, _)| n)
+                .collect();
+            for child in children {
+                self.begin_rebase(child, Rebase::BaseLanded);
+            }
+        }
         self.ledger.landed(batch);
         debug_assert_eq!(self.check_landed(&status.members), Ok(()));
         Ok(())
@@ -771,7 +1108,7 @@ impl Forge for World {
             cancelled,
         });
         match b.run {
-            Run::Waiting { .. } => self.waiting.retain(|&w| w != batch),
+            Run::Waiting { .. } => self.waiting.retain(|&w| w != Job::Batch(batch)),
             Run::Running { run, done } => {
                 self.events.remove(&done);
                 self.runs[run].consumed = self.now - self.runs[run].started_at;
@@ -783,22 +1120,45 @@ impl Forge for World {
         Ok(())
     }
 
+    /// Under `label`, ejecting a pull request for the conflict with trunk
+    /// it has sends it and its descendants out for a rebase; every other
+    /// ejection is final.
     fn eject(&mut self, pr: PrNumber, reason: &EjectReason) -> Result<(), ForgeError> {
         self.ledger.check_eject(pr)?;
         let justified = self.justified(pr);
+        let rebase = self.admission == Admission::Label
+            && matches!(
+                reason,
+                EjectReason::Conflicts {
+                    with: ConflictWith::Trunk
+                }
+            )
+            && self.prs[&pr].conflicts_with_trunk;
+        if !rebase && matches!(self.prs[&pr].out, Some(Out::WithBase { .. })) {
+            self.untrace_blocked(pr);
+        }
         self.note(|t| TraceEvent::Eject {
             t,
             pr: pr.0,
             reason: reason.to_string(),
             justified,
+            r#final: !rebase,
         });
-        self.leave(
-            pr,
-            Exit::Ejected {
-                reason: reason.clone(),
-                justified,
-            },
-        );
+        if rebase {
+            let descendants = self.descendants(pr);
+            self.begin_rebase(pr, Rebase::Conflict);
+            for d in descendants {
+                self.out_with_base(d);
+            }
+        } else {
+            self.leave(
+                pr,
+                Exit::Ejected {
+                    reason: reason.clone(),
+                    justified,
+                },
+            );
+        }
         self.ledger.ejected(pr);
         Ok(())
     }

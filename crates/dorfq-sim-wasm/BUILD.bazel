@@ -1,0 +1,21 @@
+load("@rules_rust//rust:defs.bzl", "rust_shared_library", "rust_test")
+
+# The simulator as a WebAssembly module for the report site's playground.
+# `manual`, so `//...` does not also build it for the host: `//site:wasm`
+# builds it for wasm32, optimised.
+rust_shared_library(
+    name = "dorfq_sim_wasm",
+    srcs = ["src/lib.rs"],
+    tags = ["manual"],
+    visibility = ["//site:__pkg__"],
+    deps = ["//crates/dorfq-sim:dorfq_sim"],
+)
+
+# Builds the crate on the host, which is what puts its source under the
+# gate's clippy and rustfmt; it must not be `manual`.
+rust_test(
+    name = "dorfq_sim_wasm_test",
+    size = "small",
+    compile_data = ["//crates/dorfq-sim:examples/sim.toml"],
+    crate = ":dorfq_sim_wasm",
+)

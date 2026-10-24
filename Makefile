@@ -35,6 +35,7 @@ help:
 	@echo "  make local-deploy  install the optimised binary to ~/.local/bin and restart the user unit if running"
 	@echo "  make sim           run the dorfq-sim simulator (ARGS=... for arguments)"
 	@echo "  make sim-report    run every simulator example to JSON for the report site (bazel-bin/site/reports/)"
+	@echo "                     and build the browser simulator (bazel-bin/site/dorfq_sim_wasm.wasm)"
 	@echo "  make fix           rustfmt and buildifier the tree in place"
 	@echo "  make repin         re-render every crate hub's lock files after a Cargo.toml change or scrub bump"
 	@echo "  make ide           write rust-project.json for rust-analyzer"
@@ -84,10 +85,12 @@ sim:
 	bazel run //crates/dorfq-sim -- $(ARGS)
 
 # The report site's data: every shipped simulator example as a JSON document
-# under bazel-bin/site/reports/. `make check` builds these too.
+# under bazel-bin/site/reports/, and the playground's simulator compiled to
+# WebAssembly at bazel-bin/site/dorfq_sim_wasm.wasm. `make check` builds
+# these too.
 .PHONY: sim-report
 sim-report:
-	bazel build //site:reports
+	bazel build //site:reports //site:wasm
 
 .PHONY: optimised
 optimised:

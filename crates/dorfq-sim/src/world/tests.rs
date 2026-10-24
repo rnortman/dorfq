@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::CiMinutes;
+use crate::config::{Admission, Minutes};
 
 fn config(runners: usize, p_interact: f64, p_flake: f64) -> WorldConfig {
     WorldConfig {
@@ -7,7 +7,9 @@ fn config(runners: usize, p_interact: f64, p_flake: f64) -> WorldConfig {
         drain_hours: 1,
         arrivals_per_hour: 0.0,
         runners,
-        ci_minutes: CiMinutes { min: 10, max: 10 },
+        ci_minutes: Minutes { min: 10, max: 10 },
+        pr_ci_minutes: Minutes { min: 0, max: 0 },
+        rebase_minutes: Minutes { min: 0, max: 0 },
         p_bad: 0.0,
         p_interact,
         p_flake,
@@ -22,12 +24,14 @@ fn config(runners: usize, p_interact: f64, p_flake: f64) -> WorldConfig {
 fn world(runners: usize, p_interact: f64, p_flake: f64) -> World {
     World::new(
         config(runners, p_interact, p_flake),
+        Admission::Label,
         Streams::for_replication(1, 0),
     )
     .traced()
 }
 
-/// A pull request arriving now with the given truth.
+/// A pull request arriving now with the given truth; its own CI runs
+/// now, when it is instant and a runner is free.
 fn add(w: &mut World, bad: bool, conflicts: bool, key: u64) -> u64 {
     w.fire(Event::Arrival);
     let number = *w.prs.last_key_value().expect("arrived").0;
@@ -35,7 +39,20 @@ fn add(w: &mut World, bad: bool, conflicts: bool, key: u64) -> u64 {
     pr.bad = bad;
     pr.conflicts_with_trunk = conflicts;
     pr.key = key;
+    settle(w);
     number.0
+}
+
+/// Fires every event due now.
+fn settle(w: &mut World) {
+    w.advance_to(w.now());
+}
+
+/// The events recorded since the last call, as `--trace` prints them,
+/// without the pull requests' own CI.
+fn queue_lines(w: &mut World) -> Vec<String> {
+    let lines = lines(w).into_iter();
+    lines.filter(|l| !l.starts_with("pr-ci ")).collect()
 }
 
 /// The events recorded since the last call, as `--trace` prints them.
@@ -107,14 +124,23 @@ fn an_arrival_appears_on_trunk_with_its_drawn_mergeability() {
     let mut cfg = config(1, 0.0, 0.0);
     cfg.arrivals_per_hour = 100.0;
     cfg.p_conflict = 1.0;
-    let mut w = World::new(cfg, Streams::for_replication(1, 0)).traced();
+    let mut w = World::new(cfg, Admission::Label, Streams::for_replication(1, 0)).traced();
     let t = w.next_event().expect("an arrival is scheduled");
     w.advance_to(t);
     let o = w.observe().unwrap();
     assert_eq!(o.prs.len(), 1);
     assert_eq!(o.prs[0].base, PrBase::Trunk);
     assert_eq!(o.prs[0].status, PrStatus::Conflicting(ConflictWith::Trunk));
-    assert_eq!(lines(&mut w), ["arrive 1"]);
+    assert_eq!(
+        lines(&mut w),
+        [
+            "arrive 1",
+            "pr-ci 1",
+            "admit 1",
+            "pr-ci 1 begins",
+            "pr-ci 1 passed"
+        ]
+    );
 }
 
 #[test]
@@ -129,7 +155,9 @@ fn a_run_fails_for_a_bad_member_and_passes_without_one() {
     ));
     let trace = [
         "arrive 1",
+        "admit 1",
         "arrive 2",
+        "admit 2",
         "start 1 [1] on trunk",
         "ci 1 begins",
         "ci 1 passed",
@@ -137,7 +165,7 @@ fn a_run_fails_for_a_bad_member_and_passes_without_one() {
         "ci 2 begins",
         "ci 2 failed broken",
     ];
-    assert_eq!(lines(&mut w), trace);
+    assert_eq!(queue_lines(&mut w), trace);
 }
 
 #[test]
@@ -261,7 +289,7 @@ fn the_runner_queue_holds_a_third_run_until_one_of_two_completes() {
         start(&mut w, id as u64 + 1, &trunk, &[pr]).unwrap();
     }
     assert_eq!((w.running, w.runs().len()), (2, 2));
-    assert_eq!(w.waiting, [BatchId(3)]);
+    assert_eq!(w.waiting, [Job::Batch(BatchId(3))]);
     w.advance_to(w.next_event().unwrap());
     assert_eq!(w.now(), 600);
     assert_eq!((w.running, w.runs().len()), (1, 3));
@@ -468,7 +496,7 @@ fn churn_repushes_and_withdraws_on_their_clocks() {
     let mut cfg = config(1, 0.0, 0.0);
     cfg.repush_per_hour = 1.0;
     cfg.withdraw_per_hour = 0.5;
-    let mut w = World::new(cfg, Streams::for_replication(1, 0)).traced();
+    let mut w = World::new(cfg, Admission::Label, Streams::for_replication(1, 0)).traced();
     let p = add(&mut w, false, false, 1);
     let head = w.prs[&PrNumber(p)].head.clone();
     finish(&mut w);
@@ -487,7 +515,7 @@ fn a_churn_delay_past_the_end_of_the_clock_schedules_nothing() {
     let mut cfg = config(1, 0.0, 0.0);
     cfg.repush_per_hour = 1e-30;
     cfg.withdraw_per_hour = 1e-30;
-    let mut w = World::new(cfg, Streams::for_replication(1, 0));
+    let mut w = World::new(cfg, Admission::Label, Streams::for_replication(1, 0));
     add(&mut w, false, false, 1);
     assert_eq!(w.next_event(), None);
 }
@@ -498,7 +526,11 @@ fn arrivals_and_truths_do_not_depend_on_what_the_scheduler_does() {
     cfg.arrivals_per_hour = 20.0;
     cfg.p_bad = 0.5;
     let truths = |busy: bool| {
-        let mut w = World::new(cfg.clone(), Streams::for_replication(3, 1));
+        let mut w = World::new(
+            cfg.clone(),
+            Admission::Label,
+            Streams::for_replication(3, 1),
+        );
         while let Some(t) = w.next_event() {
             w.advance_to(t);
             let o = w.observe().unwrap();
@@ -550,10 +582,11 @@ fn a_stacked_arrival_is_reported_on_its_base_and_atomic_when_drawn_so() {
     cfg.p_stacked = 1.0;
     cfg.p_atomic = 1.0;
     cfg.p_conflict = 1.0;
-    let mut w = World::new(cfg, Streams::for_replication(1, 0)).traced();
+    let mut w = World::new(cfg, Admission::Label, Streams::for_replication(1, 0)).traced();
     for _ in 0..8 {
         w.fire(Event::Arrival);
     }
+    settle(&mut w);
     let o = w.observe().unwrap();
     // The first arrival has nothing to be cut from: it is on trunk and
     // keeps its drawn conflict.
@@ -578,7 +611,7 @@ fn a_stacked_arrival_is_reported_on_its_base_and_atomic_when_drawn_so() {
         }
     }
     assert!(stacked > 3, "{stacked} of 8 stacked");
-    let trace = lines(&mut w);
+    let trace = queue_lines(&mut w);
     let on = trace
         .iter()
         .filter(|l| l.contains(" on ") && l.ends_with(" atomic"));
@@ -702,7 +735,7 @@ fn a_repush_restacks_every_descendant() {
     let changed: Vec<bool> = after.iter().zip(&heads(&w)).map(|(b, a)| b != a).collect();
     assert_eq!(changed, [true, true, true, true, false]);
     assert_eq!(
-        lines(&mut w),
+        queue_lines(&mut w),
         [
             "repush 2", "repush 3", "repush 1", "repush 2", "repush 3", "repush 4"
         ]
@@ -748,7 +781,7 @@ fn a_world_without_stacks_draws_what_it_drew_before_stacks() {
     cfg.arrivals_per_hour = 20.0;
     cfg.p_bad = 0.5;
     cfg.p_conflict = 0.5;
-    let mut w = World::new(cfg, Streams::for_replication(3, 1));
+    let mut w = World::new(cfg, Admission::Label, Streams::for_replication(3, 1));
     finish(&mut w);
     let expected = [
         (67, false, true, 9386675400015353148, None),
@@ -768,7 +801,11 @@ fn a_cut_arrival_whose_target_left_is_on_trunk_and_changes_no_draw() {
     cfg.p_atomic = 1.0;
     cfg.p_conflict = 1.0;
     let arrivals = |withdraw_first: bool| {
-        let mut w = World::new(cfg.clone(), Streams::for_replication(2, 0));
+        let mut w = World::new(
+            cfg.clone(),
+            Admission::Label,
+            Streams::for_replication(2, 0),
+        );
         w.fire(Event::Arrival);
         if withdraw_first {
             w.fire(Event::Withdraw(PrNumber(1)));
@@ -776,6 +813,7 @@ fn a_cut_arrival_whose_target_left_is_on_trunk_and_changes_no_draw() {
         for _ in 0..7 {
             w.fire(Event::Arrival);
         }
+        settle(&mut w);
         let o = w.observe().unwrap();
         (
             w.truths(),
@@ -863,7 +901,8 @@ fn retirements_refusals_and_ejections_are_traced() {
             "withdraw 1",
             "refused 1: #1 is gone",
             "retire 1",
-            "eject 3 justified: conflicts with trunk",
+            "eject 3 unjustified: conflicts with trunk, rebasing",
+            "rebase 3 conflict",
         ]
     );
 }
@@ -875,11 +914,14 @@ fn an_arrival_carries_its_hidden_truth_and_its_stack() {
     cfg.p_conflict = 1.0;
     cfg.p_stacked = 1.0;
     cfg.p_atomic = 0.5;
-    let mut w = World::new(cfg, Streams::for_replication(1, 0)).traced();
+    let mut w = World::new(cfg, Admission::Label, Streams::for_replication(1, 0)).traced();
     for _ in 0..8 {
         w.fire(Event::Arrival);
     }
-    let arrivals = w.take_trace();
+    let trace = w.take_trace().into_iter();
+    let arrivals: Vec<TraceEvent> = trace
+        .filter(|e| matches!(e, TraceEvent::Arrive { .. }))
+        .collect();
     assert_eq!(arrivals.len(), 8);
     for (event, p) in arrivals.iter().zip(w.prs.values()) {
         let expected = TraceEvent::Arrive {
@@ -917,4 +959,572 @@ fn an_arrival_carries_its_hidden_truth_and_its_stack() {
             ..
         }
     )));
+}
+
+/// [`world`] whose pull requests' own CI takes `minutes` exactly.
+fn pr_ci_world(runners: usize, minutes: u64) -> World {
+    let mut cfg = config(runners, 0.0, 0.0);
+    cfg.pr_ci_minutes = Minutes {
+        min: minutes,
+        max: minutes,
+    };
+    World::new(cfg, Admission::Label, Streams::for_replication(1, 0)).traced()
+}
+
+fn status(o: &Observation, pr: u64) -> PrStatus {
+    let p = o.prs.iter().find(|p| p.number == PrNumber(pr));
+    p.expect("observed").status.clone()
+}
+
+fn pending() -> PrStatus {
+    PrStatus::Waiting(BTreeSet::from([Hold::OwnCiPending]))
+}
+
+#[test]
+fn an_arrival_runs_its_own_ci_on_a_runner_shared_with_batches() {
+    let mut cfg = config(2, 0.0, 0.0);
+    cfg.pr_ci_minutes = Minutes { min: 5, max: 25 };
+    let mut w = World::new(cfg, Admission::Label, Streams::for_replication(1, 0)).traced();
+    let first = add(&mut w, false, false, 1);
+    let second = add(&mut w, false, false, 2);
+    assert_eq!(w.running, 2);
+    assert_eq!(
+        lines(&mut w),
+        [
+            "arrive 1",
+            "pr-ci 1",
+            "admit 1",
+            "pr-ci 1 begins",
+            "arrive 2",
+            "pr-ci 2",
+            "admit 2",
+            "pr-ci 2 begins"
+        ]
+    );
+    finish(&mut w);
+    let durations: Vec<u64> = w.pr_ci_runs().iter().map(|r| r.consumed).collect();
+    assert_eq!(durations.len(), 2);
+    for d in &durations {
+        assert!((300..=1500).contains(d) && d % 60 == 0, "{durations:?}");
+    }
+    assert_eq!(w.check_invariants(), Ok(()));
+    // A batch and a PR CI run share the two runners.
+    let trunk = w.observe().unwrap().trunk;
+    start(&mut w, 1, &trunk, &[first]).unwrap();
+    w.fire(Event::Repush(PrNumber(second)));
+    assert_eq!(w.running, 2);
+    assert_eq!(w.check_invariants(), Ok(()));
+    finish(&mut w);
+    assert_eq!(w.check_invariants(), Ok(()));
+    let m = w.metrics();
+    assert_eq!(m.pr_ci_runs, 3);
+    let pr_ci: u64 = w.pr_ci_runs().iter().map(|r| r.consumed).sum();
+    assert_eq!(m.pr_ci_hours, pr_ci as f64 / HOUR);
+    assert_eq!(m.runner_hours, (pr_ci + 600) as f64 / HOUR);
+}
+
+#[test]
+fn a_pull_request_is_held_until_its_own_ci_passes() {
+    let mut w = pr_ci_world(1, 20);
+    let p = add(&mut w, false, false, 1);
+    let q = add(&mut w, false, false, 2);
+    stack(&mut w, q, p, false);
+    let o = w.observe().unwrap();
+    assert_eq!(
+        (status(&o, p), o.prs[1].base),
+        (pending(), PrBase::Pr(PrNumber(p)))
+    );
+    let message = violation_of(start(&mut w, 1, &o.trunk, &[p]));
+    assert!(message.contains("not ready"), "{message}");
+    // One runner: 2's run waits behind 1's.
+    w.advance_to(1200);
+    let o = w.observe().unwrap();
+    assert_eq!((status(&o, p), status(&o, q)), (PrStatus::Ready, pending()));
+    start(&mut w, 1, &o.trunk, &[p]).unwrap();
+    w.advance_to(2400);
+    let o = w.observe().unwrap();
+    assert_eq!(status(&o, q), PrStatus::Ready);
+    let starts = w.pr_ci_runs().iter().map(|r| (r.pr.0, r.started_at));
+    assert_eq!(starts.collect::<Vec<_>>(), [(1, 0), (2, 1200)]);
+}
+
+#[test]
+fn an_instant_own_ci_is_ready_at_once_but_still_waits_for_a_runner() {
+    let mut w = pr_ci_world(1, 0);
+    let p = add(&mut w, false, false, 1);
+    let o = w.observe().unwrap();
+    assert_eq!(status(&o, p), PrStatus::Ready);
+    start(&mut w, 1, &o.trunk, &[p]).unwrap();
+    // The batch holds the only runner: the next arrival's run waits.
+    let q = add(&mut w, false, false, 2);
+    let o = w.observe().unwrap();
+    assert_eq!(status(&o, q), pending());
+    w.advance_to(600);
+    let o = w.observe().unwrap();
+    assert_eq!(status(&o, q), PrStatus::Ready);
+    assert_eq!(w.pr_ci_runs()[1].started_at, 600);
+}
+
+#[test]
+fn a_repush_cancels_the_old_heads_run_and_holds_the_new_head() {
+    let mut w = pr_ci_world(2, 20);
+    let p = add(&mut w, false, false, 1);
+    w.advance_to(1200);
+    let o = w.observe().unwrap();
+    assert_eq!(status(&o, p), PrStatus::Ready);
+    start(&mut w, 1, &o.trunk, &[p]).unwrap();
+    w.take_trace();
+    w.advance_to(1500);
+    w.fire(Event::Repush(PrNumber(p)));
+    let o = w.observe().unwrap();
+    assert_eq!(status(&o, p), pending());
+    assert_ne!(o.prs[0].head, w.pr_ci_runs()[0].head);
+    // A second re-push cuts the first new head's run short.
+    w.advance_to(1800);
+    w.fire(Event::Repush(PrNumber(p)));
+    assert_eq!(
+        lines(&mut w),
+        [
+            "repush 1",
+            "pr-ci 1",
+            "pr-ci 1 begins",
+            "ci 1 passed",
+            "repush 1",
+            "pr-ci 1 cancelled",
+            "pr-ci 1",
+            "pr-ci 1 begins"
+        ]
+    );
+    let cut = &w.pr_ci_runs()[1];
+    assert_eq!((cut.consumed, cut.cancelled), (300, true));
+    finish(&mut w);
+    let o = w.observe().unwrap();
+    assert_eq!(status(&o, p), PrStatus::Ready);
+    // The batch holds the first head: its landing is refused.
+    w.land(BatchId(1)).unwrap();
+    let o = w.observe().unwrap();
+    let gone = LandRefusal::MemberGone { pr: PrNumber(p) };
+    assert!(matches!(state(&o, 1), BatchState::LandRefused { reason, .. } if reason == gone));
+    assert_eq!(w.check_invariants(), Ok(()));
+    let m = w.metrics();
+    assert_eq!(m.pr_ci_runs, 3);
+    assert_eq!(m.pr_ci_hours, (1200 + 300 + 1200) as f64 / HOUR);
+}
+
+#[test]
+fn a_repush_while_the_run_waits_drops_it_from_the_runner_queue() {
+    let mut w = pr_ci_world(1, 20);
+    let p = add(&mut w, false, false, 1);
+    let q = add(&mut w, false, false, 2);
+    w.take_trace();
+    w.fire(Event::Repush(PrNumber(q)));
+    assert_eq!(lines(&mut w), ["repush 2", "pr-ci 2 cancelled", "pr-ci 2"]);
+    assert_eq!(w.waiting, [Job::PrCi(PrNumber(q))]);
+    finish(&mut w);
+    let runs: Vec<(u64, bool)> = w
+        .pr_ci_runs()
+        .iter()
+        .map(|r| (r.pr.0, r.cancelled))
+        .collect();
+    assert_eq!(runs, [(p, false), (q, false)]);
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_pull_request_that_leaves_still_pays_for_its_run() {
+    let mut w = pr_ci_world(1, 20);
+    let p = add(&mut w, false, false, 1);
+    let q = add(&mut w, false, false, 2);
+    w.take_trace();
+    w.fire(Event::Withdraw(PrNumber(p)));
+    w.fire(Event::Withdraw(PrNumber(q)));
+    finish(&mut w);
+    assert_eq!(
+        lines(&mut w),
+        [
+            "withdraw 1",
+            "withdraw 2",
+            "pr-ci 1 passed",
+            "pr-ci 2 begins",
+            "pr-ci 2 passed"
+        ]
+    );
+    assert_eq!(w.metrics().pr_ci_hours, 2400.0 / HOUR);
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_pull_requests_own_ci_durations_do_not_depend_on_the_queue() {
+    let mut cfg = config(1, 0.0, 0.0);
+    cfg.arrivals_per_hour = 20.0;
+    cfg.pr_ci_minutes = Minutes { min: 1, max: 30 };
+    let durations = |busy: bool| {
+        let mut w = World::new(
+            cfg.clone(),
+            Admission::Label,
+            Streams::for_replication(3, 1),
+        );
+        while let Some(t) = w.next_event() {
+            w.advance_to(t);
+            let o = w.observe().unwrap();
+            let ready = o.prs.iter().find(|p| p.status == PrStatus::Ready);
+            if let Some(ready) = ready.filter(|_| busy && o.batches.is_empty()) {
+                start(&mut w, t + 1, &o.trunk, &[ready.number.0]).unwrap();
+            }
+        }
+        let runs = w.pr_ci_runs().iter().map(|r| (r.pr, r.consumed));
+        runs.collect::<BTreeMap<_, _>>()
+    };
+    let idle = durations(false);
+    assert!(idle.len() > 5);
+    assert_eq!(idle, durations(true));
+}
+
+/// A world under `admission` on `runners` runners whose own CI runs take
+/// `pr_ci` minutes and whose rebases take `rebase` minutes, exactly.
+fn admitting(admission: Admission, runners: usize, pr_ci: u64, rebase: u64) -> World {
+    let mut cfg = config(runners, 0.0, 0.0);
+    cfg.pr_ci_minutes = Minutes {
+        min: pr_ci,
+        max: pr_ci,
+    };
+    cfg.rebase_minutes = Minutes {
+        min: rebase,
+        max: rebase,
+    };
+    World::new(cfg, admission, Streams::for_replication(1, 0)).traced()
+}
+
+fn conflict() -> EjectReason {
+    EjectReason::Conflicts {
+        with: ConflictWith::Trunk,
+    }
+}
+
+fn observed(o: &Observation) -> Vec<u64> {
+    o.prs.iter().map(|p| p.number.0).collect()
+}
+
+fn departures(o: &Observation) -> Vec<(u64, Departed)> {
+    o.departed.iter().map(|d| (d.pr.0, d.how.clone())).collect()
+}
+
+/// The whole trace so far, checked along every pull request's life, as
+/// `--trace` prints it without the pull requests' own CI.
+fn checked_lines(w: &mut World) -> Vec<String> {
+    let trace = w.take_trace();
+    assert_eq!(crate::trace::check_lives(&trace), Ok(()));
+    let lines = trace.iter().map(ToString::to_string);
+    lines.filter(|l| !l.starts_with("pr-ci ")).collect()
+}
+
+#[test]
+fn under_label_a_conflict_ejection_is_a_rebase_and_a_return() {
+    let mut w = admitting(Admission::Label, 2, 30, 20);
+    let p = add(&mut w, false, true, 1);
+    let o = w.observe().unwrap();
+    assert_eq!(status(&o, p), PrStatus::Conflicting(ConflictWith::Trunk));
+    let first = o.prs[0].head.clone();
+    w.take_trace();
+    w.eject(PrNumber(p), &conflict()).unwrap();
+    let o = w.observe().unwrap();
+    assert_eq!(
+        (observed(&o), departures(&o)),
+        (vec![], vec![(p, Departed::Ejected)])
+    );
+    assert_eq!(w.out(), 1);
+    w.advance_to(20 * 60);
+    let o = w.observe().unwrap();
+    assert_ne!(o.prs[0].head, first);
+    assert_eq!(status(&o, p), pending());
+    w.advance_to(50 * 60);
+    assert_eq!(status(&w.observe().unwrap(), p), PrStatus::Ready);
+    assert_eq!(
+        lines(&mut w),
+        [
+            "eject 1 unjustified: conflicts with trunk, rebasing",
+            "rebase 1 conflict",
+            "repush 1",
+            "pr-ci 1 cancelled",
+            "pr-ci 1",
+            "admit 1",
+            "pr-ci 1 begins",
+            "pr-ci 1 passed",
+        ]
+    );
+    let m = w.metrics();
+    assert_eq!(
+        (m.rebases, m.ejected_bad, m.ejected_good, m.pr_ci_runs),
+        (1, 0, 0, 2)
+    );
+    // The first head's run was cut at the push, 20 minutes in.
+    assert_eq!(w.pr_ci_runs()[0].consumed, 20 * 60);
+    assert!(w.pr_ci_runs()[0].cancelled);
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn under_label_an_instant_rebase_returns_at_the_next_observation() {
+    let mut w = admitting(Admission::Label, 2, 0, 0);
+    let p = add(&mut w, false, true, 1);
+    let first = w.observe().unwrap().prs[0].head.clone();
+    w.eject(PrNumber(p), &conflict()).unwrap();
+    // The plan's own instant: absent, ejected.
+    let o = w.observe().unwrap();
+    assert_eq!(departures(&o), [(p, Departed::Ejected)]);
+    settle(&mut w);
+    let o = w.observe().unwrap();
+    assert_eq!(observed(&o), [p]);
+    assert_ne!(o.prs[0].head, first);
+    assert_eq!(status(&o, p), PrStatus::Ready);
+    assert_eq!(checked_lines(&mut w).last().unwrap(), "admit 1");
+}
+
+#[test]
+fn under_label_a_rebasing_base_takes_its_stack_out_and_brings_it_back() {
+    let mut w = admitting(Admission::Label, 4, 30, 20);
+    let base = add(&mut w, false, true, 1);
+    let child = add(&mut w, false, false, 2);
+    stack(&mut w, child, base, false);
+    w.observe().unwrap();
+    w.eject(PrNumber(base), &conflict()).unwrap();
+    let o = w.observe().unwrap();
+    let with_base = Departed::Withdrawn(Withdrawal::Blocked { on: PrNumber(base) });
+    assert_eq!(
+        departures(&o),
+        [(base, Departed::Ejected), (child, with_base)]
+    );
+    // An arrival cut from the stack while it is out is out with it.
+    w.config.p_stacked = 1.0;
+    w.fire(Event::Arrival);
+    let late = w.prs[&PrNumber(3)].base().expect("cut from the stack").0;
+    assert!(observed(&w.observe().unwrap()).is_empty());
+    assert_eq!(w.out(), 3);
+    let before = heads(&w);
+    w.advance_to(20 * 60);
+    let o = w.observe().unwrap();
+    assert_eq!(
+        bases(&o)
+            .into_iter()
+            .map(|(n, b, _)| (n, b))
+            .collect::<Vec<_>>(),
+        [
+            (1, PrBase::Trunk),
+            (2, PrBase::Pr(PrNumber(1))),
+            (3, PrBase::Pr(PrNumber(late)))
+        ]
+    );
+    assert!(heads(&w).iter().zip(&before).all(|(a, b)| a != b));
+    assert!(o.prs.iter().all(|p| p.status == pending()));
+    assert_eq!(w.metrics().rebases, 1);
+    let trace = checked_lines(&mut w);
+    let from = trace.iter().position(|l| l.starts_with("eject")).unwrap();
+    assert_eq!(
+        trace[from..],
+        [
+            "eject 1 unjustified: conflicts with trunk, rebasing".to_owned(),
+            "rebase 1 conflict".to_owned(),
+            "blocked 2 with 1".to_owned(),
+            format!("arrive 3 on {late}"),
+            format!("blocked 3 with {late}"),
+            "repush 1".to_owned(),
+            "repush 2".to_owned(),
+            "repush 3".to_owned(),
+            "admit 1".to_owned(),
+            "admit 2 on 1".to_owned(),
+            format!("admit 3 on {late}"),
+        ]
+    );
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn an_ejection_in_the_plan_that_took_a_pull_request_out_with_its_base_supersedes_it() {
+    let mut w = admitting(Admission::Label, 2, 0, 20);
+    let base = add(&mut w, false, true, 1);
+    let child = add(&mut w, false, false, 2);
+    stack(&mut w, child, base, false);
+    w.observe().unwrap();
+    w.take_trace();
+    w.eject(PrNumber(base), &conflict()).unwrap();
+    let failed = EjectReason::BatchFailed { batch: BatchId(1) };
+    w.eject(PrNumber(child), &failed).unwrap();
+    let o = w.observe().unwrap();
+    assert_eq!(
+        departures(&o),
+        [(base, Departed::Ejected), (child, Departed::Ejected)]
+    );
+    assert_eq!(
+        lines(&mut w),
+        [
+            "eject 1 unjustified: conflicts with trunk, rebasing",
+            "rebase 1 conflict",
+            "eject 2 unjustified: batch 1 failed",
+        ]
+    );
+    assert_eq!((w.out(), w.metrics().ejected_good), (1, 1));
+}
+
+#[test]
+fn a_withdrawal_during_a_rebase_is_final_and_cancels_the_push() {
+    let mut w = admitting(Admission::Label, 2, 0, 20);
+    let p = add(&mut w, false, true, 1);
+    w.observe().unwrap();
+    w.eject(PrNumber(p), &conflict()).unwrap();
+    // Its author is mid-rebase: a churn push mints no head.
+    let head = w.prs[&PrNumber(p)].head.clone();
+    w.fire(Event::Repush(PrNumber(p)));
+    assert_eq!(w.prs[&PrNumber(p)].head, head);
+    w.fire(Event::Withdraw(PrNumber(p)));
+    assert!(!w.events.values().any(|e| matches!(e, Event::Rebase(_))));
+    finish(&mut w);
+    let m = w.metrics();
+    assert_eq!((m.withdrawn, m.rebases, w.out()), (1, 0, 0));
+    assert_eq!(
+        checked_lines(&mut w)[2..],
+        [
+            "eject 1 unjustified: conflicts with trunk, rebasing",
+            "rebase 1 conflict",
+            "withdraw 1"
+        ]
+    );
+}
+
+#[test]
+fn under_label_a_landed_base_changes_nothing_for_its_child() {
+    let mut w = admitting(Admission::Label, 2, 0, 20);
+    let base = add(&mut w, false, false, 1);
+    let child = add(&mut w, false, false, 2);
+    stack(&mut w, child, base, false);
+    assert_eq!(verdict_of(&mut w, 1, &[base]), CiStatus::Passed);
+    w.land(BatchId(1)).unwrap();
+    finish(&mut w);
+    let o = w.observe().unwrap();
+    assert_eq!(bases(&o)[0].1, PrBase::Trunk);
+    assert_eq!(status(&o, child), PrStatus::Ready);
+    let m = w.metrics();
+    assert_eq!((m.rebases, m.pr_ci_runs, w.out()), (0, 2, 0));
+}
+
+#[test]
+fn under_github_a_stack_enters_one_landing_at_a_time() {
+    let mut w = admitting(Admission::Github, 4, 30, 20);
+    for key in 1..=3 {
+        add(&mut w, false, false, key);
+    }
+    stack(&mut w, 2, 1, false);
+    stack(&mut w, 3, 2, false);
+    let o = w.observe().unwrap();
+    assert!(observed(&o).is_empty());
+    assert_eq!(w.out(), 3);
+    w.advance_to(30 * 60);
+    let o = w.observe().unwrap();
+    assert_eq!(observed(&o), [1]);
+    assert_eq!(status(&o, 1), PrStatus::Ready);
+    start(&mut w, 1, &o.trunk, &[1]).unwrap();
+    w.advance_to(40 * 60);
+    w.observe().unwrap();
+    w.land(BatchId(1)).unwrap();
+    let (two, three) = (
+        w.prs[&PrNumber(2)].head.clone(),
+        w.prs[&PrNumber(3)].head.clone(),
+    );
+    w.advance_to(60 * 60);
+    // The push re-pushed the grandchild too.
+    assert_ne!(w.prs[&PrNumber(2)].head, two);
+    assert_ne!(w.prs[&PrNumber(3)].head, three);
+    assert!(observed(&w.observe().unwrap()).is_empty());
+    w.advance_to(90 * 60);
+    let o = w.observe().unwrap();
+    assert_eq!(bases(&o)[..], [(2, PrBase::Trunk, StackPolicy::Splittable)]);
+    assert_eq!(
+        checked_lines(&mut w),
+        [
+            "arrive 1",
+            "arrive 2",
+            "arrive 3",
+            "admit 1",
+            "wait 2 on 1",
+            "wait 3 on 2",
+            "start 1 [1] on trunk",
+            "ci 1 begins",
+            "ci 1 passed",
+            "land 1 [1]",
+            "rebase 2 base landed",
+            "repush 2",
+            "repush 3",
+            "admit 2",
+            "wait 3 on 2",
+        ]
+    );
+    let m = w.metrics();
+    assert_eq!((m.rebases, m.pr_ci_runs), (1, 5));
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn under_github_a_conflict_is_rebased_before_the_queue_sees_it() {
+    let mut w = admitting(Admission::Github, 2, 30, 20);
+    let p = add(&mut w, false, true, 1);
+    for t in [30, 50] {
+        w.advance_to(t * 60);
+        assert!(observed(&w.observe().unwrap()).is_empty(), "at {t} min");
+    }
+    w.advance_to(80 * 60);
+    let o = w.observe().unwrap();
+    assert_eq!(status(&o, p), PrStatus::Ready);
+    assert_eq!(
+        checked_lines(&mut w),
+        ["arrive 1", "rebase 1 conflict", "repush 1", "admit 1"]
+    );
+    let m = w.metrics();
+    assert_eq!((m.rebases, m.pr_ci_runs, m.ejected_bad), (1, 2, 0));
+}
+
+#[test]
+fn under_github_a_push_takes_an_enqueued_pull_request_out_until_it_passes() {
+    let mut w = admitting(Admission::Github, 2, 30, 20);
+    let p = add(&mut w, false, false, 1);
+    w.advance_to(30 * 60);
+    assert_eq!(observed(&w.observe().unwrap()), [p]);
+    w.fire(Event::Repush(PrNumber(p)));
+    let o = w.observe().unwrap();
+    assert_eq!(
+        departures(&o),
+        [(p, Departed::Withdrawn(Withdrawal::IntentCleared))]
+    );
+    w.advance_to(60 * 60);
+    let o = w.observe().unwrap();
+    assert_eq!(status(&o, p), PrStatus::Ready);
+    assert_eq!(
+        checked_lines(&mut w),
+        ["arrive 1", "admit 1", "repush 1", "recheck 1", "admit 1"]
+    );
+}
+
+#[test]
+fn under_github_a_base_that_leaves_blocks_a_child_the_queue_never_saw() {
+    let mut w = admitting(Admission::Github, 2, 30, 20);
+    let base = add(&mut w, false, false, 1);
+    let child = add(&mut w, false, false, 2);
+    stack(&mut w, child, base, false);
+    w.advance_to(30 * 60);
+    assert_eq!(observed(&w.observe().unwrap()), [base]);
+    w.eject(
+        PrNumber(base),
+        &EjectReason::BatchFailed { batch: BatchId(1) },
+    )
+    .unwrap();
+    let o = w.observe().unwrap();
+    assert_eq!(departures(&o), [(base, Departed::Ejected)]);
+    let m = w.metrics();
+    assert_eq!((m.ejected_good, m.blocked, w.out()), (1, 1, 0));
+    assert_eq!(
+        checked_lines(&mut w)[3..],
+        [
+            "wait 2 on 1",
+            "eject 1 unjustified: batch 1 failed",
+            "blocked 2 on 1"
+        ]
+    );
 }

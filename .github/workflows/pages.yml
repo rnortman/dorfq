@@ -1,7 +1,8 @@
 name: Pages
 
 # Publishes the simulator report site: the shipped examples run through
-# `dorfq-sim run --json` by Bazel, beside the static page in site/. The
+# `dorfq-sim run --json` by Bazel and the simulator compiled to WebAssembly
+# for the playground, beside the static page in site/. The
 # deploy needs the repository's Pages source set to GitHub Actions; until
 # then the deploy job fails and nothing else does.
 on:
@@ -63,7 +64,8 @@ jobs:
       - name: Assemble the site
         run: |
           mkdir -p _site/reports
-          cp site/index.html site/app.js site/style.css _site/
+          cp site/index.html site/app.js site/style.css site/sim-worker.js _site/
+          cp bazel-bin/site/dorfq_sim_wasm.wasm _site/
           cp bazel-bin/site/reports/*.json _site/reports/
 
       - uses: actions/configure-pages@v5
