@@ -26,8 +26,8 @@ base's tree alone), how each pull request left the queue, the names of the
 checks a batch failed, and the forge's clock. All three schedulers batch
 stacked pull requests, bases before children, and land a stack that must
 land whole only whole; the simulator's world grows stacks to measure them
-on. The GitHub forge does not yet enqueue a stacked pull request: it
-reports only pull requests whose base is trunk.
+on. The GitHub forge enqueues stacks and trees of any depth (see **Running
+against GitHub**).
 
 On the scheduler side there are two real policies beside the stub: `bisect`,
 the conventional pipelined bisect with memory that every number is compared
@@ -156,6 +156,21 @@ because landing is a push by the queue's own identity, the token's account
 or the app. Batch CI runs the pull request's own workflow files as a push to
 this repository, with this repository's secrets, and that holds for pull requests from forks too. So
 read a pull request's current head, workflows included, before you label it.
+
+A stack is a pull request whose base is another pull request's branch.
+Label every pull request in it: a labelled pull request is enqueued once
+the pull request whose head branch it targets is enqueued, and until then
+its author is told in a comment that it is blocked, and why. A pull request
+whose base is a branch that is neither trunk nor any open pull request's
+head is told the same, and never enqueued. A stacked pull request is held
+while its head does not contain its base's current head, so after a push to
+the base, rebase the pull requests stacked on it. Once a base pull request
+has merged into trunk, by the queue or by hand, the queue moves the pull
+requests it had queued on it onto trunk; it does this only for a stack it
+had queued and only for a merge into trunk, never for a branch whose pull
+request was merged elsewhere or that a labelled pull request targeted before
+it was queued on it — those are told to retarget by hand. Every policy
+batches a stack bases before children.
 
 ### As a GitHub App
 

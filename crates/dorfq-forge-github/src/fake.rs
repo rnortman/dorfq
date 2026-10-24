@@ -29,6 +29,8 @@ pub struct FakePr {
     pub open: bool,
     pub base: String,
     pub head: Sha,
+    /// `None` for a head in a fork.
+    pub head_branch: Option<String>,
     pub labels: Vec<String>,
     pub title: String,
     pub mergeable: Option<bool>,
@@ -122,15 +124,36 @@ impl FakeGitHub {
     }
 
     /// An open pull request against `main` whose head is a new commit on
-    /// trunk, labelled `queue`, mergeable; its head.
+    /// trunk, on branch `pr-<number>`, labelled `queue`, mergeable; its head.
     pub fn open_pr(&self, number: u64) -> Sha {
-        let head = self.commit(&[self.trunk()]);
+        let trunk = self.trunk();
+        self.open_on(number, "main", &trunk)
+    }
+
+    /// An open pull request whose head is a new commit on `on`'s head and
+    /// whose base is `on`'s head branch, on branch `pr-<number>`, labelled
+    /// `queue`, mergeable; its head.
+    pub fn stack_pr(&self, number: u64, on: u64) -> Sha {
+        let (base, parent) = {
+            let state = self.state();
+            let on = &state.prs[&on];
+            let base = on.head_branch.clone().expect("the base has a head branch");
+            (base, on.head.clone())
+        };
+        self.open_on(number, &base, &parent)
+    }
+
+    fn open_on(&self, number: u64, base: &str, parent: &Sha) -> Sha {
+        let head = self.commit(std::slice::from_ref(parent));
+        let head_branch = format!("pr-{number}");
+        self.set_ref(&branch(&head_branch), &head);
         self.state().prs.insert(
             number,
             FakePr {
                 open: true,
-                base: "main".to_owned(),
+                base: base.to_owned(),
                 head: head.clone(),
+                head_branch: Some(head_branch),
                 labels: vec!["queue".to_owned()],
                 title: format!("Change {number}"),
                 mergeable: Some(true),
@@ -138,6 +161,16 @@ impl FakeGitHub {
             },
         );
         head
+    }
+
+    /// Moves pull request `number`'s head, and its head branch with it.
+    pub fn push(&self, number: u64, sha: &Sha) {
+        let mut state = self.state();
+        let pr = state.prs.get_mut(&number).expect("pull request exists");
+        pr.head = sha.clone();
+        if let Some(name) = pr.head_branch.clone() {
+            state.refs.insert(branch(&name), sha.clone());
+        }
     }
 
     pub fn pr(&self, number: u64) -> std::cell::RefMut<'_, FakePr> {
@@ -191,6 +224,7 @@ impl FakeGitHub {
             "merge",
             "remove_label",
             "create_comment",
+            "set_base",
         ])
     }
 
@@ -375,19 +409,21 @@ impl GitHubApi for FakeGitHub {
         Ok(self.state().history(descendant).contains(ancestor))
     }
 
-    fn list_open_prs(&mut self, base: &str) -> Result<Vec<PrSummary>, ApiError> {
-        self.enter("list_open_prs", base.to_owned())?;
+    fn list_open_prs(&mut self) -> Result<Vec<PrSummary>, ApiError> {
+        self.enter("list_open_prs", String::new())?;
         let state = self.state();
         let summary = |number: u64, pr: &FakePr, head: &Sha| PrSummary {
             number: PrNumber(number),
             head: head.clone(),
+            base: pr.base.clone(),
+            head_branch: pr.head_branch.clone(),
             labels: pr.labels.clone(),
             title: pr.title.clone(),
         };
         let mut listing: Vec<PrSummary> = state
             .prs
             .iter()
-            .filter(|(number, pr)| pr.open && pr.base == base && !state.unlisted.contains(number))
+            .filter(|(number, pr)| pr.open && !state.unlisted.contains(number))
             .map(|(&number, pr)| summary(number, pr, &pr.head))
             .collect();
         for (number, head) in &state.listed_again {
@@ -411,6 +447,34 @@ impl GitHubApi for FakeGitHub {
             mergeable: pr.mergeable,
             merged: pr.merged,
         })
+    }
+
+    fn set_base(&mut self, number: PrNumber, base: &str) -> Result<(), ApiError> {
+        self.enter("set_base", format!("{} {base}", number.0))?;
+        let mut state = self.state();
+        let pr = state
+            .prs
+            .get_mut(&number.0)
+            .ok_or_else(|| permanent(format!("set_base {}: no such pull request", number.0)))?;
+        pr.base = base.to_owned();
+        pr.mergeable = None;
+        Ok(())
+    }
+
+    fn merged_pr_heads(&mut self, head_branch: &str, base: &str) -> Result<Vec<Sha>, ApiError> {
+        self.enter("merged_pr_heads", format!("{head_branch} {base}"))?;
+        Ok(self
+            .state()
+            .prs
+            .values()
+            .filter(|pr| {
+                !pr.open
+                    && pr.merged
+                    && pr.head_branch.as_deref() == Some(head_branch)
+                    && pr.base == base
+            })
+            .map(|pr| pr.head.clone())
+            .collect())
     }
 
     fn checks(&mut self, sha: &Sha) -> Result<Vec<CheckResult>, ApiError> {

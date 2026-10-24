@@ -21,8 +21,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dorfq_core::{
-    BatchId, BatchStart, BatchState, CiStatus, ConflictWith, EjectReason, Forge, ForgeError,
-    LandRefusal, Observation, PrNumber, PrStatus, Sha,
+    BatchId, BatchStart, BatchState, CiStatus, ConflictWith, EjectReason, Forge, ForgeError, Hold,
+    LandRefusal, Observation, PrBase, PrNumber, PrSnapshot, PrStatus, Sha,
 };
 use dorfq_forge_github::api::{Auth, GitHubApi, RefUpdate, RestClient};
 use dorfq_forge_github::app::AppKey;
@@ -203,8 +203,51 @@ fn batch(observation: &Observation, id: u64) -> Option<&BatchState> {
         .map(|b| &b.state)
 }
 
+/// Starts batch `id` of `members` on `trunk`, waits for it to test, passes
+/// its tip and waits for the pass; returns the tip.
+fn tested(
+    forge: &mut GitHubForge,
+    repo: &mut Repo,
+    id: u64,
+    trunk: &Sha,
+    members: Vec<PrNumber>,
+) -> Result<Sha, String> {
+    forge
+        .start_batch(&BatchStart::new(BatchId(id), trunk.clone(), members))
+        .map_err(at(&format!("starting batch {id}")))?;
+    let observation = observe_until(forge, &format!("batch {id} testing"), |o| {
+        matches!(batch(o, id), Some(BatchState::Testing { .. }))
+    })?;
+    let Some(BatchState::Testing { tip, .. }) = batch(&observation, id).cloned() else {
+        unreachable!("observe_until accepted batch {id} as testing");
+    };
+    repo.pass(&tip)?;
+    observe_until(forge, &format!("batch {id} passed"), |o| {
+        batch(o, id)
+            == Some(&BatchState::Testing {
+                tip: tip.clone(),
+                ci: CiStatus::Passed,
+            })
+    })?;
+    Ok(tip)
+}
+
 fn enqueued(observation: &Observation) -> Vec<PrNumber> {
     observation.prs.iter().map(|p| p.number).collect()
+}
+
+fn snapshot(observation: &Observation, pr: PrNumber) -> Option<&PrSnapshot> {
+    observation.prs.iter().find(|p| p.number == pr)
+}
+
+/// Whether `observation` reports every one of `expected` ready, at its
+/// head, on its base.
+fn ready_on(observation: &Observation, expected: &[(&Fixture, PrBase)]) -> bool {
+    expected.iter().all(|(fixture, base)| {
+        snapshot(observation, fixture.number).is_some_and(|p| {
+            p.status == PrStatus::Ready && p.head == fixture.head && p.base == *base
+        })
+    })
 }
 
 fn str_field<'a>(what: &str, value: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -236,13 +279,13 @@ impl Repo {
             .ok_or_else(|| format!("trunk {TRUNK} does not exist"))
     }
 
-    /// Closes every open labelled pull request against trunk, deletes every
+    /// Closes every open labelled pull request, deletes every
     /// queue ref and every branch under `stale_prefix`, and creates the label
     /// if it is missing.
     fn clean(&mut self, stale_prefix: &str) -> Result<(), String> {
         for pr in self
             .client
-            .list_open_prs(TRUNK)
+            .list_open_prs()
             .map_err(at("listing pull requests"))?
         {
             if pr.labels.iter().any(|l| l == LABEL) {
@@ -304,17 +347,19 @@ impl Repo {
             .map_err(at(&what))
     }
 
-    /// A branch from trunk writing `content` to `path`, a pull request for
-    /// it carrying the label, and a passing `check` status on its head.
+    /// A branch from `parent` writing `content` to `path`, a pull request
+    /// for it against `base` carrying the label, and a passing `check`
+    /// status on its head.
     fn fixture(
         &mut self,
-        trunk: &Sha,
+        parent: &Sha,
+        base: &str,
         branch: &str,
         title: &str,
         path: &str,
         content: &str,
     ) -> Result<Fixture, String> {
-        let head = self.commit_file(trunk, path, content, title)?;
+        let head = self.commit_file(parent, path, content, title)?;
         self.client
             .create_ref(&format!("refs/heads/{branch}"), &head)
             .map_err(at(&format!("creating {branch}")))?;
@@ -323,7 +368,7 @@ impl Repo {
             .client
             .post(
                 "/pulls",
-                &json!({ "title": title, "head": branch, "base": TRUNK }),
+                &json!({ "title": title, "head": branch, "base": base }),
             )
             .map_err(at(&what))?;
         let number = pr["number"]
@@ -338,6 +383,38 @@ impl Repo {
             .map_err(at(&format!("labelling #{}", number.0)))?;
         self.pass(&head)?;
         Ok(Fixture { number, head })
+    }
+
+    /// Moves `fixture`'s branch to a new commit on `parent` writing
+    /// `content` to `path`, passing; the fixture's new head.
+    fn repush(
+        &mut self,
+        fixture: &mut Fixture,
+        branch: &str,
+        parent: &Sha,
+        path: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        let head = self.commit_file(parent, path, content, &format!("{branch}: repushed"))?;
+        let update = self
+            .client
+            .update_ref(&format!("refs/heads/{branch}"), &head, true)
+            .map_err(at(&format!("pushing {branch}")))?;
+        check(update == RefUpdate::Updated, || {
+            format!("the forced push to {branch} was {update:?}")
+        })?;
+        self.pass(&head)?;
+        fixture.head = head;
+        Ok(())
+    }
+
+    /// Whether GitHub reports `pr` merged.
+    fn merged(&mut self, pr: PrNumber) -> Result<bool, String> {
+        Ok(self
+            .client
+            .get_pr(pr)
+            .map_err(at(&format!("reading #{}", pr.0)))?
+            .merged)
     }
 
     /// Posts a successful `check` status on `sha`.
@@ -390,6 +467,7 @@ fn run() -> Result<(), String> {
     let trunk = repo.trunk()?;
     let a = repo.fixture(
         &trunk,
+        TRUNK,
         &format!("{prefix}-a"),
         &format!("{prefix} A"),
         "a.txt",
@@ -397,6 +475,7 @@ fn run() -> Result<(), String> {
     )?;
     let b = repo.fixture(
         &trunk,
+        TRUNK,
         &format!("{prefix}-b"),
         &format!("{prefix} B"),
         &format!(".github/workflows/{prefix}.yml"),
@@ -407,6 +486,7 @@ fn run() -> Result<(), String> {
     )?;
     let c = repo.fixture(
         &trunk,
+        TRUNK,
         &format!("{prefix}-c"),
         &format!("{prefix} C"),
         "a.txt",
@@ -533,9 +613,144 @@ fn run() -> Result<(), String> {
     repo.wait_for_marker(b.number, Marker::Landed)?;
     forge.retire(BatchId(2)).map_err(at("retiring batch 2"))?;
 
-    // 7. Batch 3 of D passes, trunk moves under it, the landing is refused.
+    // 7. A stack: E on trunk, F on E's branch, G on F's branch.
+    let landed = repo.trunk()?;
+    let (e_branch, f_branch, g_branch) = (
+        format!("{prefix}-e"),
+        format!("{prefix}-f"),
+        format!("{prefix}-g"),
+    );
+    let mut e = repo.fixture(
+        &landed,
+        TRUNK,
+        &e_branch,
+        &format!("{prefix} E"),
+        &format!("{prefix}-e.txt"),
+        &format!("{prefix} E\n"),
+    )?;
+    let mut f = repo.fixture(
+        &e.head,
+        &e_branch,
+        &f_branch,
+        &format!("{prefix} F"),
+        &format!("{prefix}-f.txt"),
+        &format!("{prefix} F\n"),
+    )?;
+    let mut g = repo.fixture(
+        &f.head,
+        &f_branch,
+        &g_branch,
+        &format!("{prefix} G"),
+        &format!("{prefix}-g.txt"),
+        &format!("{prefix} G\n"),
+    )?;
+    fixtures.extend([e.number, f.number, g.number]);
+    observe_until(&mut forge, "E, F and G ready, stacked", |o| {
+        ready_on(
+            o,
+            &[
+                (&e, PrBase::Trunk),
+                (&f, PrBase::Pr(e.number)),
+                (&g, PrBase::Pr(f.number)),
+            ],
+        )
+    })?;
+
+    // A push to E holds F until F and G are rebased onto it.
+    let e_before = e.head.clone();
+    repo.repush(
+        &mut e,
+        &e_branch,
+        &e_before,
+        &format!("{prefix}-e.txt"),
+        &format!("{prefix} E, again\n"),
+    )?;
+    let moved = Hold::AncestorMoved { pr: e.number };
+    observe_until(&mut forge, "F held, E moved", |o| {
+        snapshot(o, f.number).is_some_and(
+            |p| matches!(&p.status, PrStatus::Waiting(holds) if holds.contains(&moved)),
+        )
+    })?;
+    repo.repush(
+        &mut f,
+        &f_branch,
+        &e.head,
+        &format!("{prefix}-f.txt"),
+        &format!("{prefix} F, rebased\n"),
+    )?;
+    repo.repush(
+        &mut g,
+        &g_branch,
+        &f.head,
+        &format!("{prefix}-g.txt"),
+        &format!("{prefix} G, rebased\n"),
+    )?;
+    let observation = observe_until(&mut forge, "E, F and G ready again", |o| {
+        ready_on(
+            o,
+            &[
+                (&e, PrBase::Trunk),
+                (&f, PrBase::Pr(e.number)),
+                (&g, PrBase::Pr(f.number)),
+            ],
+        )
+    })?;
+
+    // Batch 3 lands E alone; F is moved onto trunk on a later observation.
+    let tip3 = tested(&mut forge, &mut repo, 3, &observation.trunk, vec![e.number])?;
+    forge.land(BatchId(3)).map_err(at("landing batch 3"))?;
+    let e_open = repo
+        .client
+        .get_pr(e.number)
+        .map_err(at(&format!("reading #{}", e.number.0)))?
+        .open;
+    observe_until(&mut forge, "batch 3 landed, F on trunk", |o| {
+        batch(o, 3) == Some(&BatchState::Landed { tip: tip3.clone() })
+            && snapshot(o, f.number).is_some_and(|p| p.base == PrBase::Trunk)
+            && snapshot(o, g.number).is_some_and(|p| p.base == PrBase::Pr(f.number))
+    })?;
+    println!(
+        "live: E merged per GitHub: {}; F moved onto trunk by the {} rule",
+        repo.merged(e.number)?,
+        if e_open { "open-base" } else { "closed-base" }
+    );
+    repo.wait_for_marker(e.number, Marker::Landed)?;
+    forge.retire(BatchId(3)).map_err(at("retiring batch 3"))?;
+
+    // Batch 4 lands F and G together; G is moved onto trunk at the landing.
+    let observation = observe_until(&mut forge, "F and G ready, F on trunk", |o| {
+        ready_on(o, &[(&f, PrBase::Trunk), (&g, PrBase::Pr(f.number))])
+    })?;
+    let members = vec![f.number, g.number];
+    let tip4 = tested(&mut forge, &mut repo, 4, &observation.trunk, members)?;
+    forge.land(BatchId(4)).map_err(at("landing batch 4"))?;
+    let what = format!("#{}'s base reads {TRUNK}", g.number.0);
+    poll(&what, || {
+        let base = repo.client.get_pr(g.number).map_err(at(&what))?.base;
+        Ok(if base == TRUNK {
+            Ok(())
+        } else {
+            Err(format!("it reads {base}"))
+        })
+    })?;
+    observe_until(&mut forge, "batch 4 landed, nothing enqueued", |o| {
+        batch(o, 4) == Some(&BatchState::Landed { tip: tip4.clone() }) && o.prs.is_empty()
+    })?;
+    for fixture in [&e, &f, &g] {
+        repo.wait_for_marker(fixture.number, Marker::Landed)?;
+    }
+    println!(
+        "live: F merged per GitHub: {}; G merged per GitHub: {}",
+        repo.merged(f.number)?,
+        repo.merged(g.number)?
+    );
+    forge.retire(BatchId(4)).map_err(at("retiring batch 4"))?;
+
+    // 8. Batch 5 of D passes, trunk moves under it, the landing is refused.
+    let trunk = repo.trunk()?;
     let d = repo.fixture(
-        &tip,
+        &trunk,
+        TRUNK,
         &format!("{prefix}-d"),
         &format!("{prefix} D"),
         &format!("{prefix}-d.txt"),
@@ -548,27 +763,7 @@ fn run() -> Result<(), String> {
                 .iter()
                 .any(|p| p.number == d.number && p.status == PrStatus::Ready)
     })?;
-    forge
-        .start_batch(&BatchStart::new(
-            BatchId(3),
-            observation.trunk.clone(),
-            vec![d.number],
-        ))
-        .map_err(at("starting batch 3"))?;
-    let observation = observe_until(&mut forge, "batch 3 testing", |o| {
-        matches!(batch(o, 3), Some(BatchState::Testing { .. }))
-    })?;
-    let Some(BatchState::Testing { tip: tip3, .. }) = batch(&observation, 3).cloned() else {
-        unreachable!("observe_until accepted batch 3 as testing");
-    };
-    repo.pass(&tip3)?;
-    observe_until(&mut forge, "batch 3 passed", |o| {
-        batch(o, 3)
-            == Some(&BatchState::Testing {
-                tip: tip3.clone(),
-                ci: CiStatus::Passed,
-            })
-    })?;
+    let tip5 = tested(&mut forge, &mut repo, 5, &observation.trunk, vec![d.number])?;
     let pushed = repo.commit_file(
         &observation.trunk,
         &format!("{prefix}-trunk.txt"),
@@ -582,19 +777,19 @@ fn run() -> Result<(), String> {
     check(update == RefUpdate::Updated, || {
         format!("the direct push to trunk was {update:?}")
     })?;
-    forge.land(BatchId(3)).map_err(at("landing batch 3"))?;
+    forge.land(BatchId(5)).map_err(at("landing batch 5"))?;
     let refused = BatchState::LandRefused {
-        tip: tip3.clone(),
+        tip: tip5.clone(),
         reason: LandRefusal::TrunkMoved {
             trunk: pushed.clone(),
         },
     };
-    observe_until(&mut forge, "batch 3 refused, trunk moved", |o| {
-        batch(o, 3) == Some(&refused)
+    observe_until(&mut forge, "batch 5 refused, trunk moved", |o| {
+        batch(o, 5) == Some(&refused)
     })?;
-    forge.retire(BatchId(3)).map_err(at("retiring batch 3"))?;
+    forge.retire(BatchId(5)).map_err(at("retiring batch 5"))?;
 
-    // 8. Clean up the run's fixtures; trunk keeps what landed on it.
+    // 9. Clean up the run's fixtures; trunk keeps what landed on it.
     for number in fixtures {
         let open = repo
             .client

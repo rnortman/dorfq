@@ -13,9 +13,8 @@
   batch broke, and run a probe: a batch with no members that tests trunk on
   its own and never lands.
 - Stacks: the `all-at-once` scheduler lands stacked pull requests, keeping
-  together stacks marked to land only whole. `bisect`, `bayes` and the
-  GitHub forge do not handle stacks yet; a queue label on a stacked pull
-  request does nothing for now.
+  together stacks marked to land only whole. `bisect` and `bayes` do not
+  batch stacked pull requests yet.
 - Authors are told in a comment when their pull request is waiting and
   what holds it.
 - A scheduler that cannot reach a decision now stops dorfq with an error
