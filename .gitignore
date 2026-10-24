@@ -42,3 +42,10 @@ CLAUDE.local.md
 .vscode/
 .idea/
 .DS_Store
+
+# allthechanges reads every entry in the fragment directories whose name does
+# not start with a dot, so git sees every such entry too: a fragment the globs
+# above would hide (a `bazel-…` slug) is committed, and a stray file blocks
+# `make release`'s clean-tree check instead of being gathered unseen.
+!/changelog.d/[!.]*
+!/todo.d/[!.]*

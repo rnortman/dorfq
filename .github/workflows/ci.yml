@@ -49,7 +49,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/bazel-repo
-          key: bazel-repo-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelversion', 'Cargo.lock', 'tools/scrub/Cargo.lock') }}
+          key: bazel-repo-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelversion', 'Cargo.lock', 'tools/scrub/Cargo.lock', 'tools/allthechanges/Cargo.lock') }}
           restore-keys: |
             bazel-repo-
 
@@ -57,9 +57,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/bazel-disk
-          key: bazel-disk-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelversion', 'Cargo.lock', 'tools/scrub/Cargo.lock') }}-${{ github.sha }}
+          key: bazel-disk-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelversion', 'Cargo.lock', 'tools/scrub/Cargo.lock', 'tools/allthechanges/Cargo.lock') }}-${{ github.sha }}
           restore-keys: |
-            bazel-disk-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelversion', 'Cargo.lock', 'tools/scrub/Cargo.lock') }}-
+            bazel-disk-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelversion', 'Cargo.lock', 'tools/scrub/Cargo.lock', 'tools/allthechanges/Cargo.lock') }}-
             bazel-disk-
 
       # Written rather than tracked, because these are facts about this runner,

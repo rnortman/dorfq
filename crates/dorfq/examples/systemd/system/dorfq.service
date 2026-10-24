@@ -1,6 +1,6 @@
 # dorfq as a systemd system service. Install as
 # /etc/systemd/system/dorfq.service, with
-#   /usr/local/bin/dorfq                the binary from `make release`
+#   /usr/local/bin/dorfq                the binary from `make optimised`
 #   /etc/dorfq/dorfq.toml               the configuration (see ../../github.toml)
 #   /etc/dorfq/token.env                DORFQ_GITHUB_TOKEN=<token>, mode 0600
 # then `systemctl enable --now dorfq`. Every piece of queue state lives in

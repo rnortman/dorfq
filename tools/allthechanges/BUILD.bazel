@@ -1,0 +1,38 @@
+"""`bazel run //tools/allthechanges -- <args>`: allthechanges, the changelog
+and TODO fragment tool, from its published crate.
+
+It reads changelog.d, CHANGELOG.md, todo.d and TODO.md from the current
+directory, so the wrapper runs it in the workspace root wherever `bazel run`
+was invoked.
+"""
+
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+sh_binary(
+    name = "allthechanges",
+    srcs = ["allthechanges.sh"],
+    data = ["@allthechanges_crates//:allthechanges__allthechanges"],
+    env = {
+        "ALLTHECHANGES_BIN": "$(rlocationpath @allthechanges_crates//:allthechanges__allthechanges)",
+    },
+    visibility = ["//visibility:public"],
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+)
+
+# Holds the wrapper to refusing outside `bazel run`: run from runfiles, the
+# tool would lint a directory with no fragments and pass.
+sh_test(
+    name = "wrapper_test",
+    size = "small",
+    srcs = ["wrapper_test.sh"],
+    data = [
+        ":allthechanges",
+        "@allthechanges_crates//:allthechanges__allthechanges",
+    ],
+    env = {
+        "ALLTHECHANGES_BIN": "$(rlocationpath @allthechanges_crates//:allthechanges__allthechanges)",
+        "WRAPPER": "$(rlocationpath :allthechanges)",
+    },
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+)

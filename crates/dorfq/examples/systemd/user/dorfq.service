@@ -1,6 +1,6 @@
 # dorfq as a systemd user service, for running a queue from a login account.
 # Install as ~/.config/systemd/user/dorfq.service, with
-#   ~/.local/bin/dorfq                  the binary from `make release`
+#   ~/.local/bin/dorfq                  the binary from `make optimised`
 #   ~/.config/dorfq/dorfq.toml          the configuration (see ../../github.toml)
 #   ~/.config/dorfq/token.env           DORFQ_GITHUB_TOKEN=<token>, mode 0600
 # then `systemctl --user enable --now dorfq`. To keep it running while logged
