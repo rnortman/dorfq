@@ -16,7 +16,9 @@ name = "live"
 path = "src/bin/live.rs"
 
 [dependencies]
+base64 = { workspace = true }
 dorfq-core = { path = "../dorfq-core" }
+ring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ureq = { workspace = true }

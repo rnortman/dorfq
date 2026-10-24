@@ -1,6 +1,9 @@
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
+# The dorfq crate's provider test builds an app credential from this key.
+exports_files(["testdata/app-key.pkcs1.pem"])
+
 rust_library(
     name = "dorfq_forge_github",
     srcs = glob(
@@ -16,6 +19,8 @@ rust_library(
 rust_test(
     name = "dorfq_forge_github_test",
     size = "small",
+    # The GitHub App key fixtures, read with `include_str!`.
+    compile_data = glob(["testdata/*.pem"]),
     crate = ":dorfq_forge_github",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True),
@@ -31,4 +36,15 @@ rust_binary(
         ":dorfq_forge_github",
         "//crates/dorfq-core:dorfq_core",
     ],
+)
+
+# The live lane's credential selection, without the network.
+rust_test(
+    name = "live_test",
+    size = "small",
+    # The GitHub App key fixture, read with `include_str!`.
+    compile_data = ["testdata/app-key.pkcs1.pem"],
+    crate = ":live",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
 )

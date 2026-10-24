@@ -25,3 +25,11 @@ keywords = ["§"] # gitleaks:allow -- this is the rule's own definition
   [[rules.allowlists]]
   regexTarget = "line"
   regexes = ['''RFC ?\d+ ?§'''] # gitleaks:allow -- carve-out for spec citations
+
+# The GitHub App signing tests need a real RSA key. These two files are one
+# key generated for the tests, registered with no app and used nowhere
+# else; it secures nothing. Matched at a path-component boundary, not at
+# `^`: the scrub gate scans a mirror of the files under a temporary root,
+# and the path it matches carries that prefix.
+[allowlist]
+paths = ['''(^|/)crates/dorfq-forge-github/testdata/app-key\.pkcs[18]\.pem$''']

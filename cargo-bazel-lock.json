@@ -1,5 +1,5 @@
 {
-  "checksum": "aa18aeb3f2ef5736118918212916beb66004e46584b43d08ce1f06087413a1a2",
+  "checksum": "ad2d7bd8dbd0a8660e9d8900081924f4b84b9be00e123af8820b10e8e99ab4d2",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -912,6 +912,14 @@
     "dorfq-forge-github 0.0.0": {
       "common_attrs": {
         "deps": [
+          {
+            "id": "base64 0.23.1",
+            "target": "base64"
+          },
+          {
+            "id": "ring 0.17.14",
+            "target": "ring"
+          },
           {
             "id": "serde 1.0.229",
             "target": "serde"
@@ -4700,7 +4708,9 @@
     }
   },
   "direct_deps": [
+    "base64 0.23.1",
     "clap 4.6.7",
+    "ring 0.17.14",
     "serde 1.0.229",
     "serde_json 1.0.154",
     "toml 1.1.8+spec-1.1.0",

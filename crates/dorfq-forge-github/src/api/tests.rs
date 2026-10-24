@@ -1,8 +1,10 @@
-use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
+use std::time::UNIX_EPOCH;
 
 use super::*;
+use crate::app::tests::{PKCS1, verified};
 
 const BASE: &str = "https://api.example.test";
 const REPO: &str = "https://api.example.test/repos/acme/widgets";
@@ -15,6 +17,7 @@ fn sha(s: &str) -> Sha {
 }
 
 /// A canned response.
+#[derive(Clone)]
 struct Canned {
     status: u16,
     headers: Vec<(&'static str, String)>,
@@ -37,13 +40,32 @@ fn status(code: u16, body: Value) -> Canned {
     }
 }
 
-/// What the transport saw: method, url, body.
-type Seen = Rc<RefCell<Vec<(Method, String, Option<Value>)>>>;
+/// What the transport saw: method, url, body, `Authorization`.
+type Seen = Rc<RefCell<Vec<(Method, String, Option<Value>, String)>>>;
 
-/// A client whose transport answers `"<METHOD> <url>"` from `routes`; an
-/// unrouted request fails the test.
+const TOKEN: &str = "fixed-token";
+
+/// A client under [`TOKEN`] whose transport answers `"<METHOD> <url>"` from
+/// `routes`; an unrouted request fails the test.
 fn client(routes: Vec<(String, Canned)>) -> (RestClient, Seen) {
-    let routes: BTreeMap<String, Canned> = routes.into_iter().collect();
+    client_with(
+        Auth::Token(TOKEN.to_owned()),
+        routes,
+        Rc::new(Cell::new(UNIX_EPOCH)),
+    )
+}
+
+/// A client under `auth` and the clock `now`. A route given more than once
+/// answers with each response in turn, then repeats the last.
+fn client_with(
+    auth: Auth,
+    routes: Vec<(String, Canned)>,
+    now: Rc<Cell<SystemTime>>,
+) -> (RestClient, Seen) {
+    let mut queues: BTreeMap<String, VecDeque<Canned>> = BTreeMap::new();
+    for (key, canned) in routes {
+        queues.entry(key).or_default().push_back(canned);
+    }
     let seen: Seen = Rc::default();
     let log = Rc::clone(&seen);
     let transport: Transport = Box::new(move |request: &HttpRequest<'_>| {
@@ -52,10 +74,16 @@ fn client(routes: Vec<(String, Canned)>) -> (RestClient, Seen) {
             request.method,
             request.url.to_owned(),
             request.body.cloned(),
+            request.authorization.to_owned(),
         ));
-        let canned = routes
-            .get(&key)
+        let queue = queues
+            .get_mut(&key)
             .unwrap_or_else(|| panic!("unrouted request {key}"));
+        let canned = if queue.len() > 1 {
+            queue.pop_front().unwrap()
+        } else {
+            queue[0].clone()
+        };
         Ok(HttpResponse {
             status: canned.status,
             headers: canned
@@ -67,7 +95,14 @@ fn client(routes: Vec<(String, Canned)>) -> (RestClient, Seen) {
         })
     });
     (
-        RestClient::with_transport(BASE, "acme", "widgets", transport),
+        RestClient::with_transport(
+            BASE,
+            "acme",
+            "widgets",
+            auth,
+            transport,
+            Box::new(move || now.get()),
+        ),
         seen,
     )
 }
@@ -500,6 +535,7 @@ fn status_codes_map_to_error_kinds() {
         let text = error.to_string();
         assert!(text.contains(&format!("/git/commits/{A}")), "{text}");
         assert!(text.contains(&format!("HTTP {code}")), "{text}");
+        assert!(!text.contains(INSTALLATION_TOKEN_REJECTED), "{text}");
     }
 }
 
@@ -556,7 +592,14 @@ fn transport_failures_keep_their_kind() {
                 message: "connection reset".to_owned(),
             })
         });
-        let mut api = RestClient::with_transport(BASE, "acme", "widgets", transport);
+        let mut api = RestClient::with_transport(
+            BASE,
+            "acme",
+            "widgets",
+            Auth::Token(TOKEN.to_owned()),
+            transport,
+            Box::new(SystemTime::now),
+        );
         let error = api.get_ref("refs/heads/main").unwrap_err();
         assert_eq!(is_transient(&error), transient);
         assert!(error.to_string().contains("connection reset"));
@@ -847,4 +890,245 @@ fn api_error_maps_to_forge_error_of_the_same_kind() {
     let permanent: ForgeError = ApiError::Permanent("never".into()).into();
     assert!(matches!(permanent, ForgeError::Permanent(_)));
     assert_eq!(permanent.to_string(), "permanent forge error: never");
+}
+
+#[test]
+fn token_auth_sends_the_token_on_every_request_to_the_repository() {
+    let (mut api, seen) = client(vec![
+        route("GET", "/labels/queue", ok(json!({ "name": "queue" }))),
+        route(
+            "GET",
+            "/issues/9/comments?per_page=100",
+            ok(json!([{ "body": "first" }])),
+        ),
+    ]);
+    api.label_exists("queue").unwrap();
+    api.list_comments(PrNumber(9)).unwrap();
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 2);
+    for (_, url, _, authorization) in seen.iter() {
+        assert!(url.starts_with(&format!("{REPO}/")), "{url}");
+        assert_eq!(authorization, &format!("Bearer {TOKEN}"));
+    }
+}
+
+const CLIENT_ID: &str = "Iv1.acme";
+const MINT: &str = "POST https://api.example.test/app/installations/42/access_tokens";
+
+fn app() -> Auth {
+    Auth::App(AppKey::from_pem(CLIENT_ID, PKCS1).unwrap())
+}
+
+fn installation() -> (String, Canned) {
+    route("GET", "/installation", ok(json!({ "id": 42 })))
+}
+
+/// An access-token response; its `expires_at` is long past, which a client
+/// that read it would act on.
+fn minted(token: &str) -> (String, Canned) {
+    (
+        MINT.to_owned(),
+        status(
+            201,
+            json!({ "token": token, "expires_at": "2000-01-01T00:00:00Z" }),
+        ),
+    )
+}
+
+fn label() -> (String, Canned) {
+    route("GET", "/labels/queue", ok(json!({ "name": "queue" })))
+}
+
+fn at(seconds: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(seconds)
+}
+
+#[test]
+fn app_auth_mints_caches_and_renews_installation_tokens() {
+    let t0 = 1_800_000_000;
+    let clock = Rc::new(Cell::new(at(t0)));
+    let (mut api, seen) = client_with(
+        app(),
+        vec![
+            installation(),
+            minted("installation-token-1"),
+            minted("installation-token-2"),
+            label(),
+        ],
+        Rc::clone(&clock),
+    );
+    let key = AppKey::from_pem(CLIENT_ID, PKCS1).unwrap();
+
+    api.label_exists("queue").unwrap();
+    {
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(
+            (seen[0].0, seen[0].1.as_str()),
+            (Method::Get, format!("{REPO}/installation").as_str())
+        );
+        let jwt = seen[0].3.strip_prefix("Bearer ").unwrap();
+        let (_, claims) = verified(&key, jwt);
+        assert_eq!(claims["iss"], CLIENT_ID);
+        assert_eq!(claims["iat"], t0 - 60);
+        assert_eq!(format!("{} {}", seen[1].0, seen[1].1), MINT);
+        assert_eq!(seen[1].2, Some(json!({ "repositories": ["widgets"] })));
+        assert_eq!(seen[1].3, seen[0].3);
+        assert_eq!(seen[2].1, format!("{REPO}/labels/queue"));
+        assert_eq!(seen[2].3, "Bearer installation-token-1");
+    }
+
+    api.label_exists("queue").unwrap();
+    assert_eq!(seen.borrow().len(), 4);
+    assert_eq!(seen.borrow()[3].3, "Bearer installation-token-1");
+
+    // A clock stepped back makes the token look younger, not expired.
+    clock.set(at(t0 - 60 * 60));
+    api.label_exists("queue").unwrap();
+    assert_eq!(seen.borrow().len(), 5);
+    assert_eq!(seen.borrow()[4].3, "Bearer installation-token-1");
+
+    let renewal = 55 * 60;
+    clock.set(at(t0 + renewal - 1));
+    api.label_exists("queue").unwrap();
+    assert_eq!(seen.borrow().len(), 6);
+    assert_eq!(seen.borrow()[5].3, "Bearer installation-token-1");
+
+    clock.set(at(t0 + renewal));
+    api.label_exists("queue").unwrap();
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 8, "a mint, no second installation lookup");
+    assert_eq!(format!("{} {}", seen[6].0, seen[6].1), MINT);
+    let (_, claims) = verified(&key, seen[6].3.strip_prefix("Bearer ").unwrap());
+    assert_eq!(claims["iat"], t0 + renewal - 60);
+    assert_eq!(seen[7].3, "Bearer installation-token-2");
+}
+
+#[test]
+fn a_missing_installation_is_permanent_and_looked_up_again() {
+    let (mut api, seen) = client_with(
+        app(),
+        vec![route(
+            "GET",
+            "/installation",
+            status(404, json!({ "message": "Not Found" })),
+        )],
+        Rc::new(Cell::new(at(1_800_000_000))),
+    );
+    let error = api.label_exists("queue").unwrap_err();
+    assert!(!is_transient(&error), "{error}");
+    let text = error.to_string();
+    assert!(text.contains("finding the app's installation"), "{text}");
+    assert!(
+        text.contains("GET /repos/acme/widgets/installation: HTTP 404"),
+        "{text}"
+    );
+    api.label_exists("queue").unwrap_err();
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert!(seen.iter().all(|s| s.1.ends_with("/installation")));
+}
+
+#[test]
+fn a_rejected_jwt_names_its_causes() {
+    let (mut api, _) = client_with(
+        app(),
+        vec![route(
+            "GET",
+            "/installation",
+            status(
+                401,
+                json!({ "message": "A JSON web token could not be decoded" }),
+            ),
+        )],
+        Rc::new(Cell::new(at(1_800_000_000))),
+    );
+    let error = api.label_exists("queue").unwrap_err();
+    assert!(!is_transient(&error), "{error}");
+    let text = error.to_string();
+    assert!(text.contains("HTTP 401"), "{text}");
+    assert!(text.contains(JWT_REJECTED), "{text}");
+    assert!(!text.contains("Bearer"), "{text}");
+}
+
+#[test]
+fn an_unavailable_mint_is_transient_and_tried_again() {
+    let (mut api, seen) = client_with(
+        app(),
+        vec![
+            installation(),
+            (
+                MINT.to_owned(),
+                status(503, json!({ "message": "Service Unavailable" })),
+            ),
+        ],
+        Rc::new(Cell::new(at(1_800_000_000))),
+    );
+    let error = api.label_exists("queue").unwrap_err();
+    assert!(is_transient(&error), "{error}");
+    let text = error.to_string();
+    assert!(text.contains("minting an installation token"), "{text}");
+    assert!(text.contains("HTTP 503"), "{text}");
+    api.label_exists("queue").unwrap_err();
+    let seen = seen.borrow();
+    let requests: Vec<String> = seen.iter().map(|s| format!("{} {}", s.0, s.1)).collect();
+    assert_eq!(
+        requests,
+        vec![
+            format!("GET {REPO}/installation"),
+            MINT.to_owned(),
+            MINT.to_owned()
+        ]
+    );
+}
+
+#[test]
+fn an_access_token_response_without_a_token_is_permanent() {
+    let (mut api, _) = client_with(
+        app(),
+        vec![
+            installation(),
+            (
+                MINT.to_owned(),
+                status(201, json!({ "expires_at": "2000-01-01T00:00:00Z" })),
+            ),
+        ],
+        Rc::new(Cell::new(at(1_800_000_000))),
+    );
+    let error = api.label_exists("queue").unwrap_err();
+    assert!(!is_transient(&error), "{error}");
+    let text = error.to_string();
+    assert!(
+        text.contains("POST /app/installations/42/access_tokens"),
+        "{text}"
+    );
+    assert!(text.contains("token"), "{text}");
+}
+
+#[test]
+fn a_rejected_installation_token_is_permanent_and_not_reminted() {
+    let (mut api, seen) = client_with(
+        app(),
+        vec![
+            installation(),
+            minted("installation-token-1"),
+            route(
+                "GET",
+                "/labels/queue",
+                status(401, json!({ "message": "Bad credentials" })),
+            ),
+        ],
+        Rc::new(Cell::new(at(1_800_000_000))),
+    );
+    let error = api.label_exists("queue").unwrap_err();
+    assert!(!is_transient(&error), "{error}");
+    let text = error.to_string();
+    assert!(text.contains(INSTALLATION_TOKEN_REJECTED), "{text}");
+    assert!(text.contains("GET /labels/queue: HTTP 401"), "{text}");
+    assert!(!text.contains("installation-token-1"), "{text}");
+    assert_eq!(seen.borrow().len(), 3);
+    api.label_exists("queue").unwrap_err();
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 4, "no mint follows a rejection");
+    assert_eq!(seen[3].3, "Bearer installation-token-1");
 }

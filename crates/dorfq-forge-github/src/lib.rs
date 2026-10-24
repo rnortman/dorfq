@@ -39,11 +39,14 @@
 //! [`ForgeError::Permanent`]: someone else is using the queue's namespace.
 //!
 //! - [`api`]: the REST calls, behind the [`api::GitHubApi`] trait.
+//! - [`app`]: the GitHub App credential: the private key, and the JWT it
+//!   signs.
 //! - [`checks`]: required check names on a commit, reduced to a CI status.
 //! - [`messages`]: what authors are told, as marked issue comments.
 //! - [`record`]: the batch record's text.
 
 pub mod api;
+pub mod app;
 pub mod checks;
 pub mod messages;
 pub mod record;

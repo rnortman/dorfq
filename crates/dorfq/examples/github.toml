@@ -1,11 +1,12 @@
 # The GitHub forge on one repository, polled once a minute, with the
-# all-at-once stub scheduler. Set `owner` and `repo` to the repository the
-# queue serves (for dorfq itself, the owner and name in the `repository` URL
-# of the workspace Cargo.toml), export the token in DORFQ_GITHUB_TOKEN, then
-# from the repository root run
+# all-at-once stub scheduler, running as a GitHub App. Set `owner` and `repo`
+# to the repository the queue serves (for dorfq itself, the owner and name in
+# the `repository` URL of the workspace Cargo.toml), and `client_id` and
+# `private_key_file` to the app's, then from the repository root run
 #   make run ARGS="run --config $PWD/crates/dorfq/examples/github.toml"
-# The operator steps (label, token permissions, CI on batch branches) are in
-# README.md, "Running against GitHub".
+# Creating and installing the app is README.md, "Running against GitHub",
+# "As a GitHub App"; the label, CI on batch branches and the token
+# alternative are in the same section.
 
 [forge]
 kind = "github"
@@ -15,7 +16,16 @@ repo = "dorfq"
 trunk = "main"
 label = "queue"
 checks = ["check"]                    # required check names on heads and batch tips
-token_env = "DORFQ_GITHUB_TOKEN"      # the environment variable holding the token
+
+[forge.auth]
+kind = "app"
+client_id = "Iv23liEXAMPLE"           # the app's Client ID, from its settings page
+private_key_file = "dorfq-app.pem"    # relative to this file's directory
+
+# Or a fixed token read from the environment:
+# [forge.auth]
+# kind = "token"
+# env = "DORFQ_GITHUB_TOKEN"          # the environment variable holding the token
 
 [scheduler]
 kind = "all-at-once"

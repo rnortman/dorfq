@@ -12,12 +12,13 @@ use std::rc::Rc;
 use dorfq_core::{
     BatchId, BatchStart, EjectReason, Forge, ForgeError, Observation, PrNumber, Scheduler,
 };
-use dorfq_forge_github::api::{ApiError, RestClient};
+use dorfq_forge_github::api::{ApiError, Auth, RestClient};
+use dorfq_forge_github::app::AppKey;
 use dorfq_forge_github::{GitHubForge, Settings, system_clock};
 use dorfq_forge_mock::{MockForge, Scenario, ScenarioError};
 use dorfq_scheduler::SchedulerConfig;
 
-use crate::config::ForgeConfig;
+use crate::config::{AuthConfig, ForgeConfig};
 
 /// A provider that could not be built.
 #[derive(Debug)]
@@ -29,6 +30,11 @@ pub enum ProviderError {
     /// The environment variable that should hold the GitHub token is unset,
     /// empty or not UTF-8.
     MissingToken { var: String },
+    /// The GitHub App's private key file could not be read.
+    ReadPrivateKey { path: PathBuf, error: io::Error },
+    /// The GitHub App's private key file is not a usable key; the message
+    /// says why.
+    PrivateKey { path: PathBuf, message: String },
     /// The GitHub forge's startup checks failed.
     GitHub(ApiError),
 }
@@ -47,6 +53,16 @@ impl fmt::Display for ProviderError {
                 "environment variable {var}, which should hold the GitHub token, \
                  is unset, empty or not UTF-8"
             ),
+            ProviderError::ReadPrivateKey { path, error } => write!(
+                f,
+                "cannot read the GitHub App private key {}: {error}",
+                path.display()
+            ),
+            ProviderError::PrivateKey { path, message } => write!(
+                f,
+                "the GitHub App private key {} is not usable: {message}",
+                path.display()
+            ),
             ProviderError::GitHub(error) => write!(f, "cannot start the GitHub forge: {error}"),
         }
     }
@@ -58,6 +74,8 @@ impl Error for ProviderError {
             ProviderError::ReadScenario { error, .. } => Some(error),
             ProviderError::Scenario { error, .. } => Some(error),
             ProviderError::MissingToken { .. } => None,
+            ProviderError::ReadPrivateKey { error, .. } => Some(error),
+            ProviderError::PrivateKey { .. } => None,
             ProviderError::GitHub(error) => Some(error),
         }
     }
@@ -126,18 +144,11 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
             trunk,
             label,
             checks,
-            token_env,
+            auth,
         } => {
-            let token = match env::var(token_env) {
-                Ok(token) if !token.is_empty() => token,
-                _ => {
-                    return Err(ProviderError::MissingToken {
-                        var: token_env.clone(),
-                    });
-                }
-            };
+            let auth = github_auth(auth)?;
             let user_agent = format!("dorfq/{}", crate::version());
-            let client = RestClient::new(api_base, owner, repo, &token, &user_agent);
+            let client = RestClient::new(api_base, owner, repo, auth, &user_agent);
             let settings = Settings {
                 trunk: trunk.clone(),
                 label: label.clone(),
@@ -154,6 +165,34 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
                 forge: Box::new(forge),
                 has_scheduled_events: Box::new(|| false),
             })
+        }
+    }
+}
+
+/// Loads the credential the configuration names: the token from its
+/// environment variable, or the app's key from its file.
+fn github_auth(config: &AuthConfig) -> Result<Auth, ProviderError> {
+    match config {
+        AuthConfig::Token { env: var } => match env::var(var) {
+            Ok(token) if !token.is_empty() => Ok(Auth::Token(token)),
+            _ => Err(ProviderError::MissingToken { var: var.clone() }),
+        },
+        AuthConfig::App {
+            client_id,
+            private_key_file,
+        } => {
+            let pem = fs::read_to_string(private_key_file).map_err(|error| {
+                ProviderError::ReadPrivateKey {
+                    path: private_key_file.clone(),
+                    error,
+                }
+            })?;
+            let key =
+                AppKey::from_pem(client_id, &pem).map_err(|message| ProviderError::PrivateKey {
+                    path: private_key_file.clone(),
+                    message,
+                })?;
+            Ok(Auth::App(key))
         }
     }
 }
@@ -194,7 +233,9 @@ mod tests {
             trunk: "main".to_owned(),
             label: "queue".to_owned(),
             checks: vec!["check".to_owned()],
-            token_env: var.to_owned(),
+            auth: AuthConfig::Token {
+                env: var.to_owned(),
+            },
         };
         let error = forge(&config).err().unwrap();
         assert!(
@@ -202,6 +243,67 @@ mod tests {
             "{error:?}"
         );
         assert!(error.to_string().contains(var), "{error}");
+    }
+
+    /// A GitHub configuration under the app credential, against an address
+    /// nothing listens on: a request would fail as a GitHub error, not as a
+    /// key problem.
+    fn github_app(private_key_file: PathBuf) -> ForgeConfig {
+        ForgeConfig::GitHub {
+            api_base: "https://127.0.0.1:1".to_owned(),
+            owner: "alice".to_owned(),
+            repo: "widgets".to_owned(),
+            trunk: "main".to_owned(),
+            label: "queue".to_owned(),
+            checks: vec!["check".to_owned()],
+            auth: AuthConfig::App {
+                client_id: "Iv23liTEST".to_owned(),
+                private_key_file,
+            },
+        }
+    }
+
+    #[test]
+    fn github_app_with_missing_key_file_names_it_before_any_request() {
+        let path = test_tmpdir().join("no-such-app-key.pem");
+        let error = forge(&github_app(path.clone())).err().unwrap();
+        assert!(
+            matches!(error, ProviderError::ReadPrivateKey { .. }),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains(&path.display().to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn github_app_with_a_file_that_is_not_a_key_names_it_and_why() {
+        let path = test_tmpdir().join("not-a-key.pem");
+        fs::write(&path, "just some text\n").unwrap();
+        let error = forge(&github_app(path.clone())).err().unwrap();
+        assert!(
+            matches!(error, ProviderError::PrivateKey { .. }),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("not PEM"), "{message}");
+    }
+
+    #[test]
+    fn github_app_with_a_key_file_builds_the_app_credential() {
+        let path = test_tmpdir().join("app-key.pem");
+        fs::write(
+            &path,
+            include_str!("../../dorfq-forge-github/testdata/app-key.pkcs1.pem"),
+        )
+        .unwrap();
+        let auth = github_auth(&AuthConfig::App {
+            client_id: "Iv23liTEST".to_owned(),
+            private_key_file: path,
+        });
+        assert!(matches!(auth, Ok(Auth::App(_))));
     }
 
     fn test_tmpdir() -> PathBuf {

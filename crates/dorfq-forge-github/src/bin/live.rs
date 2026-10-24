@@ -2,8 +2,12 @@
 //! real, disposable GitHub repository and exits non-zero on the first failed
 //! assertion.
 //!
-//! Reads `DORFQ_GITHUB_TOKEN`, `DORFQ_LIVE_REPO` (`owner/name`) and
-//! optionally `DORFQ_LIVE_API_BASE` (default `https://api.github.com`).
+//! Runs under one of two credentials: a token in `DORFQ_GITHUB_TOKEN`, or a
+//! GitHub App, `DORFQ_GITHUB_APP_CLIENT_ID` with the path of its private key
+//! in `DORFQ_GITHUB_APP_KEY_FILE`; exactly one form must be set. Under the
+//! app it is the one place installation-token minting meets GitHub. Also
+//! reads `DORFQ_LIVE_REPO` (`owner/name`) and optionally
+//! `DORFQ_LIVE_API_BASE` (default `https://api.github.com`).
 //! Refuses, before any request, a repository whose name contains neither
 //! `scratch` nor `playground`. The repository it accepts is treated as disposable: every open
 //! labelled pull request is closed and every queue ref deleted, and trunk
@@ -11,6 +15,7 @@
 
 use std::env;
 use std::fmt::Display;
+use std::fs;
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,7 +24,8 @@ use dorfq_core::{
     BatchId, BatchStart, BatchState, CiStatus, ConflictWith, EjectReason, Forge, ForgeError,
     LandRefusal, Observation, PrNumber, PrStatus, Sha,
 };
-use dorfq_forge_github::api::{GitHubApi, RefUpdate, RestClient};
+use dorfq_forge_github::api::{Auth, GitHubApi, RefUpdate, RestClient};
+use dorfq_forge_github::app::AppKey;
 use dorfq_forge_github::messages::{Marker, last_marker};
 use dorfq_forge_github::{GitHubForge, Settings, system_clock};
 use serde_json::{Value, json};
@@ -50,7 +56,38 @@ struct Target {
     api_base: String,
     owner: String,
     repo: String,
-    token: String,
+    auth: Auth,
+}
+
+const TOKEN_VAR: &str = "DORFQ_GITHUB_TOKEN";
+const APP_CLIENT_ID_VAR: &str = "DORFQ_GITHUB_APP_CLIENT_ID";
+const APP_KEY_FILE_VAR: &str = "DORFQ_GITHUB_APP_KEY_FILE";
+
+/// Reads the one credential form the environment sets, and parses an app's
+/// key so a bad file fails before any request. `set` says whether a variable
+/// is present at all, empty or not; `required` reads a non-empty value.
+fn auth_from_env(
+    set: impl Fn(&str) -> bool,
+    required: impl Fn(&str) -> Result<String, String>,
+) -> Result<Auth, String> {
+    let token = set(TOKEN_VAR);
+    let app = set(APP_CLIENT_ID_VAR) || set(APP_KEY_FILE_VAR);
+    if token == app {
+        return Err(format!(
+            "set exactly one credential: {TOKEN_VAR}, or {APP_CLIENT_ID_VAR} together with \
+             {APP_KEY_FILE_VAR}"
+        ));
+    }
+    if token {
+        return Ok(Auth::Token(required(TOKEN_VAR)?));
+    }
+    let client_id = required(APP_CLIENT_ID_VAR)?;
+    let path = required(APP_KEY_FILE_VAR)?;
+    let pem = fs::read_to_string(&path)
+        .map_err(|error| format!("{APP_KEY_FILE_VAR}: cannot read {path}: {error}"))?;
+    let key = AppKey::from_pem(&client_id, &pem)
+        .map_err(|message| format!("{APP_KEY_FILE_VAR}: {path} is not a usable key: {message}"))?;
+    Ok(Auth::App(key))
 }
 
 impl Target {
@@ -59,7 +96,7 @@ impl Target {
             Ok(value) if !value.is_empty() => Ok(value),
             _ => Err(format!("{var} is unset, empty or not UTF-8")),
         };
-        let token = required("DORFQ_GITHUB_TOKEN")?;
+        let auth = auth_from_env(|var| env::var_os(var).is_some(), required)?;
         let full = required("DORFQ_LIVE_REPO")?;
         let (owner, repo) = match full.split_once('/') {
             Some((owner, repo)) if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') => {
@@ -82,7 +119,7 @@ impl Target {
             api_base,
             owner,
             repo,
-            token,
+            auth,
         })
     }
 
@@ -91,7 +128,7 @@ impl Target {
             &self.api_base,
             &self.owner,
             &self.repo,
-            &self.token,
+            self.auth.clone(),
             USER_AGENT,
         )
     }
@@ -570,4 +607,102 @@ fn run() -> Result<(), String> {
     }
     repo.clean(&format!("refs/heads/{prefix}-"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// `auth_from_env` over `vars` in place of the process environment.
+    fn auth(vars: &[(&str, &str)]) -> Result<Auth, String> {
+        let vars: BTreeMap<&str, &str> = vars.iter().copied().collect();
+        auth_from_env(
+            |var| vars.contains_key(var),
+            |var| match vars.get(var) {
+                Some(value) if !value.is_empty() => Ok((*value).to_owned()),
+                _ => Err(format!("{var} is unset, empty or not UTF-8")),
+            },
+        )
+    }
+
+    fn key_file(name: &str, contents: &str) -> String {
+        let path = PathBuf::from(env::var("TEST_TMPDIR").expect("TEST_TMPDIR under bazel test"))
+            .join(name);
+        fs::write(&path, contents).unwrap();
+        path.display().to_string()
+    }
+
+    /// The app key fixture at `name`; tests run in parallel, so each writes
+    /// its own copy.
+    fn app_key_file(name: &str) -> String {
+        key_file(name, include_str!("../../testdata/app-key.pkcs1.pem"))
+    }
+
+    #[test]
+    fn a_token_alone_is_the_token_credential() {
+        assert!(matches!(auth(&[(TOKEN_VAR, "t")]), Ok(Auth::Token(t)) if t == "t"));
+    }
+
+    #[test]
+    fn an_app_alone_is_the_app_credential() {
+        let path = app_key_file("app-alone.pem");
+        let auth = auth(&[(APP_CLIENT_ID_VAR, "Iv1.test"), (APP_KEY_FILE_VAR, &path)]);
+        assert!(matches!(auth, Ok(Auth::App(_))));
+    }
+
+    #[test]
+    fn both_or_neither_credential_is_refused_naming_all_three() {
+        let path = app_key_file("both-or-neither.pem");
+        let both = [
+            (TOKEN_VAR, "t"),
+            (APP_CLIENT_ID_VAR, "Iv1.test"),
+            (APP_KEY_FILE_VAR, path.as_str()),
+        ];
+        // A present but empty variable counts as set.
+        let empty_token = [
+            (TOKEN_VAR, ""),
+            (APP_CLIENT_ID_VAR, "Iv1.test"),
+            (APP_KEY_FILE_VAR, path.as_str()),
+        ];
+        for vars in [&both[..], &empty_token[..], &[]] {
+            let Err(error) = auth(vars) else {
+                panic!("accepted {vars:?}");
+            };
+            for var in [TOKEN_VAR, APP_CLIENT_ID_VAR, APP_KEY_FILE_VAR] {
+                assert!(error.contains(var), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn half_an_app_credential_names_the_missing_variable() {
+        let path = app_key_file("half-an-app.pem");
+        let Err(error) = auth(&[(APP_KEY_FILE_VAR, &path)]) else {
+            panic!("accepted a key file without a client id");
+        };
+        assert!(error.contains(APP_CLIENT_ID_VAR), "{error}");
+        let Err(error) = auth(&[(APP_CLIENT_ID_VAR, "Iv1.test")]) else {
+            panic!("accepted a client id without a key file");
+        };
+        assert!(error.contains(APP_KEY_FILE_VAR), "{error}");
+    }
+
+    #[test]
+    fn an_unreadable_or_unusable_key_file_is_named() {
+        let missing = key_file("unused.pem", "");
+        fs::remove_file(&missing).unwrap();
+        let not_a_key = key_file("not-a-key.pem", "just some text\n");
+        for (path, why) in [(missing, "cannot read"), (not_a_key, "not PEM")] {
+            let Err(error) = auth(&[(APP_CLIENT_ID_VAR, "Iv1.test"), (APP_KEY_FILE_VAR, &path)])
+            else {
+                panic!("accepted {path}");
+            };
+            assert!(error.contains(APP_KEY_FILE_VAR), "{error}");
+            assert!(error.contains(&path), "{error}");
+            assert!(error.contains(why), "{error}");
+        }
+    }
 }

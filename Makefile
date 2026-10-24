@@ -25,7 +25,8 @@ help:
 	@echo "  make build         build every target"
 	@echo "  make test          run every test, without the lint aspects"
 	@echo "  make run           run the dorfq binary (ARGS=... for arguments)"
-	@echo "  make live-test     run the GitHub forge against a disposable repository (DORFQ_GITHUB_TOKEN, DORFQ_LIVE_REPO)"
+	@echo "  make live-test     run the GitHub forge against a disposable repository (DORFQ_LIVE_REPO, and DORFQ_GITHUB_TOKEN"
+	@echo "                     or DORFQ_GITHUB_APP_CLIENT_ID with DORFQ_GITHUB_APP_KEY_FILE)"
 	@echo "  make optimised     build the dorfq binary optimised"
 	@echo "  make release VERSION=X.Y.Z"
 	@echo "                     cut a release: gather changelog.d and todo.d, bump the crate version, repin"
@@ -72,7 +73,8 @@ run:
 
 # The live lane: the GitHub forge against a real, disposable repository whose
 # name contains "scratch" or "playground". Not part of `check`: it needs the network and a
-# token, which `bazel run` leaves to the operator's environment.
+# credential (a token, or a GitHub App's client id and the absolute path of its key),
+# which `bazel run` leaves to the operator's environment.
 .PHONY: live-test
 live-test:
 	bazel run //crates/dorfq-forge-github:live

@@ -6,6 +6,14 @@
 # then `systemctl --user enable --now dorfq`. To keep it running while logged
 # out: `loginctl enable-linger`.
 #
+# As a GitHub App instead of a token: drop the EnvironmentFile= line, keep
+#   ~/.config/dorfq/app-key.pem         the app's private key, mode 0600
+# and set in the configuration
+#   [forge.auth]
+#   kind = "app"
+#   client_id = "<the app's Client ID>"
+#   private_key_file = "app-key.pem"    # beside the configuration
+#
 # dorfq exits only on a Permanent error, which a restart does not cure; the
 # delay keeps a restart loop slow while the cause is found.
 

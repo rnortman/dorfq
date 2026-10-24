@@ -202,7 +202,9 @@ version = "0.0.0"
 name = "dorfq-forge-github"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "dorfq-core",
+ "ring",
  "serde",
  "serde_json",
  "ureq",
