@@ -3,7 +3,9 @@ use std::collections::BTreeSet;
 use std::io;
 use std::rc::Rc;
 
-use dorfq_core::ledger::Violation;
+use dorfq_core::ledger::{Malformed, Violation};
+
+use dorfq_core::Departure;
 
 use super::*;
 
@@ -38,12 +40,12 @@ fn prs(numbers: &[u64]) -> Vec<PrNumber> {
     numbers.iter().copied().map(PrNumber).collect()
 }
 
+const CONFLICTS_WITH_TRUNK: EjectReason = EjectReason::Conflicts {
+    with: ConflictWith::Trunk,
+};
+
 fn start(id: u64, base: &Sha, members: &[u64]) -> BatchStart {
-    BatchStart {
-        id: BatchId(id),
-        base: base.clone(),
-        prs: prs(members),
-    }
+    BatchStart::new(BatchId(id), base.clone(), prs(members))
 }
 
 fn numbers(observation: &Observation) -> Vec<u64> {
@@ -129,7 +131,7 @@ fn observations_are_sorted() {
 }
 
 #[test]
-fn snapshots_report_mergeability_and_own_ci() {
+fn snapshots_map_mergeability_and_own_ci_to_status() {
     let (mut forge, _) = forge(
         r#"
         ci_ticks = 1
@@ -140,13 +142,21 @@ fn snapshots_report_mergeability_and_own_ci() {
         [[pr]]
         number = 2
         own_ci = "failed"
+        [[pr]]
+        number = 3
         "#,
     );
     let observation = forge.observe().unwrap();
-    assert_eq!(observation.prs[0].mergeable, Mergeable::Conflicting);
-    assert_eq!(observation.prs[0].head_ci, CiStatus::Pending);
-    assert_eq!(observation.prs[1].mergeable, Mergeable::Clean);
-    assert_eq!(observation.prs[1].head_ci, CiStatus::Failed);
+    let statuses: Vec<&PrStatus> = observation.prs.iter().map(|p| &p.status).collect();
+    assert_eq!(
+        statuses,
+        [
+            &PrStatus::Conflicting(ConflictWith::Trunk),
+            &PrStatus::Waiting(BTreeSet::from([Hold::OwnCiFailed])),
+            &PrStatus::Ready,
+        ]
+    );
+    assert!(observation.prs.iter().all(|p| p.base == PrBase::Trunk));
 }
 
 #[test]
@@ -158,19 +168,54 @@ fn arrives_at_delays_appearance() {
 }
 
 #[test]
-fn build_conflicts_with_trunk() {
-    let (mut forge, _) =
-        forge("ci_ticks = 1\n[[pr]]\nnumber = 1\n[[pr]]\nnumber = 2\nmergeable = false\n");
+fn start_rejects_a_member_that_is_not_ready() {
+    let (mut forge, _) = forge(
+        "ci_ticks = 1\n[[pr]]\nnumber = 1\n[[pr]]\nnumber = 2\nmergeable = false\n\
+         [[pr]]\nnumber = 3\nown_ci = \"pending\"\n",
+    );
     let observation = forge.observe().unwrap();
-    forge
-        .start_batch(&start(1, &observation.trunk, &[1, 2]))
-        .unwrap();
+    for n in [2, 3] {
+        assert_eq!(
+            violation_of(forge.start_batch(&start(1, &observation.trunk, &[1, n]))),
+            Violation::MemberNotReady {
+                batch: BatchId(1),
+                pr: PrNumber(n)
+            },
+            "{n}"
+        );
+    }
+}
+
+#[test]
+fn a_held_pull_request_is_told_what_holds_it() {
+    let (mut forge, buffer) = forge(
+        "ci_ticks = 1\n[[pr]]\nnumber = 1\nown_ci = \"failed\"\n[[pr]]\nnumber = 2\n\
+         mergeable = false\nown_ci = \"pending\"\n",
+    );
+    forge.observe().unwrap();
+    forge.observe().unwrap();
     assert_eq!(
-        state(&forge.observe().unwrap(), 1),
-        BatchState::Conflict {
-            pr: PrNumber(2),
-            with: ConflictWith::Trunk
-        }
+        forge.messages(),
+        [
+            Message {
+                pr: PrNumber(1),
+                event: Event::Queued
+            },
+            Message {
+                pr: PrNumber(1),
+                event: Event::Held {
+                    holds: BTreeSet::from([Hold::OwnCiFailed])
+                }
+            },
+            Message {
+                pr: PrNumber(2),
+                event: Event::Queued
+            },
+        ]
+    );
+    assert_eq!(
+        buffer.text(),
+        "message to pr 1: queued\nmessage to pr 1: held: own CI failed\nmessage to pr 2: queued\n"
     );
 }
 
@@ -238,6 +283,13 @@ fn zero_ci_ticks_decides_at_start() {
 }
 
 #[test]
+fn now_is_the_tick_the_world_moved_at() {
+    let (mut mock, _) = forge("ci_ticks = 1\n[[pr]]\nnumber = 1\n");
+    let nows: Vec<Timestamp> = (0..3).map(|_| mock.observe().unwrap().now).collect();
+    assert_eq!(nows, [Timestamp(0), Timestamp(1), Timestamp(2)]);
+}
+
+#[test]
 fn a_bad_member_fails_the_batch() {
     let (_, observation) = decided(
         "ci_ticks = 2\n[[pr]]\nnumber = 1\n[[pr]]\nnumber = 2\nbad = true\n",
@@ -246,7 +298,7 @@ fn a_bad_member_fails_the_batch() {
     assert!(matches!(
         state(&observation, 1),
         BatchState::Testing {
-            ci: CiStatus::Failed,
+            ci: CiStatus::Failed(_),
             ..
         }
     ));
@@ -259,7 +311,7 @@ fn a_breaks_with_pair_fails_the_batch_and_either_alone_passes() {
     assert!(matches!(
         state(&both, 1),
         BatchState::Testing {
-            ci: CiStatus::Failed,
+            ci: CiStatus::Failed(_),
             ..
         }
     ));
@@ -273,6 +325,65 @@ fn a_breaks_with_pair_fails_the_batch_and_either_alone_passes() {
             }
         ));
     }
+}
+
+#[test]
+fn a_probe_tests_its_base_on_a_tip_of_its_own_and_passes() {
+    let (mut forge, observation) = decided(THREE, &[]);
+    let probe = &observation.batches[0];
+    assert!(probe.members.is_empty());
+    let BatchState::Testing { tip, ci } = &probe.state else {
+        panic!("a probe is testing: {probe:?}");
+    };
+    assert_ne!(tip, &probe.base);
+    assert_eq!(probe.base, observation.trunk);
+    assert_eq!(ci, &CiStatus::Passed);
+    assert!(forge.messages().iter().all(|m| m.event == Event::Queued));
+    forge.retire(BatchId(1)).unwrap();
+    assert!(forge.observe().unwrap().batches.is_empty());
+}
+
+#[test]
+fn trunk_broken_fails_every_probe_and_every_batch() {
+    let broken = format!("trunk_broken = true\n{THREE}");
+    let (_, observation) = decided(&broken, &[]);
+    assert!(matches!(
+        state(&observation, 1),
+        BatchState::Testing {
+            ci: CiStatus::Failed(_),
+            ..
+        }
+    ));
+    let (_, observation) = decided(&broken, &[1]);
+    assert!(matches!(
+        state(&observation, 1),
+        BatchState::Testing {
+            ci: CiStatus::Failed(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn land_on_a_passed_probe_is_permanent() {
+    let (mut forge, observation) = decided(THREE, &[]);
+    let trunk = observation.trunk.clone();
+    assert_eq!(
+        violation_of(forge.land(BatchId(1))),
+        Violation::ProbeLanded { batch: BatchId(1) }
+    );
+    assert_eq!(forge.observe().unwrap().trunk, trunk);
+}
+
+#[test]
+fn a_batch_on_a_probe_tip_builds_on_it() {
+    let (mut forge, observation) = decided(THREE, &[]);
+    let BatchState::Testing { tip, .. } = state(&observation, 1) else {
+        panic!("a probe is testing");
+    };
+    forge.start_batch(&start(2, &tip, &[1])).unwrap();
+    let observation = forge.observe().unwrap();
+    assert_eq!(observation.batches[1].base, tip);
 }
 
 #[test]
@@ -338,6 +449,47 @@ fn land_after_trunk_moved_is_refused() {
         }
     );
     assert_eq!(numbers(&observation), [2, 3]);
+}
+
+#[test]
+fn departed_says_how_each_pull_request_left() {
+    // 1 and 2 land in batch 1, 3 is ejected, 4 withdraws at tick 2.
+    let (mut forge, _) = forge(
+        "ci_ticks = 0\n[[pr]]\nnumber = 1\n[[pr]]\nnumber = 2\n[[pr]]\nnumber = 3\n\
+         [[pr]]\nnumber = 4\ndequeue_at = 2\n",
+    );
+    let first = forge.observe().unwrap();
+    assert!(first.departed.is_empty());
+    let heads: Vec<Sha> = first.prs.iter().map(|p| p.head.clone()).collect();
+    forge.start_batch(&start(1, &first.trunk, &[1, 2])).unwrap();
+    let second = forge.observe().unwrap();
+    assert!(second.departed.is_empty());
+    forge.land(BatchId(1)).unwrap();
+    forge.eject(PrNumber(3), &CONFLICTS_WITH_TRUNK).unwrap();
+    let third = forge.observe().unwrap();
+    assert!(third.prs.is_empty());
+    assert_eq!(
+        third.departed,
+        [
+            Departure::new(
+                PrNumber(1),
+                heads[0].clone(),
+                Departed::Landed { batch: BatchId(1) }
+            ),
+            Departure::new(
+                PrNumber(2),
+                heads[1].clone(),
+                Departed::Landed { batch: BatchId(1) }
+            ),
+            Departure::new(PrNumber(3), heads[2].clone(), Departed::Ejected),
+            Departure::new(
+                PrNumber(4),
+                heads[3].clone(),
+                Departed::Withdrawn(Withdrawal::IntentCleared)
+            ),
+        ]
+    );
+    assert!(forge.observe().unwrap().departed.is_empty());
 }
 
 #[test]
@@ -427,7 +579,12 @@ fn eject_removes_and_tells_the_reason() {
         .eject(PrNumber(2), &EjectReason::BatchFailed { batch: BatchId(4) })
         .unwrap();
     forge
-        .eject(PrNumber(3), &EjectReason::ConflictsWith { pr: PrNumber(1) })
+        .eject(
+            PrNumber(3),
+            &EjectReason::Conflicts {
+                with: ConflictWith::Pr(PrNumber(1)),
+            },
+        )
         .unwrap();
     assert_eq!(numbers(&forge.observe().unwrap()), [1]);
     assert_eq!(
@@ -442,7 +599,9 @@ fn eject_removes_and_tells_the_reason() {
             Message {
                 pr: PrNumber(3),
                 event: Event::Ejected {
-                    reason: EjectReason::ConflictsWith { pr: PrNumber(1) }
+                    reason: EjectReason::Conflicts {
+                        with: ConflictWith::Pr(PrNumber(1)),
+                    }
                 }
             }
         ]
@@ -453,7 +612,7 @@ fn eject_removes_and_tells_the_reason() {
         "{text}"
     );
     assert!(
-        text.contains("message to pr 3: ejected: conflicts with pr 1\n"),
+        text.contains("message to pr 3: ejected: conflicts with #1\n"),
         "{text}"
     );
 }
@@ -500,9 +659,7 @@ fn messages_follow_a_pull_request_through_the_queue() {
 fn no_withdrawal_message_after_leaving_the_queue() {
     let (mut forge, _) = forge("ci_ticks = 1\n[[pr]]\nnumber = 1\ndequeue_at = 1\n");
     forge.observe().unwrap();
-    forge
-        .eject(PrNumber(1), &EjectReason::ConflictsWithTrunk)
-        .unwrap();
+    forge.eject(PrNumber(1), &CONFLICTS_WITH_TRUNK).unwrap();
     forge.observe().unwrap();
     assert!(!forge.messages().iter().any(|m| m.event == Event::Withdrawn));
 }
@@ -533,10 +690,6 @@ fn rule_5_violations_are_permanent() {
         Violation::BatchIdInUse { batch: BatchId(1) }
     );
     assert_eq!(
-        violation_of(forge.start_batch(&start(2, &trunk, &[]))),
-        Violation::EmptyBatch { batch: BatchId(2) }
-    );
-    assert_eq!(
         violation_of(forge.start_batch(&start(2, &trunk, &[2, 3, 2]))),
         Violation::DuplicateMember {
             batch: BatchId(2),
@@ -550,9 +703,7 @@ fn rule_5_violations_are_permanent() {
             pr: PrNumber(9)
         }
     );
-    forge
-        .eject(PrNumber(3), &EjectReason::ConflictsWithTrunk)
-        .unwrap();
+    forge.eject(PrNumber(3), &CONFLICTS_WITH_TRUNK).unwrap();
     assert_eq!(
         violation_of(forge.start_batch(&start(2, &trunk, &[2, 3]))),
         Violation::MemberNotKnown {
@@ -589,7 +740,7 @@ fn rule_6_violations_are_permanent() {
         }
     );
     assert_eq!(
-        violation_of(forge.eject(PrNumber(9), &EjectReason::ConflictsWithTrunk)),
+        violation_of(forge.eject(PrNumber(9), &CONFLICTS_WITH_TRUNK)),
         Violation::UnknownPr { pr: PrNumber(9) }
     );
     forge
@@ -615,12 +766,17 @@ fn rule_6_violations_are_permanent() {
         Violation::LandedTwice { batch: BatchId(1) }
     );
     assert_eq!(
-        violation_of(forge.eject(PrNumber(1), &EjectReason::ConflictsWithTrunk)),
+        violation_of(forge.eject(PrNumber(1), &CONFLICTS_WITH_TRUNK)),
         Violation::LandedInPlan {
             effect: "eject",
             pr: PrNumber(1)
         }
     );
+    assert_eq!(
+        violation_of(forge.retire(BatchId(1))),
+        Violation::RetiredInPlan { batch: BatchId(1) }
+    );
+    forge.observe().unwrap();
     forge.retire(BatchId(1)).unwrap();
     assert_eq!(
         violation_of(forge.retire(BatchId(1))),
@@ -628,6 +784,32 @@ fn rule_6_violations_are_permanent() {
             effect: "retire",
             batch: BatchId(1)
         }
+    );
+}
+
+#[test]
+fn a_malformed_observation_is_permanent() {
+    let (mut forge, _) = decided(THREE, &[1]);
+    let mut status = forge.batches[&BatchId(1)].status.clone();
+    status.id = BatchId(2);
+    let verdict = forge.batches[&BatchId(1)].verdict.clone();
+    forge.batches.insert(
+        BatchId(2),
+        MockBatch {
+            status,
+            verdict,
+            remaining: 0,
+        },
+    );
+    let Err(ForgeError::Permanent(cause)) = forge.observe() else {
+        panic!("expected a permanent error");
+    };
+    assert_eq!(
+        cause.downcast_ref::<Malformed>(),
+        Some(&Malformed::DuplicateTip {
+            batch: BatchId(2),
+            other: BatchId(1)
+        })
     );
 }
 
@@ -666,7 +848,7 @@ fn a_plan_neither_builds_on_nor_ejects_what_it_lands() {
         landed_in_plan("start_batch", 2)
     );
     assert_eq!(
-        violation_of(moved.eject(PrNumber(2), &EjectReason::ConflictsWithTrunk)),
+        violation_of(moved.eject(PrNumber(2), &CONFLICTS_WITH_TRUNK)),
         landed_in_plan("eject", 2)
     );
 
@@ -700,7 +882,7 @@ fn land_on_a_batch_that_did_not_pass_is_permanent() {
         state(&observation, 1),
         BatchState::Testing {
             tip: commit(3),
-            ci: CiStatus::Failed
+            ci: CiStatus::Failed(Failure::new(BTreeSet::new()))
         }
     );
     assert_eq!(
@@ -708,10 +890,11 @@ fn land_on_a_batch_that_did_not_pass_is_permanent() {
         Violation::NotPassed { batch: BatchId(1) }
     );
 
-    let (mut conflicted, _) = forge("ci_ticks = 1\n[[pr]]\nnumber = 1\nmergeable = false\n");
+    let (mut conflicted, _) =
+        forge("ci_ticks = 1\n[[pr]]\nnumber = 1\n[[pr]]\nnumber = 2\nconflicts_with = [1]\n");
     let first = conflicted.observe().unwrap();
     conflicted
-        .start_batch(&start(1, &first.trunk, &[1]))
+        .start_batch(&start(1, &first.trunk, &[1, 2]))
         .unwrap();
     assert!(matches!(
         state(&conflicted.observe().unwrap(), 1),
@@ -777,11 +960,9 @@ fn a_message_that_cannot_be_written_is_permanent() {
 fn ejecting_the_same_pull_request_twice_after_one_observation_is_permanent() {
     let (mut forge, _) = forge(THREE);
     forge.observe().unwrap();
-    forge
-        .eject(PrNumber(2), &EjectReason::ConflictsWithTrunk)
-        .unwrap();
+    forge.eject(PrNumber(2), &CONFLICTS_WITH_TRUNK).unwrap();
     assert_eq!(
-        violation_of(forge.eject(PrNumber(2), &EjectReason::ConflictsWithTrunk)),
+        violation_of(forge.eject(PrNumber(2), &CONFLICTS_WITH_TRUNK)),
         Violation::UnknownPr { pr: PrNumber(2) }
     );
 }
@@ -808,5 +989,133 @@ fn violations_say_what_was_wrong() {
     assert_eq!(
         unknown,
         "start_batch: batch 2 names pr 4, which is not known"
+    );
+}
+
+/// 1 on trunk; 2 on 1; 3 on 2, atomic; 4 on 1, conflicting with it.
+const STACK: &str = "ci_ticks = 0\n[[pr]]\nnumber = 1\n[[pr]]\nnumber = 2\nbase = 1\n\
+     [[pr]]\nnumber = 3\nbase = 2\natomic = true\n[[pr]]\nnumber = 4\nbase = 1\nmergeable = false\n";
+
+#[test]
+fn stacked_pull_requests_are_reported_on_their_bases() {
+    let (mut forge, _) = forge(STACK);
+    let observation = forge.observe().unwrap();
+    let bases: Vec<PrBase> = observation.prs.iter().map(|p| p.base).collect();
+    assert_eq!(
+        bases,
+        [
+            PrBase::Trunk,
+            PrBase::Pr(PrNumber(1)),
+            PrBase::Pr(PrNumber(2)),
+            PrBase::Pr(PrNumber(1))
+        ]
+    );
+    let stacks: Vec<StackPolicy> = observation.prs.iter().map(|p| p.stack).collect();
+    assert_eq!(
+        stacks,
+        [
+            StackPolicy::Splittable,
+            StackPolicy::Splittable,
+            StackPolicy::Atomic,
+            StackPolicy::Splittable
+        ]
+    );
+    assert_eq!(
+        observation.prs[3].status,
+        PrStatus::Conflicting(ConflictWith::Pr(PrNumber(1)))
+    );
+}
+
+#[test]
+fn a_child_of_a_base_that_left_departs_blocked_and_is_told() {
+    // 1 withdraws at tick 2, taking 2 and 4 with it, and 3 with 2; 5 waits
+    // unreported until its base 6 arrives at tick 2.
+    let (mut forge, buffer) = forge(
+        "ci_ticks = 0\n[[pr]]\nnumber = 1\ndequeue_at = 2\n[[pr]]\nnumber = 2\nbase = 1\n\
+         [[pr]]\nnumber = 3\nbase = 2\n[[pr]]\nnumber = 4\nbase = 1\n\
+         [[pr]]\nnumber = 5\nbase = 6\n[[pr]]\nnumber = 6\narrives_at = 2\n",
+    );
+    let first = forge.observe().unwrap();
+    assert_eq!(numbers(&first), [1, 2, 3, 4]);
+    forge.observe().unwrap();
+    let third = forge.observe().unwrap();
+    assert_eq!(numbers(&third), [5, 6]);
+    let how: Vec<(u64, Departed)> = third
+        .departed
+        .iter()
+        .map(|d| (d.pr.0, d.how.clone()))
+        .collect();
+    let blocked = |on| Departed::Withdrawn(Withdrawal::Blocked { on: PrNumber(on) });
+    assert_eq!(
+        how,
+        [
+            (1, Departed::Withdrawn(Withdrawal::IntentCleared)),
+            (2, blocked(1)),
+            (3, blocked(2)),
+            (4, blocked(1)),
+        ]
+    );
+    let text = buffer.text();
+    for line in [
+        "message to pr 2: blocked on #1",
+        "message to pr 3: blocked on #2",
+        "message to pr 4: blocked on #1",
+    ] {
+        assert!(text.contains(line), "{text}");
+    }
+    assert!(!text.contains("message to pr 5: blocked"), "{text}");
+}
+
+#[test]
+fn a_child_is_on_trunk_from_the_snapshot_that_reports_its_parent_landed() {
+    let (mut forge, _) = forge(STACK);
+    let first = forge.observe().unwrap();
+    forge
+        .start_batch(&start(1, &first.trunk, &[1, 2, 3]))
+        .unwrap();
+    forge.observe().unwrap();
+    forge.land(BatchId(1)).unwrap();
+    let landed = forge.observe().unwrap();
+    assert!(matches!(state(&landed, 1), BatchState::Landed { .. }));
+    assert_eq!(numbers(&landed), [4]);
+    assert_eq!(landed.prs[0].base, PrBase::Trunk);
+    assert_eq!(
+        landed.prs[0].status,
+        PrStatus::Conflicting(ConflictWith::Trunk)
+    );
+}
+
+#[test]
+fn start_rejects_a_child_without_its_parent() {
+    let (mut forge, _) = forge(STACK);
+    let first = forge.observe().unwrap();
+    assert_eq!(
+        violation_of(forge.start_batch(&start(1, &first.trunk, &[2, 1]))),
+        Violation::BaseNotInBatch {
+            batch: BatchId(1),
+            pr: PrNumber(2),
+            base: PrNumber(1)
+        }
+    );
+    forge.start_batch(&start(1, &first.trunk, &[1])).unwrap();
+    let second = forge.observe().unwrap();
+    let BatchState::Testing { tip, .. } = state(&second, 1) else {
+        panic!("batch should be testing");
+    };
+    forge.start_batch(&start(2, &tip, &[2])).unwrap();
+}
+
+#[test]
+fn landing_a_parent_without_its_atomic_tip_is_permanent() {
+    let (mut forge, _) = forge(STACK);
+    let first = forge.observe().unwrap();
+    forge.start_batch(&start(1, &first.trunk, &[1, 2])).unwrap();
+    forge.observe().unwrap();
+    assert_eq!(
+        violation_of(forge.land(BatchId(1))),
+        Violation::SplitsAtomicStack {
+            batch: BatchId(1),
+            pr: PrNumber(3)
+        }
     );
 }

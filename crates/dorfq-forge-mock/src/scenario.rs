@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use dorfq_core::{CiStatus, PrNumber};
+use dorfq_core::PrNumber;
 use serde::Deserialize;
 
 /// A validated scenario.
@@ -13,6 +13,9 @@ use serde::Deserialize;
 pub struct Scenario {
     /// Observations between a batch's start and its CI verdict.
     pub(crate) ci_ticks: u64,
+    /// Whether trunk's own tree fails CI, so that every batch and every
+    /// probe fails.
+    pub(crate) trunk_broken: bool,
     /// Every pull request, by number.
     pub(crate) prs: BTreeMap<PrNumber, PrSpec>,
 }
@@ -21,8 +24,12 @@ pub struct Scenario {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PrSpec {
     pub(crate) arrives_at: u64,
+    /// The pull request it is based on; `None` for trunk.
+    pub(crate) base: Option<PrNumber>,
+    /// Whether it and its ancestors land together or not at all.
+    pub(crate) atomic: bool,
     pub(crate) mergeable: bool,
-    pub(crate) own_ci: CiStatus,
+    pub(crate) own_ci: OwnCi,
     pub(crate) bad: bool,
     pub(crate) breaks_with: BTreeSet<PrNumber>,
     pub(crate) conflicts_with: BTreeSet<PrNumber>,
@@ -34,6 +41,8 @@ pub(crate) struct PrSpec {
 #[serde(deny_unknown_fields)]
 struct RawScenario {
     ci_ticks: u64,
+    #[serde(default)]
+    trunk_broken: bool,
     #[serde(default, rename = "pr")]
     prs: Vec<RawPr>,
 }
@@ -44,6 +53,9 @@ struct RawPr {
     number: u64,
     #[serde(default)]
     arrives_at: u64,
+    base: Option<u64>,
+    #[serde(default)]
+    atomic: bool,
     #[serde(default = "yes")]
     mergeable: bool,
     #[serde(default)]
@@ -62,23 +74,14 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Deserialize, Default, Clone, Copy)]
+/// The state of a pull request's own checks on its head.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-enum OwnCi {
+pub(crate) enum OwnCi {
     Pending,
     #[default]
     Passed,
     Failed,
-}
-
-impl From<OwnCi> for CiStatus {
-    fn from(own: OwnCi) -> CiStatus {
-        match own {
-            OwnCi::Pending => CiStatus::Pending,
-            OwnCi::Passed => CiStatus::Passed,
-            OwnCi::Failed => CiStatus::Failed,
-        }
-    }
 }
 
 /// A scenario file that does not describe a scenario.
@@ -99,6 +102,8 @@ pub enum ScenarioError {
     SelfReference { pr: u64, field: &'static str },
     /// `field` of `pr` fires at or before the tick the pull request arrives.
     NotAfterArrival { pr: u64, field: &'static str },
+    /// Following `base` from `pr` leads back to it.
+    BaseCycle { pr: u64 },
 }
 
 impl fmt::Display for ScenarioError {
@@ -121,6 +126,10 @@ impl fmt::Display for ScenarioError {
             ScenarioError::NotAfterArrival { pr, field } => write!(
                 f,
                 "invalid scenario: pull request {pr}: `{field}` must be later than `arrives_at`"
+            ),
+            ScenarioError::BaseCycle { pr } => write!(
+                f,
+                "invalid scenario: pull request {pr}: following `base` leads back to it"
             ),
         }
     }
@@ -152,6 +161,7 @@ impl Scenario {
                 }
             }
             for (field, targets) in [
+                ("base", &pr.base.into_iter().collect::<Vec<u64>>()),
                 ("breaks_with", &pr.breaks_with),
                 ("conflicts_with", &pr.conflicts_with),
             ] {
@@ -175,8 +185,10 @@ impl Scenario {
                 PrNumber(pr.number),
                 PrSpec {
                     arrives_at: pr.arrives_at,
+                    base: pr.base.map(PrNumber),
+                    atomic: pr.atomic,
                     mergeable: pr.mergeable,
-                    own_ci: pr.own_ci.into(),
+                    own_ci: pr.own_ci,
                     bad: pr.bad,
                     breaks_with: BTreeSet::new(),
                     conflicts_with: BTreeSet::new(),
@@ -184,6 +196,18 @@ impl Scenario {
                     dequeue_at: pr.dequeue_at,
                 },
             );
+        }
+
+        for (&number, spec) in &prs {
+            let mut at = spec.base;
+            let mut steps = 0;
+            while let Some(base) = at {
+                if base == number || steps > prs.len() {
+                    return Err(ScenarioError::BaseCycle { pr: number.0 });
+                }
+                steps += 1;
+                at = prs[&base].base;
+            }
         }
 
         for pr in raw.prs {
@@ -198,6 +222,7 @@ impl Scenario {
 
         Ok(Scenario {
             ci_ticks: raw.ci_ticks,
+            trunk_broken: raw.trunk_broken,
             prs,
         })
     }
@@ -236,12 +261,15 @@ mod tests {
     fn defaults_apply() {
         let scenario = Scenario::from_toml("ci_ticks = 2\n[[pr]]\nnumber = 1\n").unwrap();
         assert_eq!(scenario.ci_ticks, 2);
+        assert!(!scenario.trunk_broken);
         assert_eq!(
             scenario.prs[&PrNumber(1)],
             PrSpec {
                 arrives_at: 0,
+                base: None,
+                atomic: false,
                 mergeable: true,
-                own_ci: CiStatus::Passed,
+                own_ci: OwnCi::Passed,
                 bad: false,
                 breaks_with: BTreeSet::new(),
                 conflicts_with: BTreeSet::new(),
@@ -256,9 +284,12 @@ mod tests {
         let scenario = Scenario::from_toml(
             r#"
             ci_ticks = 3
+            trunk_broken = true
             [[pr]]
             number = 1
             arrives_at = 2
+            base = 3
+            atomic = true
             mergeable = false
             own_ci = "failed"
             bad = true
@@ -274,16 +305,19 @@ mod tests {
             "#,
         )
         .unwrap();
+        assert!(scenario.trunk_broken);
         let one = &scenario.prs[&PrNumber(1)];
         assert_eq!(one.arrives_at, 2);
+        assert_eq!(one.base, Some(PrNumber(3)));
+        assert!(one.atomic);
         assert!(!one.mergeable);
-        assert_eq!(one.own_ci, CiStatus::Failed);
+        assert_eq!(one.own_ci, OwnCi::Failed);
         assert!(one.bad);
         assert_eq!(one.repush_at, Some(4));
         assert_eq!(one.dequeue_at, Some(5));
         assert_eq!(one.breaks_with, BTreeSet::from([PrNumber(2)]));
         assert_eq!(one.conflicts_with, BTreeSet::from([PrNumber(3)]));
-        assert_eq!(scenario.prs[&PrNumber(2)].own_ci, CiStatus::Pending);
+        assert_eq!(scenario.prs[&PrNumber(2)].own_ci, OwnCi::Pending);
         assert_eq!(
             scenario.prs[&PrNumber(2)].breaks_with,
             BTreeSet::from([PrNumber(1)])
@@ -351,6 +385,33 @@ mod tests {
                 target: 9
             }
         );
+    }
+
+    #[test]
+    fn a_base_outside_the_scenario_or_on_itself_is_rejected() {
+        assert_eq!(
+            parse_err("ci_ticks = 1\n[[pr]]\nnumber = 1\nbase = 9\n"),
+            ScenarioError::UnknownReference {
+                pr: 1,
+                field: "base",
+                target: 9
+            }
+        );
+        assert_eq!(
+            parse_err("ci_ticks = 1\n[[pr]]\nnumber = 1\nbase = 1\n"),
+            ScenarioError::SelfReference {
+                pr: 1,
+                field: "base"
+            }
+        );
+    }
+
+    #[test]
+    fn a_cycle_of_bases_is_rejected() {
+        let text = "ci_ticks = 1\n[[pr]]\nnumber = 1\nbase = 3\n[[pr]]\nnumber = 2\nbase = 1\n[[pr]]\nnumber = 3\nbase = 2\n[[pr]]\nnumber = 4\nbase = 1\n";
+        assert_eq!(parse_err(text), ScenarioError::BaseCycle { pr: 1 });
+        let message = ScenarioError::BaseCycle { pr: 1 }.to_string();
+        assert!(message.contains("base"), "{message}");
     }
 
     #[test]

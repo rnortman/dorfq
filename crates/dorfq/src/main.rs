@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use dorfq::config::Config;
-use dorfq::driver::Driver;
+use dorfq::driver::{Driver, DriverError};
 use dorfq::providers;
 use dorfq_core::ForgeError;
 
@@ -67,8 +67,12 @@ fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
                     return ExitCode::SUCCESS;
                 }
             }
-            Err(error @ ForgeError::Transient(_)) => eprintln!("dorfq: {error}; retrying"),
-            Err(error @ ForgeError::Permanent(_)) => {
+            Err(DriverError::Forge(error @ ForgeError::Transient(_))) => {
+                eprintln!("dorfq: {error}; retrying")
+            }
+            Err(
+                error @ (DriverError::Forge(ForgeError::Permanent(_)) | DriverError::Scheduler(_)),
+            ) => {
                 eprintln!("dorfq: {error}");
                 return ExitCode::FAILURE;
             }

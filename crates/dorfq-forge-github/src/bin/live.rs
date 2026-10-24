@@ -17,11 +17,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dorfq_core::{
     BatchId, BatchStart, BatchState, CiStatus, ConflictWith, EjectReason, Forge, ForgeError,
-    LandRefusal, Mergeable, Observation, PrNumber, Sha,
+    LandRefusal, Observation, PrNumber, PrStatus, Sha,
 };
 use dorfq_forge_github::api::{GitHubApi, RefUpdate, RestClient};
 use dorfq_forge_github::messages::{Marker, last_marker};
-use dorfq_forge_github::{GitHubForge, Settings};
+use dorfq_forge_github::{GitHubForge, Settings, system_clock};
 use serde_json::{Value, json};
 
 const TRUNK: &str = "main";
@@ -105,6 +105,7 @@ impl Target {
         GitHubForge::new(
             Box::new(self.client()),
             settings,
+            Box::new(system_clock),
             Box::new(std::io::stdout()),
         )
         .map_err(at("constructing the forge"))
@@ -376,20 +377,14 @@ fn run() -> Result<(), String> {
     )?;
     let mut fixtures = vec![a.number, b.number, c.number];
 
-    // 3. The forge sees all three, mergeability computed and checks passed.
+    // 3. The forge sees all three ready: each merges into trunk and its
+    // checks passed.
     let mut forge = target.forge()?;
-    let observation = observe_until(&mut forge, "three pull requests enqueued", |o| {
-        let want = [(a.number, true), (b.number, true), (c.number, false)];
-        want.iter().all(|&(number, clean)| {
-            o.prs.iter().any(|p| {
-                p.number == number
-                    && p.head_ci == CiStatus::Passed
-                    && if clean {
-                        p.mergeable == Mergeable::Clean
-                    } else {
-                        p.mergeable != Mergeable::Unknown
-                    }
-            })
+    let observation = observe_until(&mut forge, "three pull requests ready", |o| {
+        [a.number, b.number, c.number].iter().all(|&number| {
+            o.prs
+                .iter()
+                .any(|p| p.number == number && p.status == PrStatus::Ready)
         })
     })?;
     check(observation.trunk == trunk, || {
@@ -409,11 +404,11 @@ fn run() -> Result<(), String> {
 
     // 4. A batch of all three conflicts at C, attributed to A by the probe.
     forge
-        .start_batch(&BatchStart {
-            id: BatchId(1),
-            base: trunk.clone(),
-            prs: vec![a.number, b.number, c.number],
-        })
+        .start_batch(&BatchStart::new(
+            BatchId(1),
+            trunk.clone(),
+            vec![a.number, b.number, c.number],
+        ))
         .map_err(at("starting batch 1"))?;
     let expected = BatchState::Conflict {
         pr: c.number,
@@ -423,7 +418,12 @@ fn run() -> Result<(), String> {
         batch(o, 1) == Some(&expected)
     })?;
     forge
-        .eject(c.number, &EjectReason::ConflictsWith { pr: a.number })
+        .eject(
+            c.number,
+            &EjectReason::Conflicts {
+                with: ConflictWith::Pr(a.number),
+            },
+        )
         .map_err(at("ejecting C"))?;
     forge.retire(BatchId(1)).map_err(at("retiring batch 1"))?;
     observe_until(&mut forge, "A and B enqueued, no batches", |o| {
@@ -439,11 +439,11 @@ fn run() -> Result<(), String> {
 
     // 5. A batch of A and B builds and tests; a fresh forge recovers it.
     forge
-        .start_batch(&BatchStart {
-            id: BatchId(2),
-            base: trunk.clone(),
-            prs: vec![a.number, b.number],
-        })
+        .start_batch(&BatchStart::new(
+            BatchId(2),
+            trunk.clone(),
+            vec![a.number, b.number],
+        ))
         .map_err(at("starting batch 2"))?;
     let observation = observe_until(&mut forge, "batch 2 testing, pending", |o| {
         matches!(
@@ -505,18 +505,18 @@ fn run() -> Result<(), String> {
         &format!("{prefix} D\n"),
     )?;
     fixtures.push(d.number);
-    let observation = observe_until(&mut forge, "D enqueued, passed, no batches", |o| {
+    let observation = observe_until(&mut forge, "D enqueued, ready, no batches", |o| {
         o.batches.is_empty()
             && o.prs
                 .iter()
-                .any(|p| p.number == d.number && p.head_ci == CiStatus::Passed)
+                .any(|p| p.number == d.number && p.status == PrStatus::Ready)
     })?;
     forge
-        .start_batch(&BatchStart {
-            id: BatchId(3),
-            base: observation.trunk.clone(),
-            prs: vec![d.number],
-        })
+        .start_batch(&BatchStart::new(
+            BatchId(3),
+            observation.trunk.clone(),
+            vec![d.number],
+        ))
         .map_err(at("starting batch 3"))?;
     let observation = observe_until(&mut forge, "batch 3 testing", |o| {
         matches!(batch(o, 3), Some(BatchState::Testing { .. }))

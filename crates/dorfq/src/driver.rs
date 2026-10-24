@@ -1,11 +1,45 @@
 //! The loop body: observe, step, execute.
 
+use std::error::Error;
 use std::fmt;
 
 use dorfq_core::{
-    BatchState, CiStatus, ConflictWith, EjectReason, Forge, ForgeError, LandRefusal, Mergeable,
-    Observation, Plan, Scheduler,
+    BatchState, CiStatus, Forge, ForgeError, Observation, Plan, PrBase, PrStatus, Scheduler,
+    SchedulerError,
 };
+
+/// Why a tick ended early.
+#[derive(Debug)]
+pub enum DriverError {
+    /// The scheduler could not produce a plan; always fatal.
+    Scheduler(SchedulerError),
+    /// A forge call failed; fatal when `Permanent`.
+    Forge(ForgeError),
+}
+
+impl From<ForgeError> for DriverError {
+    fn from(error: ForgeError) -> DriverError {
+        DriverError::Forge(error)
+    }
+}
+
+impl fmt::Display for DriverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DriverError::Scheduler(e) => e.fmt(f),
+            DriverError::Forge(e) => e.fmt(f),
+        }
+    }
+}
+
+impl Error for DriverError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            DriverError::Scheduler(e) => Some(e),
+            DriverError::Forge(e) => Some(e),
+        }
+    }
+}
 
 /// Runs ticks of a forge and a scheduler it borrows.
 pub struct Driver<'a> {
@@ -38,12 +72,16 @@ impl<'a> Driver<'a> {
 
     /// Observes, steps the scheduler, and executes the plan in the order
     /// `land`, `start`, `eject`, `retire`, stopping at the first error. An
-    /// error means the rest of the plan was abandoned; the tick still counts.
-    pub fn tick(&mut self) -> Result<TickReport, ForgeError> {
+    /// error means the rest of the plan was abandoned, or none was made; the
+    /// tick still counts.
+    pub fn tick(&mut self) -> Result<TickReport, DriverError> {
         let tick = self.tick;
         self.tick += 1;
         let observation = self.forge.observe()?;
-        let plan = self.scheduler.step(&observation);
+        let plan = self
+            .scheduler
+            .step(&observation)
+            .map_err(DriverError::Scheduler)?;
         for &batch in &plan.land {
             self.forge.land(batch)?;
         }
@@ -66,19 +104,26 @@ impl<'a> Driver<'a> {
     }
 }
 
-fn mergeable(m: Mergeable) -> &'static str {
-    match m {
-        Mergeable::Clean => "clean",
-        Mergeable::Conflicting => "conflicting",
-        Mergeable::Unknown => "unknown",
+fn status(s: &PrStatus) -> String {
+    match s {
+        PrStatus::Ready => "ready".to_owned(),
+        PrStatus::Waiting(holds) => {
+            let holds: Vec<String> = holds.iter().map(ToString::to_string).collect();
+            format!("waiting:{}", holds.join(","))
+        }
+        PrStatus::Conflicting(with) => format!("conflicting:{with}"),
     }
 }
 
-fn ci(c: CiStatus) -> &'static str {
+fn ci(c: &CiStatus) -> String {
     match c {
-        CiStatus::Pending => "pending",
-        CiStatus::Passed => "passed",
-        CiStatus::Failed => "failed",
+        CiStatus::Pending => "pending".to_owned(),
+        CiStatus::Passed => "passed".to_owned(),
+        CiStatus::Failed(failure) if failure.checks.is_empty() => "failed".to_owned(),
+        CiStatus::Failed(failure) => {
+            let checks: Vec<&str> = failure.checks.iter().map(|c| c.0.as_str()).collect();
+            format!("failed:{}", checks.join(","))
+        }
     }
 }
 
@@ -87,16 +132,18 @@ fn ci(c: CiStatus) -> &'static str {
 impl fmt::Display for TickReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let obs = &self.observation;
-        write!(f, "tick {} trunk {}", self.tick, obs.trunk)?;
+        write!(
+            f,
+            "tick {} now {} trunk {}",
+            self.tick, obs.now.0, obs.trunk
+        )?;
         for pr in &obs.prs {
-            write!(
-                f,
-                " | pr {} {} {} ci {}",
-                pr.number.0,
-                pr.head,
-                mergeable(pr.mergeable),
-                ci(pr.head_ci)
-            )?;
+            write!(f, " | pr {} {}", pr.number.0, pr.head)?;
+            match pr.base {
+                PrBase::Trunk => {}
+                PrBase::Pr(base) => write!(f, " on #{}", base.0)?,
+            }
+            write!(f, " {}", status(&pr.status))?;
         }
         for batch in &obs.batches {
             let members: Vec<String> = batch.members.iter().map(|m| m.pr.0.to_string()).collect();
@@ -108,21 +155,22 @@ impl fmt::Display for TickReport {
                 batch.base
             )?;
             match &batch.state {
-                BatchState::Conflict { pr, with } => match with {
-                    ConflictWith::Trunk => write!(f, "conflict: pr {} with trunk", pr.0)?,
-                    ConflictWith::Pr(q) => write!(f, "conflict: pr {} with pr {}", pr.0, q.0)?,
-                },
-                BatchState::Testing { tip, ci: c } => write!(f, "testing {tip} ci {}", ci(*c))?,
+                BatchState::Conflict { pr, with } => {
+                    write!(f, "conflict: pr {} with {with}", pr.0)?
+                }
+                BatchState::Testing { tip, ci: c } => write!(f, "testing {tip} ci {}", ci(c))?,
                 BatchState::Landed { tip } => write!(f, "landed {tip}")?,
-                BatchState::LandRefused { tip, reason } => match reason {
-                    LandRefusal::TrunkMoved { trunk } => {
-                        write!(f, "land refused {tip}: trunk moved to {trunk}")?
-                    }
-                    LandRefusal::MemberGone { pr } => {
-                        write!(f, "land refused {tip}: pr {} gone", pr.0)?
-                    }
-                },
+                BatchState::LandRefused { tip, reason } => {
+                    write!(f, "land refused {tip}: {reason}")?
+                }
             }
+        }
+        for departure in &obs.departed {
+            write!(
+                f,
+                " | departed pr {} {} {}",
+                departure.pr.0, departure.head, departure.how
+            )?;
         }
         if self.idle {
             f.write_str(" | idle")?;
@@ -142,12 +190,7 @@ impl fmt::Display for TickReport {
             )?;
         }
         for ejection in &plan.eject {
-            write!(f, "\n  eject pr {}: ", ejection.pr.0)?;
-            match &ejection.reason {
-                EjectReason::ConflictsWithTrunk => f.write_str("conflicts with trunk")?,
-                EjectReason::ConflictsWith { pr } => write!(f, "conflicts with pr {}", pr.0)?,
-                EjectReason::BatchFailed { batch } => write!(f, "batch {} failed", batch.0)?,
-            }
+            write!(f, "\n  eject pr {}: {}", ejection.pr.0, ejection.reason)?;
         }
         for batch in &plan.retire {
             write!(f, "\n  retire batch {}", batch.0)?;

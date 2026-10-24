@@ -14,6 +14,10 @@
 //! `state` is one of `started`, `testing <tip>`, `conflict <pr> trunk`,
 //! `conflict <pr> pr <m>`, `landing <tip>`, `landed <tip>`,
 //! `refused <tip> trunk-moved <sha>`, `refused <tip> member-gone <pr>`.
+//! A probe's record has no `member:` lines.
+//! A `ConflictWith` or `LandRefusal` variant with no form here cannot be
+//! recorded, and the effect that would record it is `Permanent`; a forge
+//! change that constructs a new variant gives it a form in the same change.
 //! Parsing is strict: the forge does not guess about a record it did not
 //! write.
 
@@ -67,15 +71,39 @@ impl fmt::Display for RecordError {
 
 impl Error for RecordError {}
 
+/// A batch state the record grammar has no form for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unrecordable {
+    pub id: BatchId,
+    pub state: RecordState,
+}
+
+impl fmt::Display for Unrecordable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "batch {}'s state {:?} has no form in the batch record",
+            self.id.0, self.state
+        )
+    }
+}
+
+impl Error for Unrecordable {}
+
 impl Record {
-    /// The record text; ends with a newline.
-    pub fn render(&self) -> String {
+    /// The record text; ends with a newline. A state with no form in the
+    /// grammar is an error.
+    pub fn render(&self) -> Result<String, Unrecordable> {
         let mut text = format!("{HEADER}\nid: {}\nbase: {}\n", self.id.0, self.base);
         for member in &self.members {
             text.push_str(&format!("member: {} {}\n", member.pr.0, member.head));
         }
-        text.push_str(&format!("state: {}\n", render_state(&self.state)));
-        text
+        let state = render_state(&self.state).ok_or_else(|| Unrecordable {
+            id: self.id,
+            state: self.state.clone(),
+        })?;
+        text.push_str(&format!("state: {state}\n"));
+        Ok(text)
     }
 
     /// Parses the record read from `ref_name`, whose suffix says it is
@@ -117,19 +145,13 @@ impl Record {
                 let (pr, head) = member
                     .split_once(' ')
                     .ok_or_else(|| error(format!("bad member line {line:?}")))?;
-                members.push(BatchMember {
-                    pr: pr_number(pr, &error)?,
-                    head: sha(head, &error)?,
-                });
+                members.push(BatchMember::new(pr_number(pr, &error)?, sha(head, &error)?));
             } else if let Some(state) = line.strip_prefix("state: ") {
                 break parse_state(state, &error)?;
             } else {
                 return Err(error(format!("unexpected line {line:?}")));
             }
         };
-        if members.is_empty() {
-            return Err(error("no members".to_owned()));
-        }
         if let Some(line) = lines.next() {
             return Err(error(format!("unexpected line {line:?} after state")));
         }
@@ -152,8 +174,8 @@ pub fn parse_decimal(text: &str) -> Option<u64> {
     if canonical { text.parse().ok() } else { None }
 }
 
-fn render_state(state: &RecordState) -> String {
-    match state {
+fn render_state(state: &RecordState) -> Option<String> {
+    let text = match state {
         RecordState::Started => "started".to_owned(),
         RecordState::Testing { tip } => format!("testing {tip}"),
         RecordState::Conflict {
@@ -174,7 +196,9 @@ fn render_state(state: &RecordState) -> String {
             tip,
             reason: LandRefusal::MemberGone { pr },
         } => format!("refused {tip} member-gone {}", pr.0),
-    }
+        RecordState::Conflict { .. } | RecordState::Refused { .. } => return None,
+    };
+    Some(text)
 }
 
 fn parse_state(
@@ -260,14 +284,8 @@ mod tests {
             id: BatchId(7),
             base: sha(A),
             members: vec![
-                BatchMember {
-                    pr: PrNumber(12),
-                    head: sha(B),
-                },
-                BatchMember {
-                    pr: PrNumber(15),
-                    head: sha(C),
-                },
+                BatchMember::new(PrNumber(12), sha(B)),
+                BatchMember::new(PrNumber(15), sha(C)),
             ],
             state,
         }
@@ -306,7 +324,9 @@ mod tests {
     }
 
     fn valid_text() -> String {
-        record(RecordState::Testing { tip: sha(T) }).render()
+        record(RecordState::Testing { tip: sha(T) })
+            .render()
+            .unwrap()
     }
 
     #[test]
@@ -323,7 +343,7 @@ mod tests {
     fn every_state_round_trips() {
         for state in every_state() {
             let original = record(state);
-            let text = original.render();
+            let text = original.render().unwrap();
             assert_eq!(Record::parse(REF, BatchId(7), &text).unwrap(), original);
             let trimmed = text.trim_end_matches('\n');
             assert_eq!(Record::parse(REF, BatchId(7), trimmed).unwrap(), original);
@@ -360,8 +380,15 @@ mod tests {
             }
             rejected(&without.join("\n"));
         }
-        let no_members = format!("{HEADER}\nid: 7\nbase: {A}\nstate: started\n");
-        assert_eq!(rejected(&no_members).problem, "no members");
+    }
+
+    #[test]
+    fn a_probe_record_with_no_members_round_trips() {
+        let text = format!("{HEADER}\nid: 7\nbase: {A}\nstate: testing {T}\n");
+        let probe = Record::parse(REF, BatchId(7), &text).unwrap();
+        assert!(probe.members.is_empty());
+        assert_eq!(probe.state, RecordState::Testing { tip: sha(T) });
+        assert_eq!(probe.render().unwrap(), text);
     }
 
     #[test]

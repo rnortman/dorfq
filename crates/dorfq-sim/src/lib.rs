@@ -1,9 +1,9 @@
 //! DorfQ's simulator: any [`Scheduler`] run against a seeded, event-driven
 //! world of pull requests with hidden truths.
 //!
-//! The [`World`] is a [`Forge`]: it checks rules 5 and 6 of the
-//! [`dorfq_core`] contract and answers a violation with
-//! [`ForgeError::Permanent`]. Behind it each pull request is bad or good,
+//! The [`World`] is a [`Forge`]: it checks rules 5, 6 and 8 of the
+//! [`dorfq_core`] contract through its [`Ledger`](dorfq_core::ledger::Ledger)
+//! and answers a breach with [`ForgeError::Permanent`]. Behind it each pull request is bad or good,
 //! conflicts with trunk or not, and carries a key from which the truth of
 //! every pair is a function. Runs take a uniform time on a fixed number of
 //! runners and fail when their tree is broken or the flake draw fires.
@@ -27,16 +27,14 @@ mod world;
 use std::error::Error;
 use std::fmt;
 
-use dorfq_core::{
-    BatchState, CiStatus, EjectReason, Forge, ForgeError, Observation, Plan, Scheduler,
-};
+use dorfq_core::{BatchState, CiStatus, Forge, ForgeError, Observation, Plan, Scheduler};
 use dorfq_scheduler::SchedulerConfig;
 
 pub use config::{CiMinutes, Policy, SimConfig, SimConfigError, WorldConfig};
 pub use metrics::{Exit, Metrics, PrRecord, RunRecord};
 pub use report::{PolicyReport, Report};
 pub use rng::{SplitMix64, Streams};
-pub use world::{Violation, World};
+pub use world::World;
 
 /// Non-empty plans at one instant after which a scheduler is livelocked.
 const SAME_INSTANT_LIMIT: u32 = 100;
@@ -58,6 +56,8 @@ pub enum SimError {
     },
     /// The scheduler broke a contract rule.
     Violation { at: u64, message: String },
+    /// The scheduler returned an error instead of a plan.
+    Scheduler { at: u64, message: String },
 }
 
 impl fmt::Display for SimError {
@@ -73,6 +73,9 @@ impl fmt::Display for SimError {
                 "stuck at t={at}: {queued} queued, {tracked} batches tracked"
             ),
             SimError::Violation { at, message } => write!(f, "violation at t={at}: {message}"),
+            SimError::Scheduler { at, message } => {
+                write!(f, "scheduler failed at t={at}: {message}")
+            }
         }
     }
 }
@@ -151,11 +154,20 @@ fn drive(
     let mut same_instant = 0;
     loop {
         let at = world.now();
-        let observation = world.observe().map_err(|e| failure(at, e))?;
+        // The world is this crate's own deterministic forge: an observation
+        // it cannot produce is a simulator bug, not the policy's outcome.
+        let observation = world
+            .observe()
+            .unwrap_or_else(|e| panic!("the simulated world failed to observe at t={at}: {e}"));
         if let Some(lines) = trace.as_deref_mut() {
             lines.extend(world.take_trace());
         }
-        let plan = scheduler.step(&observation);
+        let plan = scheduler
+            .step(&observation)
+            .map_err(|e| SimError::Scheduler {
+                at,
+                message: e.to_string(),
+            })?;
         if let Some(lines) = trace.as_deref_mut() {
             lines.push(step_line(at, &observation, &plan));
         }
@@ -241,16 +253,7 @@ fn step_line(at: u64, o: &Observation, plan: &Plan) -> String {
     let ejects: Vec<String> = plan
         .eject
         .iter()
-        .map(|e| {
-            // TODO(eject-reason-display): render through a form `EjectReason`
-            // itself provides, shared with the driver and the mock.
-            let reason = match e.reason {
-                EjectReason::ConflictsWithTrunk => "conflicts-with-trunk".to_owned(),
-                EjectReason::ConflictsWith { pr } => format!("conflicts-with-{}", pr.0),
-                EjectReason::BatchFailed { batch } => format!("batch-failed-{}", batch.0),
-            };
-            format!("{}:{reason}", e.pr.0)
-        })
+        .map(|e| format!("{}({})", e.pr.0, e.reason))
         .collect();
     format!(
         "t={at} queued={} in_flight={in_flight} | land {} | start {} | eject {} | retire {}",

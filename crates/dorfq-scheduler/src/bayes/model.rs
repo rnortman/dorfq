@@ -85,7 +85,8 @@ impl Model {
     /// the prior, and a re-pushed one is reset as a new one. A pull request
     /// no longer at the head the model holds leaves every pair; its causes
     /// leave every run if it is in `landed`, and otherwise every run that
-    /// exercised one of them leaves with it.
+    /// exercised one of them leaves with it. `landed` is what reached trunk,
+    /// by the queue or by another hand.
     pub(crate) fn sync(&mut self, prs: &[PrSnapshot], landed: &BTreeSet<PrNumber>) {
         let current: BTreeMap<PrNumber, &Sha> = prs.iter().map(|p| (p.number, &p.head)).collect();
         let gone: Vec<PrNumber> = self
@@ -95,6 +96,7 @@ impl Model {
             .map(|(pr, _)| *pr)
             .collect();
         for pr in gone {
+            // TODO(bayes-landing-transfers-pair-belief)
             if landed.contains(&pr) {
                 for run in &mut self.evidence {
                     run.exercised.retain(|cause| !cause.involves(pr));
@@ -383,7 +385,7 @@ mod tests {
         assert_eq!(model.belief(bad(1)), 1.0 - FLOOR);
         model.failed(BatchId(1), &members(&[1, 2]));
         model.failed(BatchId(2), &members(&[2, 3]));
-        let inference = super::super::infer::Inference::of(&model);
+        let inference = super::super::infer::Inference::of(&model).unwrap();
         for n in 1..=3 {
             let p = inference.posterior(&model, bad(n));
             assert!(p.is_finite() && p > 0.99, "{n}: {p}");

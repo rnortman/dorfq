@@ -99,6 +99,8 @@ pub struct PrDetail {
     pub labels: Vec<String>,
     /// `None` while GitHub has not computed it.
     pub mergeable: Option<bool>,
+    /// Whether it was merged, by any hand.
+    pub merged: bool,
 }
 
 /// One check run or commit status, reduced to what the forge decides on.
@@ -493,12 +495,16 @@ impl GitHubApi for RestClient {
             "closed" => false,
             other => return Err(permanent(format!("{what}: unknown state {other:?}"))),
         };
+        let merged = pr
+            .merged
+            .ok_or_else(|| permanent(format!("{what}: no merged field")))?;
         Ok(PrDetail {
             open,
             base: pr.base.branch,
             head: parse_sha(&what, &pr.head.sha)?,
             labels: pr.labels.into_iter().map(|l| l.name).collect(),
             mergeable: pr.mergeable,
+            merged,
         })
     }
 
@@ -795,6 +801,9 @@ struct PrJson {
     labels: Vec<LabelJson>,
     #[serde(default)]
     mergeable: Option<bool>,
+    /// Only the single-item endpoint carries it.
+    #[serde(default)]
+    merged: Option<bool>,
 }
 
 #[derive(Deserialize)]

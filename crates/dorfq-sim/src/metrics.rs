@@ -181,7 +181,9 @@ mod tests {
 
     fn ejected(justified: bool) -> Exit {
         Exit::Ejected {
-            reason: EjectReason::ConflictsWithTrunk,
+            reason: EjectReason::Conflicts {
+                with: dorfq_core::ConflictWith::Trunk,
+            },
             justified,
         }
     }

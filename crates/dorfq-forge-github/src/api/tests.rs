@@ -89,6 +89,7 @@ fn pr_json(number: u64, head: &str, labels: &[&str], mergeable: Value) -> Value 
         "base": { "sha": A, "ref": "main" },
         "labels": labels.iter().map(|l| json!({ "name": l })).collect::<Vec<_>>(),
         "mergeable": mergeable,
+        "merged": false,
     })
 }
 
@@ -108,8 +109,27 @@ fn get_pr_decodes_null_mergeable_as_unknown() {
             head: sha(B),
             labels: vec!["queue".to_owned(), "bug".to_owned()],
             mergeable: None,
+            merged: false,
         }
     );
+}
+
+#[test]
+fn get_pr_decodes_merged_and_requires_it() {
+    let mut merged = pr_json(5, B, &[], json!(false));
+    merged["state"] = json!("closed");
+    merged["merged"] = json!(true);
+    let mut silent = pr_json(6, B, &[], json!(true));
+    silent.as_object_mut().unwrap().remove("merged");
+    let (mut api, _) = client(vec![
+        route("GET", "/pulls/5", ok(merged)),
+        route("GET", "/pulls/6", ok(silent)),
+    ]);
+    let five = api.get_pr(PrNumber(5)).unwrap();
+    assert_eq!((five.open, five.merged), (false, true));
+    let error = api.get_pr(PrNumber(6)).unwrap_err();
+    assert!(!is_transient(&error), "{error}");
+    assert!(error.to_string().contains("no merged field"), "{error}");
 }
 
 #[test]

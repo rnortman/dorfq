@@ -32,6 +32,7 @@ pub struct FakePr {
     pub labels: Vec<String>,
     pub title: String,
     pub mergeable: Option<bool>,
+    pub merged: bool,
 }
 
 #[derive(Debug, Default)]
@@ -52,6 +53,12 @@ pub struct State {
     /// A ref moved to a sha just before the next update of that ref, as a
     /// push racing the forge would.
     pub interpose: Option<(String, Sha)>,
+    /// Pull requests every listing returns a second time, at the given head,
+    /// as a page boundary shifting under a paginated read does.
+    pub listed_again: Vec<(u64, Sha)>,
+    /// Open pull requests every listing leaves out, as a page boundary
+    /// shifting the other way does.
+    pub unlisted: BTreeSet<u64>,
     /// Every call, as `"<method> <arguments>"`.
     pub calls: Vec<String>,
     /// Failures to inject: method, a substring of the call's arguments,
@@ -127,6 +134,7 @@ impl FakeGitHub {
                 labels: vec!["queue".to_owned()],
                 title: format!("Change {number}"),
                 mergeable: Some(true),
+                merged: false,
             },
         );
         head
@@ -369,18 +377,23 @@ impl GitHubApi for FakeGitHub {
 
     fn list_open_prs(&mut self, base: &str) -> Result<Vec<PrSummary>, ApiError> {
         self.enter("list_open_prs", base.to_owned())?;
-        Ok(self
-            .state()
+        let state = self.state();
+        let summary = |number: u64, pr: &FakePr, head: &Sha| PrSummary {
+            number: PrNumber(number),
+            head: head.clone(),
+            labels: pr.labels.clone(),
+            title: pr.title.clone(),
+        };
+        let mut listing: Vec<PrSummary> = state
             .prs
             .iter()
-            .filter(|(_, pr)| pr.open && pr.base == base)
-            .map(|(number, pr)| PrSummary {
-                number: PrNumber(*number),
-                head: pr.head.clone(),
-                labels: pr.labels.clone(),
-                title: pr.title.clone(),
-            })
-            .collect())
+            .filter(|(number, pr)| pr.open && pr.base == base && !state.unlisted.contains(number))
+            .map(|(&number, pr)| summary(number, pr, &pr.head))
+            .collect();
+        for (number, head) in &state.listed_again {
+            listing.push(summary(*number, &state.prs[number], head));
+        }
+        Ok(listing)
     }
 
     fn get_pr(&mut self, number: PrNumber) -> Result<PrDetail, ApiError> {
@@ -396,6 +409,7 @@ impl GitHubApi for FakeGitHub {
             head: pr.head.clone(),
             labels: pr.labels.clone(),
             mergeable: pr.mergeable,
+            merged: pr.merged,
         })
     }
 

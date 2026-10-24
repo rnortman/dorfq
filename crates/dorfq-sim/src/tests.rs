@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use dorfq_core::{BatchId, BatchStart, Ejection, PrNumber, Sha};
+use dorfq_core::{
+    BatchId, BatchStart, ConflictWith, EjectReason, Ejection, PrNumber, SchedulerError, Sha,
+    Timestamp,
+};
 
 use super::*;
 use dorfq_scheduler::BayesConfig;
@@ -111,19 +114,17 @@ impl Forge for Recorder {
 }
 
 fn full_plan(trunk: Sha) -> Plan {
-    Plan {
-        start: vec![BatchStart {
-            id: BatchId(3),
-            base: trunk,
-            prs: vec![PrNumber(1)],
-        }],
+    let reason = EjectReason::Conflicts {
+        with: ConflictWith::Trunk,
+    };
+    let mut plan = Plan {
+        start: vec![BatchStart::new(BatchId(3), trunk, vec![PrNumber(1)])],
         land: vec![BatchId(1)],
         retire: vec![BatchId(2)],
-        eject: vec![Ejection {
-            pr: PrNumber(2),
-            reason: EjectReason::ConflictsWithTrunk,
-        }],
-    }
+        ..Plan::default()
+    };
+    plan.eject.push(Ejection::new(PrNumber(2), reason));
+    plan
 }
 
 fn trunk() -> Sha {
@@ -149,20 +150,20 @@ struct Restless {
 }
 
 impl Scheduler for Restless {
-    fn step(&mut self, o: &Observation) -> Plan {
+    fn step(&mut self, o: &Observation) -> Result<Plan, SchedulerError> {
         let mut plan = Plan {
             retire: o.batches.iter().map(|b| b.id).collect(),
             ..Plan::default()
         };
         if let Some(pr) = o.prs.first() {
             self.next += 1;
-            plan.start.push(BatchStart {
-                id: BatchId(self.next),
-                base: o.trunk.clone(),
-                prs: vec![pr.number],
-            });
+            plan.start.push(BatchStart::new(
+                BatchId(self.next),
+                o.trunk.clone(),
+                vec![pr.number],
+            ));
         }
-        plan
+        Ok(plan)
     }
 }
 
@@ -170,8 +171,8 @@ impl Scheduler for Restless {
 struct Idle;
 
 impl Scheduler for Idle {
-    fn step(&mut self, _: &Observation) -> Plan {
-        Plan::default()
+    fn step(&mut self, _: &Observation) -> Result<Plan, SchedulerError> {
+        Ok(Plan::default())
     }
 }
 
@@ -205,16 +206,56 @@ fn a_scheduler_that_never_acts_on_a_conflicting_pull_request_is_stuck() {
 struct Rogue;
 
 impl Scheduler for Rogue {
-    fn step(&mut self, o: &Observation) -> Plan {
-        Plan {
-            start: vec![BatchStart {
-                id: BatchId(1),
-                base: o.trunk.clone(),
-                prs: vec![PrNumber(999)],
-            }],
+    fn step(&mut self, o: &Observation) -> Result<Plan, SchedulerError> {
+        Ok(Plan {
+            start: vec![BatchStart::new(
+                BatchId(1),
+                o.trunk.clone(),
+                vec![PrNumber(999)],
+            )],
             ..Plan::default()
+        })
+    }
+}
+
+/// Cannot decide once anything is queued.
+struct Stumped;
+
+impl Scheduler for Stumped {
+    fn step(&mut self, o: &Observation) -> Result<Plan, SchedulerError> {
+        if o.prs.is_empty() {
+            Ok(Plan::default())
+        } else {
+            Err(SchedulerError::new("no verdict"))
         }
     }
+}
+
+#[test]
+fn a_scheduler_error_ends_the_replication_as_its_failure() {
+    let config = small(0.0, 0.0, 0.0, 0.0);
+    let mut world = World::new(config, Streams::for_replication(1, 0));
+    let outcome = drive(&mut world, &mut Stumped, u64::MAX, None);
+    let error = outcome.unwrap_err();
+    let SimError::Scheduler { at, message } = &error else {
+        panic!("expected a scheduler failure, got {error:?}");
+    };
+    assert!(*at > 0, "the first pull request arrives after t=0");
+    assert_eq!(message, "scheduler error: no verdict");
+    assert_eq!(
+        error.to_string(),
+        format!("scheduler failed at t={at}: scheduler error: no verdict")
+    );
+}
+
+#[test]
+fn observations_carry_the_world_clock() {
+    let config = small(0.0, 0.0, 0.0, 0.0);
+    let mut world = World::new(config, Streams::for_replication(1, 0));
+    assert_eq!(world.observe().unwrap().now, Timestamp(0));
+    let next = world.next_event().expect("an arrival is scheduled");
+    world.advance_to(next);
+    assert_eq!(world.observe().unwrap().now, Timestamp(next));
 }
 
 #[test]
@@ -324,7 +365,7 @@ fn all_at_once_ejects_every_member_of_a_failed_batch() {
     let failed: Vec<&RunRecord> = world
         .runs()
         .iter()
-        .filter(|r| r.verdict == Some(CiStatus::Failed))
+        .filter(|r| matches!(r.verdict, Some(CiStatus::Failed(_))))
         .collect();
     assert!(!failed.is_empty(), "no batch failed at this seed");
     for run in failed {
@@ -407,7 +448,7 @@ fn assert_ejections_name_failed_runs_of_their_tree(world: &World) -> usize {
                 record.number.0, batch.0
             )
         });
-        assert_eq!(run.verdict, Some(CiStatus::Failed), "{run:?}");
+        assert!(matches!(run.verdict, Some(CiStatus::Failed(_))), "{run:?}");
         assert!(
             run.started_at + run.consumed <= *at,
             "pr {} ejected at {at} naming {run:?}, which had not completed",

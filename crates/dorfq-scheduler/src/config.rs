@@ -354,7 +354,7 @@ speculate_above = 0.0
         // Three ready pull requests tell the two apart: the stub batches all
         // of them, a bisect of `max_batch = 2` the first two.
         let input = observation(ready_all(&[1, 2, 3]), vec![]);
-        let plan = SchedulerConfig::AllAtOnce {}.build().step(&input);
+        let plan = SchedulerConfig::AllAtOnce {}.build().step(&input).unwrap();
         assert_eq!(plan.start.len(), 1);
         assert_eq!(plan.start[0].prs, numbers(&[1, 2, 3]));
         let plan = SchedulerConfig::Bisect {
@@ -362,7 +362,8 @@ speculate_above = 0.0
             max_batch: 2,
         }
         .build()
-        .step(&input);
+        .step(&input)
+        .unwrap();
         assert_eq!(plan.start.len(), 1);
         assert_eq!(plan.start[0].prs, vec![PrNumber(1), PrNumber(2)]);
     }
@@ -375,7 +376,8 @@ speculate_above = 0.0
         let prs: Vec<u64> = (1..=30).collect();
         let plan = SchedulerConfig::Bayes(bayes())
             .build()
-            .step(&observation(ready_all(&prs), vec![]));
+            .step(&observation(ready_all(&prs), vec![]))
+            .unwrap();
         assert_eq!(plan.start.len(), 1);
         let grown = plan.start[0].prs.len();
         assert!((2..24).contains(&grown), "{grown}");

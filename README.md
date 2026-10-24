@@ -20,6 +20,14 @@ against GitHub**. dorfq does not run on its own repository yet: batch
 branches get CI only once the workflow change that covers them is on `main`.
 `CHANGELOG.md` tracks what exists.
 
+The contract carries stacks (a pull request based on another, and stacks
+that land only whole), probes (a batch with no members that tests its
+base's tree alone), how each pull request left the queue, the names of the
+checks a batch failed, and the forge's clock. The `all-at-once` stub lands
+stacks; `bisect` and `bayes` do not yet batch a stacked pull request, and
+the GitHub forge does not yet enqueue one: it reports only pull requests
+whose base is trunk.
+
 On the scheduler side there are two real policies beside the stub: `bisect`,
 the conventional pipelined bisect with memory that every number is compared
 to, and `bayes`, which keeps a belief about every queued pull request,
@@ -95,6 +103,18 @@ repository you care about. The steps, all done by the operator:
    a system unit; each says where it expects the binary, the configuration
    and the token. `make local-deploy` installs the binary where the user
    unit expects it and restarts the unit if it is running.
+
+While the queue runs, nobody pushes to, deletes or creates anything under
+`dorfq/` or `refs/dorfq/` by hand: the queue reads a foreign or moved ref
+there as a fault and stops. Trunk moves only by fast-forward, and a push to
+trunk by another hand makes every batch built on the old trunk refuse to
+land. Batch ids in those names are decimal.
+
+A queue that stops with "batch <id>'s tip is its base" is tracking a batch
+that an earlier build published at its own base, because every member was
+already in trunk. Stop the queue, delete `refs/dorfq/batches/<id>` and the
+branch `dorfq/batch/<id>`, and start it again; the batch's members that are
+still labelled rejoin the queue.
 
 The label is what authorises a merge. Anyone who can apply it lands the pull
 request, and on GitHub the Triage role is enough. The pull request lands at

@@ -4,10 +4,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use dorfq_core::{
     BatchId, BatchStart, BatchState, CiStatus, ConflictWith, EjectReason, Observation, Plan,
-    PrNumber, Scheduler, Sha,
+    PrBase, PrNumber, Scheduler, SchedulerError, Sha,
 };
 
-use crate::{Ejections, Ids, Member, chain, conflict_reason, is_pending, is_ready};
+use crate::{Ejections, Ids, Member, batchable, chain, is_pending};
 
 /// The conventional pipelined bisect: batches in queue order on one chain,
 /// halves a failed batch, and never runs a member set known to fail.
@@ -85,7 +85,7 @@ enum Fate {
 }
 
 impl Scheduler for Bisect {
-    fn step(&mut self, observation: &Observation) -> Plan {
+    fn step(&mut self, observation: &Observation) -> Result<Plan, SchedulerError> {
         self.ids.raise(observation);
         let heads: BTreeMap<PrNumber, &Sha> = observation
             .prs
@@ -93,11 +93,11 @@ impl Scheduler for Bisect {
             .map(|p| (p.number, &p.head))
             .collect();
         let queued = |(pr, head): &Member| heads.get(pr) == Some(&head);
-        let ready: BTreeSet<PrNumber> = observation
-            .prs
-            .iter()
-            .filter(|p| is_ready(p))
-            .map(|p| p.number)
+        // TODO(scheduler-stacks): stacked pull requests, and the ancestors of
+        // an `Atomic` one, wait; splitting a batch could separate a child
+        // from its base.
+        let ready: BTreeSet<PrNumber> = batchable(observation, |p| p.base == PrBase::Trunk)
+            .into_iter()
             .collect();
 
         let tracked: BTreeSet<BatchId> = observation.batches.iter().map(|b| b.id).collect();
@@ -137,17 +137,23 @@ impl Scheduler for Bisect {
                     tip,
                     ci: CiStatus::Passed,
                 } if base_live => {
-                    live.insert(tip, below_passed);
-                    if batch.base == *after {
-                        after = tip;
-                        plan.land.push(batch.id);
-                        Fate::Land
+                    // An `Atomic` pull request above a member arrived after
+                    // the batch started: the members go back to the pool.
+                    if batch.base == *after && observation.split_atomic(batch).is_some() {
+                        Fate::Retire
                     } else {
-                        Fate::Wait
+                        live.insert(tip, below_passed);
+                        if batch.base == *after {
+                            after = tip;
+                            plan.land.push(batch.id);
+                            Fate::Land
+                        } else {
+                            Fate::Wait
+                        }
                     }
                 }
                 BatchState::Testing {
-                    ci: CiStatus::Failed,
+                    ci: CiStatus::Failed(_),
                     ..
                 } if base_live => {
                     if below_passed {
@@ -202,7 +208,7 @@ impl Scheduler for Bisect {
                 }
                 Fate::Conflict(..) | Fate::Retire => {
                     if let Fate::Conflict(pr, with) = fate {
-                        ejections.eject(*pr, conflict_reason(*with));
+                        ejections.eject(*pr, EjectReason::Conflicts { with: *with });
                     }
                     if let Some(group) = self.retesting.remove(&batch.id)
                         && !matches!(batch.state, BatchState::Landed { .. })
@@ -239,7 +245,7 @@ impl Scheduler for Bisect {
         let mut taken = in_flight;
         taken.extend(plan.eject.iter().map(|e| e.pr));
         if pending >= self.lanes {
-            return plan;
+            return Ok(plan);
         }
         while let Some(group) = self.retests.pop_front() {
             let group: Vec<Member> = group
@@ -255,13 +261,13 @@ impl Scheduler for Bisect {
                 continue;
             }
             let id = self.ids.mint();
-            plan.start.push(BatchStart {
+            plan.start.push(BatchStart::new(
                 id,
-                base: chain_end.clone(),
-                prs: group.iter().map(|(pr, _)| *pr).collect(),
-            });
+                chain_end.clone(),
+                group.iter().map(|(pr, _)| *pr).collect(),
+            ));
             self.retesting.insert(id, group);
-            return plan;
+            return Ok(plan);
         }
 
         // A batch built on a tree holding a known-failed set runs that set
@@ -271,7 +277,7 @@ impl Scheduler for Bisect {
             .flat_map(|batch| batch.members.iter().map(|m| (m.pr, m.head.clone())))
             .collect();
         if self.contains_failed(&tree) {
-            return plan;
+            return Ok(plan);
         }
         let mut members: Vec<Member> = Vec::new();
         for pr in &observation.prs {
@@ -287,14 +293,14 @@ impl Scheduler for Bisect {
             }
         }
         if !members.is_empty() {
-            plan.start.push(BatchStart {
-                id: self.ids.mint(),
-                base: chain_end.clone(),
-                prs: members.into_iter().map(|(pr, _)| pr).collect(),
-            });
+            plan.start.push(BatchStart::new(
+                self.ids.mint(),
+                chain_end.clone(),
+                members.into_iter().map(|(pr, _)| pr).collect(),
+            ));
         }
 
-        plan
+        Ok(plan)
     }
 }
 
@@ -302,7 +308,7 @@ impl Scheduler for Bisect {
 mod tests {
     use super::*;
     use crate::test_support::*;
-    use dorfq_core::{LandRefusal, Mergeable};
+    use dorfq_core::{Hold, LandRefusal, Timestamp};
 
     fn bisect() -> Bisect {
         Bisect::new(2, 16)
@@ -313,8 +319,8 @@ mod tests {
         let mut s = Bisect::new(1, 3);
         let mut prs = ready_all(&[4, 1, 3, 2]);
         prs.sort_by_key(|p| p.number);
-        prs.push(pr(5, Mergeable::Unknown, CiStatus::Passed));
-        prs.push(pr(6, Mergeable::Clean, CiStatus::Pending));
+        prs.push(held(5, Hold::MergeabilityUnknown));
+        prs.push(held(6, Hold::OwnCiPending));
         let plan = step(&mut s, &observation(prs, vec![]));
         assert_eq!(
             plan,
@@ -352,7 +358,7 @@ mod tests {
             &mut s,
             &observation(
                 ready_all(&[1, 2]),
-                vec![testing(4, trunk(), &[1], CiStatus::Failed)],
+                vec![testing(4, trunk(), &[1], ci_failed())],
             ),
         );
         assert_eq!(plan.eject, vec![ejection(1, failed_by(4))]);
@@ -368,7 +374,7 @@ mod tests {
             &mut s,
             &observation(
                 prs.clone(),
-                vec![testing(1, trunk(), &[1, 2, 3, 4, 5], CiStatus::Failed)],
+                vec![testing(1, trunk(), &[1, 2, 3, 4, 5], ci_failed())],
             ),
         );
         assert!(plan.eject.is_empty());
@@ -390,7 +396,7 @@ mod tests {
             &mut s,
             &observation(
                 prs.clone(),
-                vec![testing(1, trunk(), &[1, 2, 3, 4], CiStatus::Failed)],
+                vec![testing(1, trunk(), &[1, 2, 3, 4], ci_failed())],
             ),
         );
         assert_eq!(plan.start, vec![start(2, trunk(), &[1, 2])]);
@@ -411,7 +417,7 @@ mod tests {
             &mut s,
             &observation(
                 ready_all(&[1, 2, 3, 4, 5, 6]),
-                vec![testing(1, trunk(), &[1, 2, 3, 4], CiStatus::Failed)],
+                vec![testing(1, trunk(), &[1, 2, 3, 4], ci_failed())],
             ),
         );
         // 3 and 4 are withdrawn before their group runs: the lower half is
@@ -429,7 +435,7 @@ mod tests {
             &mut s,
             &observation(
                 prs.clone(),
-                vec![testing(1, trunk(), &[1, 2, 3, 4], CiStatus::Failed)],
+                vec![testing(1, trunk(), &[1, 2, 3, 4], ci_failed())],
             ),
         );
         step(
@@ -446,7 +452,7 @@ mod tests {
             &observation(
                 prs.clone(),
                 vec![
-                    testing(2, trunk(), &[1, 2], CiStatus::Failed),
+                    testing(2, trunk(), &[1, 2], ci_failed()),
                     testing(3, tip(2), &[3, 4], CiStatus::Pending),
                 ],
             ),
@@ -469,7 +475,7 @@ mod tests {
             &mut s,
             &observation(
                 prs.clone(),
-                vec![testing(1, trunk(), &[1, 2, 3, 4], CiStatus::Failed)],
+                vec![testing(1, trunk(), &[1, 2, 3, 4], ci_failed())],
             ),
         );
         step(
@@ -480,13 +486,13 @@ mod tests {
             ),
         );
         let lower = testing(2, trunk(), &[1, 2], CiStatus::Pending);
-        let upper = testing(3, tip(2), &[3, 4], CiStatus::Failed);
+        let upper = testing(3, tip(2), &[3, 4], ci_failed());
         let plan = step(
             &mut s,
             &observation(prs.clone(), vec![lower, upper.clone()]),
         );
         assert!(plan.is_empty(), "{plan:?}");
-        let lower = testing(2, trunk(), &[1, 2], CiStatus::Failed);
+        let lower = testing(2, trunk(), &[1, 2], ci_failed());
         let plan = step(&mut s, &observation(prs, vec![lower, upper]));
         assert_eq!(plan.retire, vec![BatchId(2), BatchId(3)]);
         // {3, 4} is not split: its failure was the lower half's.
@@ -501,7 +507,7 @@ mod tests {
             &mut s,
             &observation(
                 prs.clone(),
-                vec![testing(1, trunk(), &[1, 2, 3, 4], CiStatus::Failed)],
+                vec![testing(1, trunk(), &[1, 2, 3, 4], ci_failed())],
             ),
         );
         step(
@@ -517,7 +523,7 @@ mod tests {
                 prs,
                 vec![
                     testing(2, trunk(), &[1, 2], CiStatus::Passed),
-                    testing(3, tip(2), &[3, 4], CiStatus::Failed),
+                    testing(3, tip(2), &[3, 4], ci_failed()),
                 ],
             ),
         );
@@ -533,7 +539,7 @@ mod tests {
             &mut s,
             &observation(
                 ready_all(&[1, 2]),
-                vec![testing(1, trunk(), &[1, 2], CiStatus::Failed)],
+                vec![testing(1, trunk(), &[1, 2], ci_failed())],
             ),
         );
         assert_eq!(plan.start, vec![start(2, trunk(), &[1])]);
@@ -550,7 +556,7 @@ mod tests {
             &mut s,
             &observation(
                 prs.clone(),
-                vec![testing(1, trunk(), &[1, 2, 3, 4], CiStatus::Failed)],
+                vec![testing(1, trunk(), &[1, 2, 3, 4], ci_failed())],
             ),
         );
         assert_eq!(plan.start, vec![start(2, trunk(), &[1, 2])]);
@@ -572,17 +578,14 @@ mod tests {
             &mut s,
             &observation(
                 prs.clone(),
-                vec![testing(1, trunk(), &[1, 2, 3, 4], CiStatus::Failed)],
+                vec![testing(1, trunk(), &[1, 2, 3, 4], ci_failed())],
             ),
         );
         // Halves {1, 2} and {3, 4} are queued; {1, 2} runs and fails too,
         // so {1, 2} is known to fail and splits into {1} and {2}.
         let plan = step(
             &mut s,
-            &observation(
-                prs.clone(),
-                vec![testing(2, trunk(), &[1, 2], CiStatus::Failed)],
-            ),
+            &observation(prs.clone(), vec![testing(2, trunk(), &[1, 2], ci_failed())]),
         );
         assert_eq!(plan.start, vec![start(3, trunk(), &[1])]);
         // {1} passes and lands; {2} runs next, then {3, 4}.
@@ -594,16 +597,16 @@ mod tests {
         assert_eq!(plan.start, vec![start(4, tip(3), &[2])]);
         let plan = step(
             &mut s,
-            &Observation {
-                trunk: tip(3),
-                ..observation(
-                    ready_all(&[2, 3, 4]),
-                    vec![
-                        batch(3, trunk(), &[1], BatchState::Landed { tip: tip(3) }),
-                        testing(4, tip(3), &[2], CiStatus::Failed),
-                    ],
-                )
-            },
+            &Observation::new(
+                Timestamp(0),
+                tip(3),
+                ready_all(&[2, 3, 4]),
+                vec![
+                    batch(3, trunk(), &[1], BatchState::Landed { tip: tip(3) }),
+                    testing(4, tip(3), &[2], ci_failed()),
+                ],
+                vec![landed(1, 3)],
+            ),
         );
         assert_eq!(plan.eject, vec![ejection(2, failed_by(4))]);
         assert_eq!(plan.retire, vec![BatchId(3), BatchId(4)]);
@@ -639,16 +642,16 @@ mod tests {
         assert_eq!(plan.start, vec![start(2, tip(1), &[2])]);
         let plan = step(
             &mut s,
-            &Observation {
-                trunk: tip(1),
-                ..observation(
-                    ready_all(&[2, 3]),
-                    vec![
-                        batch(1, trunk(), &[1], BatchState::Landed { tip: tip(1) }),
-                        testing(2, tip(1), &[2], CiStatus::Passed),
-                    ],
-                )
-            },
+            &Observation::new(
+                Timestamp(0),
+                tip(1),
+                ready_all(&[2, 3]),
+                vec![
+                    batch(1, trunk(), &[1], BatchState::Landed { tip: tip(1) }),
+                    testing(2, tip(1), &[2], CiStatus::Passed),
+                ],
+                vec![landed(1, 1)],
+            ),
         );
         assert_eq!(plan.start, vec![start(3, tip(2), &[3])]);
     }
@@ -656,15 +659,15 @@ mod tests {
     #[test]
     fn fresh_batch_skips_a_member_that_completes_a_failed_set() {
         let mut s = Bisect::new(2, 16);
-        // {1, 3} fails while both are briefly not mergeable, so their groups
+        // {1, 3} fails while both are briefly held, so their groups
         // empty out and they return to the fresh pool still known to fail
         // together.
-        let unknown = |n| pr(n, Mergeable::Unknown, CiStatus::Passed);
+        let unknown = |n| held(n, Hold::MergeabilityUnknown);
         let plan = step(
             &mut s,
             &observation(
                 vec![unknown(1), ready(2), unknown(3), ready(4)],
-                vec![testing(1, trunk(), &[1, 3], CiStatus::Failed)],
+                vec![testing(1, trunk(), &[1, 3], ci_failed())],
             ),
         );
         assert_eq!(plan.start, vec![start(2, trunk(), &[2, 4])]);
@@ -741,7 +744,7 @@ mod tests {
             &observation(
                 ready_all(&[1, 2, 3]),
                 vec![
-                    testing(1, trunk(), &[1, 2], CiStatus::Failed),
+                    testing(1, trunk(), &[1, 2], ci_failed()),
                     testing(2, tip(1), &[3], CiStatus::Pending),
                 ],
             ),
@@ -756,7 +759,7 @@ mod tests {
         let mut s = Bisect::new(3, 16);
         let prs = ready_all(&[1, 2, 3, 4]);
         let parent = testing(1, trunk(), &[1], CiStatus::Pending);
-        let child = testing(2, tip(1), &[2, 3], CiStatus::Failed);
+        let child = testing(2, tip(1), &[2, 3], ci_failed());
         let plan = step(
             &mut s,
             &observation(prs.clone(), vec![parent, child.clone()]),
@@ -783,8 +786,8 @@ mod tests {
             &observation(
                 ready_all(&[1, 2, 3]),
                 vec![
-                    testing(1, trunk(), &[1], CiStatus::Failed),
-                    testing(2, tip(1), &[2, 3], CiStatus::Failed),
+                    testing(1, trunk(), &[1], ci_failed()),
+                    testing(2, tip(1), &[2, 3], ci_failed()),
                 ],
             ),
         );
@@ -823,16 +826,16 @@ mod tests {
         // again on the new trunk.
         let plan = step(
             &mut s,
-            &Observation {
-                trunk: tip(2),
-                ..observation(
-                    ready_all(&[2]),
-                    vec![
-                        batch(2, trunk(), &[1], BatchState::Landed { tip: tip(2) }),
-                        testing(3, trunk(), &[2], CiStatus::Passed),
-                    ],
-                )
-            },
+            &Observation::new(
+                Timestamp(0),
+                tip(2),
+                ready_all(&[2]),
+                vec![
+                    batch(2, trunk(), &[1], BatchState::Landed { tip: tip(2) }),
+                    testing(3, trunk(), &[2], CiStatus::Passed),
+                ],
+                vec![landed(1, 2)],
+            ),
         );
         assert_eq!(plan.retire, vec![BatchId(2), BatchId(3)]);
         assert_eq!(plan.start, vec![start(4, tip(2), &[2])]);
@@ -874,7 +877,7 @@ mod tests {
             &observation(
                 ready_all(&[1, 2, 3, 4, 5]),
                 vec![
-                    testing(1, trunk(), &[1, 2, 3, 4], CiStatus::Failed),
+                    testing(1, trunk(), &[1, 2, 3, 4], ci_failed()),
                     busy.clone(),
                 ],
             ),
@@ -888,7 +891,7 @@ mod tests {
             &mut s,
             &observation(
                 ready_all(&[3, 4]),
-                vec![testing(10, trunk(), &[1], CiStatus::Failed)],
+                vec![testing(10, trunk(), &[1], ci_failed())],
             ),
         );
         assert_eq!(
@@ -911,13 +914,7 @@ mod tests {
         let plan = step(
             &mut s,
             &observation(
-                vec![
-                    ready(1),
-                    ready(2),
-                    ready(3),
-                    pr(4, Mergeable::Conflicting, CiStatus::Passed),
-                    ready(5),
-                ],
+                vec![ready(1), ready(2), ready(3), conflicting(4), ready(5)],
                 vec![
                     batch(
                         1,
@@ -945,9 +942,9 @@ mod tests {
         assert_eq!(
             plan.eject,
             vec![
-                ejection(2, EjectReason::ConflictsWith { pr: PrNumber(1) }),
-                ejection(5, EjectReason::ConflictsWithTrunk),
-                ejection(4, EjectReason::ConflictsWithTrunk),
+                ejection(2, conflicts_with(1)),
+                ejection(5, conflicts_with_trunk()),
+                ejection(4, conflicts_with_trunk()),
             ]
         );
         assert_eq!(
@@ -963,10 +960,10 @@ mod tests {
         let plan = step(
             &mut s,
             &observation(
-                vec![pr(1, Mergeable::Conflicting, CiStatus::Passed), ready(2)],
+                vec![conflicting(1), ready(2)],
                 vec![
                     testing(1, trunk(), &[1, 2], CiStatus::Passed),
-                    testing(2, trunk(), &[2], CiStatus::Failed),
+                    testing(2, trunk(), &[2], ci_failed()),
                 ],
             ),
         );
@@ -983,7 +980,7 @@ mod tests {
             testing(11, trunk(), &[6], CiStatus::Pending),
             testing(12, trunk(), &[7], CiStatus::Pending),
         ];
-        let mut batches = vec![testing(1, trunk(), &[1, 2, 3, 4], CiStatus::Failed)];
+        let mut batches = vec![testing(1, trunk(), &[1, 2, 3, 4], ci_failed())];
         batches.extend(busy.iter().cloned());
         let plan = step(
             &mut s,
@@ -1022,7 +1019,7 @@ mod tests {
             &mut s,
             &observation(
                 vec![repushed(1)],
-                vec![testing(1, trunk(), &[1], CiStatus::Failed)],
+                vec![testing(1, trunk(), &[1], ci_failed())],
             ),
         );
         assert!(plan.eject.is_empty());
@@ -1033,7 +1030,7 @@ mod tests {
     #[test]
     fn failure_seen_again_is_not_split_twice() {
         let mut s = Bisect::new(1, 16);
-        let failed = testing(1, trunk(), &[1, 2], CiStatus::Failed);
+        let failed = testing(1, trunk(), &[1, 2], ci_failed());
         let prs = ready_all(&[1, 2]);
         let plan = step(&mut s, &observation(prs.clone(), vec![failed.clone()]));
         assert_eq!(plan.start, vec![start(2, trunk(), &[1])]);
@@ -1081,7 +1078,7 @@ mod tests {
         let batches = vec![
             testing(1, trunk(), &[1, 2], CiStatus::Pending),
             testing(2, tip(1), &[3], CiStatus::Passed),
-            testing(3, tip(1), &[4, 5], CiStatus::Failed),
+            testing(3, tip(1), &[4, 5], ci_failed()),
         ];
         // Seeded: a queued group holds a member in flight; the start must
         // skip it whatever put it there.
@@ -1105,17 +1102,37 @@ mod tests {
     #[test]
     fn equal_inputs_give_equal_plans() {
         let input = observation(
-            vec![
-                ready(1),
-                pr(2, Mergeable::Conflicting, CiStatus::Passed),
-                ready(3),
-                ready(4),
-            ],
-            vec![testing(7, trunk(), &[3, 4], CiStatus::Failed)],
+            vec![ready(1), conflicting(2), ready(3), ready(4)],
+            vec![testing(7, trunk(), &[3, 4], ci_failed())],
         );
         let mut a = bisect();
         let mut b = bisect();
-        assert_eq!(a.step(&input), b.step(&input));
+        assert_eq!(a.step(&input).unwrap(), b.step(&input).unwrap());
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn stacked_pull_requests_and_parents_of_atomic_ones_are_never_batched() {
+        let mut s = bisect();
+        let prs = vec![
+            ready(1),
+            stacked(2, 1),
+            ready(3),
+            atomic(stacked(4, 3)),
+            ready(5),
+        ];
+        let plan = step(&mut s, &observation(prs, vec![]));
+        assert_eq!(plan.start, vec![start(1, trunk(), &[1, 5])]);
+    }
+
+    #[test]
+    fn a_passed_batch_whose_member_gained_an_atomic_child_is_retired() {
+        let mut s = bisect();
+        let prs = vec![ready(1), atomic(stacked(2, 1)), ready(3)];
+        let passed = testing(1, trunk(), &[1], CiStatus::Passed);
+        let plan = step(&mut s, &observation(prs, vec![passed]));
+        assert!(plan.land.is_empty(), "{plan:?}");
+        assert_eq!(plan.retire, vec![BatchId(1)]);
+        assert_eq!(plan.start, vec![start(2, trunk(), &[3])]);
     }
 }

@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
 
-use dorfq_core::{BatchId, BatchState, EjectReason, LandRefusal, PrNumber, Sha};
+use dorfq_core::{BatchId, BatchState, ConflictWith, EjectReason, LandRefusal, PrNumber, Sha};
 use dorfq_forge_mock::{Event, Message, MockForge, Scenario};
 use dorfq_scheduler::AllAtOnce;
 
@@ -150,7 +150,15 @@ fn trunk_conflict_is_ejected_first_and_the_rest_land() {
     assert_eq!(first.eject.len(), 1);
     assert_eq!(first.eject[0].pr, PrNumber(2));
     assert_eq!(run.starts(), [(0, 1, vec![1, 3])]);
-    assert_eq!(run.ejected(), [(2, EjectReason::ConflictsWithTrunk)]);
+    assert_eq!(
+        run.ejected(),
+        [(
+            2,
+            EjectReason::Conflicts {
+                with: ConflictWith::Trunk,
+            }
+        )]
+    );
     assert_eq!(run.landed(), [1, 3]);
     assert_eq!(run.trunk(), &sha(5));
     assert_eq!(run.reports.len(), 5);
@@ -196,7 +204,12 @@ fn member_conflict_ejects_the_later_member_and_the_rebuild_lands() {
     assert_eq!(run.starts(), [(0, 1, vec![1, 2, 3]), (2, 2, vec![1, 3])]);
     assert_eq!(
         run.ejected(),
-        [(2, EjectReason::ConflictsWith { pr: PrNumber(1) })]
+        [(
+            2,
+            EjectReason::Conflicts {
+                with: ConflictWith::Pr(PrNumber(1)),
+            }
+        )]
     );
     // A batch that ends in a conflict tells no one it is testing.
     let testing: Vec<u64> = run
@@ -287,11 +300,52 @@ fn shipped_example_runs_to_idle() {
     assert_eq!(run.reports[2].plan.land, [BatchId(1)]);
     assert_eq!(
         run.ejected(),
-        [(4, EjectReason::ConflictsWithTrunk), (5, failed(2))]
+        [
+            (
+                4,
+                EjectReason::Conflicts {
+                    with: ConflictWith::Trunk,
+                }
+            ),
+            (5, failed(2))
+        ]
     );
     // Heads 2-5, batch 1's tip 6, pr 5's head 7, batch 2's tip 8.
     assert_eq!(run.landed(), [1, 2, 3]);
     assert_eq!(run.trunk(), &sha(6));
     assert!(run.reports.last().unwrap().idle);
     assert_eq!(run.reports.len(), 8);
+}
+
+#[test]
+fn a_stack_lands_in_one_batch_with_its_authors_told_in_order() {
+    let run = run(
+        "ci_ticks = 1\n[[pr]]\nnumber = 1\n[[pr]]\nnumber = 2\nbase = 1\n\
+         [[pr]]\nnumber = 3\nbase = 2\n",
+    );
+    assert_eq!(run.starts(), [(0, 1, vec![1, 2, 3])]);
+    assert_eq!(run.landed(), [1, 2, 3]);
+    assert!(run.ejected().is_empty());
+}
+
+#[test]
+fn a_base_dequeued_while_waiting_leaves_its_child_blocked_and_told() {
+    // 2 waits on its own CI until it withdraws at tick 2; 3 is ready but
+    // its base never is.
+    let run = run("ci_ticks = 1\n[[pr]]\nnumber = 1\n\
+         [[pr]]\nnumber = 2\nbase = 1\nown_ci = \"pending\"\ndequeue_at = 2\n\
+         [[pr]]\nnumber = 3\nbase = 2\n");
+    assert_eq!(run.starts(), [(0, 1, vec![1])]);
+    assert_eq!(run.landed(), [1]);
+    let to_three: Vec<&Event> = run
+        .forge
+        .messages()
+        .iter()
+        .filter(|m| m.pr == PrNumber(3))
+        .map(|m| &m.event)
+        .collect();
+    assert_eq!(
+        to_three,
+        [&Event::Queued, &Event::Blocked { on: PrNumber(2) }]
+    );
 }
