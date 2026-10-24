@@ -206,6 +206,8 @@ impl Ids {
 }
 
 /// Whether a batch is still running CI.
+// TODO(chain-collapse-under-runner-queue): a `Pending` batch may be running or
+// still waiting for a runner; both schedulers bound chain depth by `lanes` over this.
 pub(crate) fn is_pending(state: &BatchState) -> bool {
     matches!(
         state,

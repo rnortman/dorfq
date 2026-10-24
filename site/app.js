@@ -1219,6 +1219,8 @@ const playground = {
   started: null,
   ticker: null,
   running: false,
+  // The text of the last document a run produced, kept for download.
+  documentText: null,
 
   load(doc) {
     $("playground").hidden = false;
@@ -1279,6 +1281,20 @@ const playground = {
     this.status(`cancelled after ${this.elapsed()}`);
   },
 
+  // The object URL is revoked only after the click has started the download.
+  download() {
+    if (this.documentText === null) return;
+    const blob = new Blob([this.documentText], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "playground.json";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  },
+
   reply(message) {
     this.finish();
     switch (message.kind) {
@@ -1291,6 +1307,8 @@ const playground = {
           this.status(`The simulator's document is not JSON: ${error.message}`, true);
           break;
         }
+        this.documentText = message.text;
+        $("playground-download").disabled = false;
         show(doc);
         this.status(
           `ran in ${took}. The browser's floating point may differ from the ` +
@@ -1317,6 +1335,7 @@ const playground = {
 
 $("playground-run").addEventListener("click", () => playground.run());
 $("playground-cancel").addEventListener("click", () => playground.cancel());
+$("playground-download").addEventListener("click", () => playground.download());
 $("play").addEventListener("click", () => replay.toggle());
 $("scrubber").addEventListener("input", (e) => replay.seek(Number(e.target.value)));
 $("canvas").addEventListener("mousemove", hover);
