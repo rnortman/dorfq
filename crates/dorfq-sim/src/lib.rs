@@ -10,9 +10,29 @@
 //! Time is the simulator's: the scheduler never sees it.
 //!
 //! An arrival may be cut from a recent arrival's branch; it is stacked on
-//! that pull request while it is queued, and may be `Atomic`. A base that
+//! that pull request while it is in the world, and may be `Atomic`. A base that
 //! leaves without landing takes everything stacked on it with it
 //! (`Blocked`), and a re-push restacks every descendant.
+//!
+//! Every pull request also runs its own CI, on the same runners as batch
+//! runs, each time it gets a head: at arrival and at every re-push. A run
+//! takes a uniform time and passes; a head change cancels the old head's
+//! run. As the GitHub forge does, the world reports a pull request
+//! `Waiting(OwnCiPending)` until its current head's run has passed, so no
+//! batch takes it before then. Each pull request draws its runs' durations
+//! and its rebase delays from its own clock, seeded from its key, so the
+//! n-th draw of a pull request is the same under every policy.
+//!
+//! Each policy runs under an [`Admission`]: what the queue asks of a pull
+//! request before it sees it. Under `label`, dorfq's, a pull request is in
+//! the queue from arrival; ejected for the conflict with trunk it has, it
+//! and everything stacked on it go out while its author rebases, and come
+//! back with new heads at the push. Under `github`, GitHub's, the queue
+//! sees a pull request only once it is on trunk and its current head has
+//! passed its own CI: a stacked pull request waits for its base to land,
+//! is rebased then, and is checked again before it enters; a conflict is
+//! rebased before the queue ever sees it; a push takes an enqueued pull
+//! request out until the new head passes.
 //!
 //! Every draw comes from SplitMix64 streams split by purpose (arrivals,
 //! truth, CI, churn, stacks), so two policies at one seed see the same
@@ -41,11 +61,11 @@ use std::fmt;
 use dorfq_core::{BatchState, CiStatus, Forge, ForgeError, Observation, Plan, Scheduler};
 use dorfq_scheduler::SchedulerConfig;
 
-pub use config::{CiMinutes, Policy, SimConfig, SimConfigError, WorldConfig};
-pub use metrics::{Exit, Metrics, PrRecord, RunRecord};
+pub use config::{Admission, Minutes, Policy, SimConfig, SimConfigError, WorldConfig};
+pub use metrics::{Exit, Metrics, PrCiRecord, PrRecord, RunRecord, RunningSeconds};
 pub use report::{PolicyReport, Report, SCHEMA};
 pub use rng::{SplitMix64, Streams};
-pub use trace::{PlannedEject, PlannedStart, TraceEvent, Truth};
+pub use trace::{PlannedEject, PlannedStart, Rebase, TraceEvent, Truth};
 pub use world::World;
 
 /// Non-empty plans at one instant after which a scheduler is livelocked.
@@ -60,11 +80,13 @@ const HOUR: u64 = 3600;
 pub enum SimError {
     /// The plan stayed non-empty at one instant too many times.
     Livelock { at: u64 },
-    /// Nothing is scheduled to happen, yet something is queued or tracked.
+    /// Nothing is scheduled to happen, yet something is queued, tracked or
+    /// out of the queue.
     Stuck {
         at: u64,
         queued: usize,
         tracked: usize,
+        out: usize,
     },
     /// The scheduler broke a contract rule.
     Violation { at: u64, message: String },
@@ -80,9 +102,10 @@ impl fmt::Display for SimError {
                 at,
                 queued,
                 tracked,
+                out,
             } => write!(
                 f,
-                "stuck at t={at}: {queued} queued, {tracked} batches tracked"
+                "stuck at t={at}: {queued} queued, {tracked} batches tracked, {out} out of the queue"
             ),
             SimError::Violation { at, message } => write!(f, "violation at t={at}: {message}"),
             SimError::Scheduler { at, message } => {
@@ -95,17 +118,18 @@ impl fmt::Display for SimError {
 impl Error for SimError {}
 
 /// Runs the scheduler `scheduler` describes for replication `k` of `seed`
-/// in `world`, to drain or deadline, appending its steps and events to
+/// in `world` under `admission`, to drain or deadline, appending its steps and events to
 /// `trace` when given, failed replication or not. `world` must have passed
 /// [`WorldConfig::validate`] and `scheduler` [`SchedulerConfig::validate`].
 pub fn run(
     world: &WorldConfig,
+    admission: Admission,
     scheduler: &SchedulerConfig,
     seed: u64,
     k: u64,
     trace: Option<&mut Vec<TraceEvent>>,
 ) -> Result<Metrics, SimError> {
-    let (world, outcome) = replicate(world, scheduler, seed, k, trace);
+    let (world, outcome) = replicate(world, admission, scheduler, seed, k, trace);
     outcome.map(|()| world.metrics())
 }
 
@@ -113,13 +137,14 @@ pub fn run(
 /// with the outcome.
 fn replicate(
     config: &WorldConfig,
+    admission: Admission,
     scheduler: &SchedulerConfig,
     seed: u64,
     k: u64,
     trace: Option<&mut Vec<TraceEvent>>,
 ) -> (World, Result<(), SimError>) {
     let deadline = (config.hours + config.drain_hours) * HOUR;
-    let mut world = World::new(config.clone(), Streams::for_replication(seed, k));
+    let mut world = World::new(config.clone(), admission, Streams::for_replication(seed, k));
     if trace.is_some() {
         world = world.traced();
     }
@@ -141,7 +166,15 @@ pub fn simulate(config: &SimConfig, trace: bool) -> Report {
             let replications = (0..config.replications)
                 .map(|k| {
                     let events = (trace && k == 0).then_some(&mut events);
-                    run(&config.world, &policy.scheduler, config.seed, k, events)
+                    let admission = policy.admission;
+                    run(
+                        &config.world,
+                        admission,
+                        &policy.scheduler,
+                        config.seed,
+                        k,
+                        events,
+                    )
                 })
                 .collect();
             PolicyReport {
@@ -193,12 +226,18 @@ fn drive(
         }
         same_instant = 0;
         match world.next_event() {
-            None if observation.prs.is_empty() && observation.batches.is_empty() => return Ok(()),
+            None if observation.prs.is_empty()
+                && observation.batches.is_empty()
+                && world.out() == 0 =>
+            {
+                return Ok(());
+            }
             None => {
                 return Err(SimError::Stuck {
                     at,
                     queued: observation.prs.len(),
                     tracked: observation.batches.len(),
+                    out: world.out(),
                 });
             }
             Some(t) if t > deadline => {

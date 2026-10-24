@@ -38,9 +38,16 @@ event-driven simulator that runs any scheduler against a world of pull
 requests with hidden truths (bad ones, pairs that break only together,
 flaky runs, a fixed number of runners) and reports runner-hours per landed
 pull request, time to land and to reject, wasted runner time and false
-ejections. In the busy example world, a high-velocity team's, `bisect`'s
-pooling does not pay — it does best with no pooling at all — and `bayes`
-is the policy that keeps up; see **Simulator reports**.
+ejections. The world also charges PR CI, the CI a pull request runs on its
+own, to the same runners: at arrival, after each push, and after the rebase
+that a conflict or, under GitHub's admission, a landed base forces. As the
+GitHub forge does, it lets a pull request into a batch only once its
+current head has passed, so runner cost and time to land include it. In
+the busy example world, a high-velocity team's, `bisect` does not keep up
+at any batch cap and its pooling does not pay — it does as well with no
+pooling at all — while `bayes` is the only policy that comes close to
+keeping up; see
+**Simulator reports**.
 
 ```sh
 make run ARGS="run --config $PWD/crates/dorfq/examples/mock.toml --exit-when-idle"
@@ -58,20 +65,24 @@ prints one column per policy.
 
 ## Simulator reports
 
-The report site, published on this repository's GitHub Pages, shows each
-shipped simulator example (`crates/dorfq-sim/examples/`): every policy's headline
+The report site, published at <https://rnortman.github.io/dorfq/>, shows <!-- gitleaks:allow -->
+each shipped simulator example (`crates/dorfq-sim/examples/`): every policy's headline
 numbers as deltas against the `github-like` column, an approximation of
 GitHub's own merge queue, the full metric table, and a replay of the first
 replication — runners, batches, the queue with its stacks, and trunk —
-switchable between policies over the same arrivals. The Pages workflow
+switchable between policies over the same arrivals. Each report shows the
+configuration it ran with, its comments explaining every parameter, and a
+playground runs the simulator in the browser, compiled to WebAssembly, on a
+configuration you edit, starting from the report's own. The Pages workflow
 (`.github/workflows/pages.yml`) builds and deploys it on every push to
 `main`.
 
 `dorfq-sim run --config F --json PATH` writes the document the site reads.
-`make sim-report` builds every example's under `bazel-bin/site/reports/`;
+`make sim-report` builds every example's under `bazel-bin/site/reports/`
+and the browser simulator at `bazel-bin/site/dorfq_sim_wasm.wasm`;
 `make check` builds them too, so an example that fails is a red gate.
 To view the site locally, open `site/index.html` and load a report through
-its file picker.
+its file picker; the playground needs the page served over HTTP.
 
 ## Running against GitHub
 
@@ -247,8 +258,12 @@ invocation.
   - `crates/dorfq-sim/` — the simulator: a seeded world that implements the
     forge side of the contract, the loop that runs a scheduler against it,
     the metrics and the `dorfq-sim` binary.
+  - `crates/dorfq-sim-wasm/` — the simulator as a WebAssembly module for
+    the report site's playground.
 - `site/` — the simulator report site: a static page and the Bazel rules
-  that run the examples into its reports.
+  that run the examples into its reports. `site/sim-worker.js` runs the
+  playground's simulator off the page's thread; `site/wasm.bzl` builds it
+  for wasm32, optimised.
 - `tools/scrub/` — the secret scanner the commit, push and CI gates run,
   built by Bazel from its published crate with a pinned gitleaks.
 - `tools/allthechanges/` — the changelog and TODO fragment tool, built by

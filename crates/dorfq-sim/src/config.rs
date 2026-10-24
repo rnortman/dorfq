@@ -30,8 +30,15 @@ pub struct WorldConfig {
     pub arrivals_per_hour: f64,
     /// Concurrent CI runs; further runs wait for a runner.
     pub runners: usize,
-    /// Uniform run duration.
-    pub ci_minutes: CiMinutes,
+    /// Uniform duration of a batch's CI run.
+    pub ci_minutes: Minutes,
+    /// Uniform duration of a pull request's own CI run, which must pass on
+    /// its current head before a batch may take it; `{ min = 0, max = 0 }`
+    /// costs no runner time, but the run still waits its turn for a runner.
+    pub pr_ci_minutes: Minutes,
+    /// Uniform delay from a rebase becoming necessary — a conflict, or under
+    /// `github` admission a landed base — to the author's push of it.
+    pub rebase_minutes: Minutes,
     /// A pull request breaks on its own against trunk.
     pub p_bad: f64,
     /// A pair of pull requests whose queue time overlapped break only together.
@@ -51,12 +58,29 @@ pub struct WorldConfig {
     pub p_atomic: f64,
 }
 
-/// Bounds of the uniform CI run duration, in minutes.
+/// Bounds of a uniform duration, in minutes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct CiMinutes {
+pub struct Minutes {
     pub min: u64,
     pub max: u64,
+}
+
+/// What the queue asks of a pull request before it sees it, and what
+/// takes one out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Admission {
+    /// DorfQ's: the label is the intent. A pull request is in the queue from
+    /// arrival, stacked on its base, held until its own CI passes on its
+    /// current head; a conflict takes it and its descendants out for a
+    /// rebase.
+    Label,
+    /// GitHub's: the queue sees a pull request only once it is on trunk and
+    /// its current head has passed its own CI. A stacked pull request waits
+    /// for its base to land, is rebased and re-checked; a push takes an
+    /// enqueued one out until the new head passes.
+    Github,
 }
 
 /// One scheduler under comparison, told apart by `name`.
@@ -64,6 +88,7 @@ pub struct CiMinutes {
 pub struct Policy {
     /// The report's column header and the trace's label; unique.
     pub name: String,
+    pub admission: Admission,
     #[serde(flatten)]
     pub scheduler: SchedulerConfig,
 }
@@ -116,6 +141,24 @@ fn rate(field: &str, r: f64) -> Result<(), SimConfigError> {
     }
 }
 
+/// Checks a duration's bounds and returns its maximum in seconds.
+fn minutes(field: &str, m: Minutes) -> Result<u128, SimConfigError> {
+    if m.min > m.max {
+        return Err(invalid(
+            format!("world.{field}"),
+            "must have min no greater than max",
+        ));
+    }
+    let longest = u128::from(m.max) * 60;
+    if longest >= u128::from(u64::MAX) {
+        return Err(invalid(
+            format!("world.{field}"),
+            "must have a max that fits the simulator's clock",
+        ));
+    }
+    Ok(longest)
+}
+
 impl SimConfig {
     /// Parses and validates a configuration file's text.
     pub fn parse(text: &str) -> Result<SimConfig, SimConfigError> {
@@ -159,27 +202,18 @@ impl WorldConfig {
         if self.runners == 0 {
             return Err(invalid("world.runners", "must be at least 1"));
         }
-        if self.ci_minutes.min > self.ci_minutes.max {
-            return Err(invalid(
-                "world.ci_minutes",
-                "must have min no greater than max",
-            ));
-        }
-        // The clock is u64 seconds: the deadline plus the longest run must
-        // stay below its end, so no run and no deadline overflows it.
-        let longest_run = u128::from(self.ci_minutes.max) * 60;
-        if longest_run >= u128::from(u64::MAX) {
-            return Err(invalid(
-                "world.ci_minutes",
-                "must have a max that fits the simulator's clock",
-            ));
-        }
+        let longest_run = minutes("ci_minutes", self.ci_minutes)?;
+        let longest_pr_ci = minutes("pr_ci_minutes", self.pr_ci_minutes)?;
+        let longest_rebase = minutes("rebase_minutes", self.rebase_minutes)?;
+        // The clock is u64 seconds: the deadline plus the longest delay must
+        // stay below its end, so no delay and no deadline overflows it.
+        let longest = longest_run.max(longest_pr_ci).max(longest_rebase);
         let deadline =
             (u128::from(self.hours) + u128::from(self.drain_hours)) * u128::from(crate::HOUR);
-        if deadline + longest_run >= u128::from(u64::MAX) {
+        if deadline + longest >= u128::from(u64::MAX) {
             return Err(invalid(
                 "world.hours",
-                "plus drain_hours and the longest CI run must fit the simulator's clock",
+                "plus drain_hours and the longest delay must fit the simulator's clock",
             ));
         }
         probability("p_bad", self.p_bad)?;
@@ -205,6 +239,8 @@ drain_hours = 24
 arrivals_per_hour = 4.0
 runners = 2
 ci_minutes = { min = 150, max = 210 }
+pr_ci_minutes = { min = 40, max = 60 }
+rebase_minutes = { min = 15, max = 120 }
 p_bad = 0.05
 p_interact = 0.002
 p_flake = 0.02
@@ -222,10 +258,12 @@ p_atomic = 0.2
     const POLICIES: &str = "\
 [[policy]]
 name = \"floor\"
+admission = \"label\"
 kind = \"all-at-once\"
 
 [[policy]]
 name = \"bisect\"
+admission = \"github\"
 kind = \"bisect\"
 lanes = 2
 max_batch = 16
@@ -258,13 +296,25 @@ max_batch = 16
         assert_eq!(config.world.drain_hours, 24);
         assert_eq!(config.world.arrivals_per_hour, 0.75);
         assert_eq!(config.world.runners, 2);
-        assert_eq!(config.world.ci_minutes, CiMinutes { min: 150, max: 210 });
+        assert_eq!(config.world.ci_minutes, Minutes { min: 150, max: 210 });
+        assert_eq!(config.world.pr_ci_minutes, Minutes { min: 40, max: 60 });
+        assert_eq!(config.world.rebase_minutes, Minutes { min: 15, max: 120 });
         assert_eq!((config.world.p_stacked, config.world.p_atomic), (0.25, 0.2));
         let policies: Vec<_> = config
             .policy
             .iter()
             .map(|p| (p.name.as_str(), &p.scheduler))
             .collect();
+        let admissions: Vec<Admission> = config.policy.iter().map(|p| p.admission).collect();
+        assert_eq!(
+            admissions,
+            [
+                Admission::Label,
+                Admission::Github,
+                Admission::Label,
+                Admission::Label
+            ]
+        );
         assert_eq!(
             policies,
             [
@@ -307,6 +357,18 @@ max_batch = 16
         let config = SimConfig::parse(include_str!("../examples/busy.toml")).unwrap();
         assert_eq!(config.world.arrivals_per_hour, 5.0);
         assert_eq!(config.world.runners, 6);
+        assert_eq!(config.world.pr_ci_minutes, Minutes { min: 15, max: 25 });
+        assert_eq!(config.world.rebase_minutes, Minutes { min: 15, max: 120 });
+        let admissions: Vec<Admission> = config.policy.iter().map(|p| p.admission).collect();
+        assert_eq!(
+            admissions,
+            [
+                Admission::Label,
+                Admission::Github,
+                Admission::Label,
+                Admission::Label
+            ]
+        );
         let names: Vec<&str> = config.policy.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["all-at-once", "github-like", "bisect", "bayes"]);
         assert_eq!(
@@ -352,8 +414,33 @@ max_batch = 16
         let value = serde_json::to_value(&config).unwrap();
         assert_eq!(
             value["policy"][1],
-            serde_json::json!({ "name": "github-like", "kind": "bisect", "lanes": 5, "max_batch": 1 })
+            serde_json::json!({
+                "name": "github-like", "admission": "github",
+                "kind": "bisect", "lanes": 5, "max_batch": 1
+            })
         );
+    }
+
+    /// The report page shows an example's text as its parameters, so each
+    /// parameter's comment is its explanation.
+    #[test]
+    fn every_parameter_line_of_each_example_is_commented() {
+        for (name, text) in [
+            ("sim.toml", include_str!("../examples/sim.toml")),
+            ("busy.toml", include_str!("../examples/busy.toml")),
+        ] {
+            let parameters = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('['));
+            for line in parameters {
+                let comment = line.split_once(" # ").map(|(_, c)| c.trim());
+                assert!(
+                    comment.is_some_and(|c| !c.is_empty()),
+                    "{name}: no comment on {line:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -380,6 +467,8 @@ max_batch = 16
             ("repush_per_hour", "-1.0"),
             ("withdraw_per_hour", "inf"),
             ("ci_minutes", "{ min = 3, max = 2 }"),
+            ("pr_ci_minutes", "{ min = 3, max = 2 }"),
+            ("rebase_minutes", "{ min = 3, max = 2 }"),
         ] {
             let message = rejected(&with(field, value));
             assert!(message.contains(&format!("world.{field}")), "{message}");
@@ -400,6 +489,21 @@ max_batch = 16
             "{ min = 0, max = 18446744073709551615 }",
         ));
         assert!(ci.contains("world.ci_minutes"), "{ci}");
+        let pr_ci = rejected(&with(
+            "pr_ci_minutes",
+            "{ min = 0, max = 18446744073709551615 }",
+        ));
+        assert!(pr_ci.contains("world.pr_ci_minutes"), "{pr_ci}");
+        let rebase = rejected(&with(
+            "rebase_minutes",
+            "{ min = 0, max = 18446744073709551615 }",
+        ));
+        assert!(rebase.contains("world.rebase_minutes"), "{rebase}");
+        // Each fits on its own, but not after the deadline.
+        for field in ["pr_ci_minutes", "rebase_minutes"] {
+            let late = rejected(&with(field, "{ min = 0, max = 307445734561825860 }"));
+            assert!(late.contains("world.hours"), "{field}: {late}");
+        }
         // A rate small enough to mean "never" is legal.
         SimConfig::parse(&with("repush_per_hour", "1e-30")).unwrap();
     }
@@ -408,7 +512,13 @@ max_batch = 16
     fn unknown_and_missing_fields_are_named() {
         let unknown = file(&format!("{WORLD}speed = 3\n"), POLICIES);
         assert!(rejected(&unknown).contains("speed"));
-        for field in ["runners", "p_stacked", "p_atomic"] {
+        for field in [
+            "runners",
+            "pr_ci_minutes",
+            "rebase_minutes",
+            "p_stacked",
+            "p_atomic",
+        ] {
             let line = WORLD.lines().find(|l| l.starts_with(&format!("{field} ")));
             let missing = WORLD.replace(&format!("{}\n", line.unwrap()), "");
             assert!(
@@ -416,6 +526,19 @@ max_batch = 16
                 "{field}"
             );
         }
+    }
+
+    #[test]
+    fn a_policy_without_a_known_admission_is_rejected_naming_it() {
+        let missing = POLICIES.replace("admission = \"label\"\n", "");
+        let message = rejected(&file(WORLD, &missing));
+        assert!(message.contains("admission"), "{message}");
+        let unknown = POLICIES.replace("admission = \"label\"", "admission = \"gitlab\"");
+        let message = rejected(&file(WORLD, &unknown));
+        assert!(message.contains("gitlab"), "{message}");
+        let both = SimConfig::parse(&file(WORLD, POLICIES)).unwrap();
+        let admissions: Vec<Admission> = both.policy.iter().map(|p| p.admission).collect();
+        assert_eq!(admissions, [Admission::Label, Admission::Github]);
     }
 
     #[test]

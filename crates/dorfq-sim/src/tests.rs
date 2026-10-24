@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use dorfq_core::{
-    BatchId, BatchStart, ConflictWith, EjectReason, Ejection, PrNumber, SchedulerError, Sha,
-    Timestamp,
+    BatchId, BatchStart, ConflictWith, EjectReason, Ejection, PrNumber, PrStatus, SchedulerError,
+    Sha, Timestamp,
 };
 
 use super::*;
@@ -18,7 +18,9 @@ fn small(p_bad: f64, p_interact: f64, p_flake: f64, p_conflict: f64) -> WorldCon
         drain_hours: 48,
         arrivals_per_hour: 3.0,
         runners: 2,
-        ci_minutes: CiMinutes { min: 20, max: 40 },
+        ci_minutes: Minutes { min: 20, max: 40 },
+        pr_ci_minutes: Minutes { min: 5, max: 15 },
+        rebase_minutes: Minutes { min: 15, max: 60 },
         p_bad,
         p_interact,
         p_flake,
@@ -65,10 +67,19 @@ fn bayes() -> SchedulerConfig {
 
 /// Runs to the end, asserting no failure, the world's invariants and the
 /// count identity.
-fn replicate_cleanly(config: &WorldConfig, scheduler: &SchedulerConfig, seed: u64) -> World {
-    let (world, outcome) = replicate(config, scheduler, seed, 0, None);
-    assert_eq!(outcome, Ok(()), "{scheduler:?}");
-    assert_eq!(world.check_invariants(), Ok(()), "{scheduler:?}");
+fn replicate_cleanly(
+    config: &WorldConfig,
+    admission: Admission,
+    scheduler: &SchedulerConfig,
+    seed: u64,
+) -> World {
+    let (world, outcome) = replicate(config, admission, scheduler, seed, 0, None);
+    assert_eq!(outcome, Ok(()), "{scheduler:?} under {admission:?}");
+    assert_eq!(
+        world.check_invariants(),
+        Ok(()),
+        "{scheduler:?} under {admission:?}"
+    );
     let m = world.metrics();
     let ejected = m.ejected_bad + m.ejected_good;
     let left = m.landed + ejected + m.withdrawn + m.blocked;
@@ -158,7 +169,7 @@ impl Scheduler for Restless {
             retire: o.batches.iter().map(|b| b.id).collect(),
             ..Plan::default()
         };
-        if let Some(pr) = o.prs.first() {
+        if let Some(pr) = o.prs.iter().find(|p| p.status == PrStatus::Ready) {
             self.next += 1;
             plan.start.push(BatchStart::new(
                 BatchId(self.next),
@@ -182,7 +193,7 @@ impl Scheduler for Idle {
 #[test]
 fn a_scheduler_that_never_settles_is_livelocked() {
     let config = small(0.0, 0.0, 0.0, 0.0);
-    let mut world = World::new(config, Streams::for_replication(1, 0));
+    let mut world = World::new(config, Admission::Label, Streams::for_replication(1, 0));
     let outcome = drive(&mut world, &mut Restless { next: 0 }, u64::MAX, None);
     let Err(SimError::Livelock { at }) = outcome else {
         panic!("expected a livelock, got {outcome:?}");
@@ -193,7 +204,7 @@ fn a_scheduler_that_never_settles_is_livelocked() {
 #[test]
 fn a_scheduler_that_never_acts_on_a_conflicting_pull_request_is_stuck() {
     let config = small(0.0, 0.0, 0.0, 1.0);
-    let mut world = World::new(config, Streams::for_replication(1, 0));
+    let mut world = World::new(config, Admission::Label, Streams::for_replication(1, 0));
     let outcome = drive(&mut world, &mut Idle, u64::MAX, None);
     let Err(SimError::Stuck {
         queued, tracked, ..
@@ -237,7 +248,7 @@ impl Scheduler for Stumped {
 #[test]
 fn a_scheduler_error_ends_the_replication_as_its_failure() {
     let config = small(0.0, 0.0, 0.0, 0.0);
-    let mut world = World::new(config, Streams::for_replication(1, 0));
+    let mut world = World::new(config, Admission::Label, Streams::for_replication(1, 0));
     let outcome = drive(&mut world, &mut Stumped, u64::MAX, None);
     let error = outcome.unwrap_err();
     let SimError::Scheduler { at, message } = &error else {
@@ -254,7 +265,7 @@ fn a_scheduler_error_ends_the_replication_as_its_failure() {
 #[test]
 fn observations_carry_the_world_clock() {
     let config = small(0.0, 0.0, 0.0, 0.0);
-    let mut world = World::new(config, Streams::for_replication(1, 0));
+    let mut world = World::new(config, Admission::Label, Streams::for_replication(1, 0));
     assert_eq!(world.observe().unwrap().now, Timestamp(0));
     let next = world.next_event().expect("an arrival is scheduled");
     world.advance_to(next);
@@ -264,7 +275,7 @@ fn observations_carry_the_world_clock() {
 #[test]
 fn a_violating_plan_is_the_last_step_of_the_trace() {
     let config = small(0.0, 0.0, 0.0, 0.0);
-    let mut world = World::new(config, Streams::for_replication(1, 0)).traced();
+    let mut world = World::new(config, Admission::Label, Streams::for_replication(1, 0)).traced();
     let mut events = Vec::new();
     let outcome = drive(&mut world, &mut Rogue, u64::MAX, Some(&mut events));
     let Err(SimError::Violation { at: 0, message }) = outcome else {
@@ -284,11 +295,11 @@ fn a_replication_cut_off_at_the_deadline_counts_its_unfinished_work() {
     let config = WorldConfig {
         drain_hours: 0,
         runners: 1,
-        ci_minutes: CiMinutes { min: 90, max: 120 },
+        ci_minutes: Minutes { min: 90, max: 120 },
         ..small(0.1, 0.0, 0.0, 0.0)
     };
     let deadline = config.hours * HOUR;
-    let world = replicate_cleanly(&config, &bisect(), 1);
+    let world = replicate_cleanly(&config, Admission::Label, &bisect(), 1);
     let m = world.metrics();
     assert!(m.unfinished > 0, "{m:?}");
     assert_eq!(world.now(), deadline);
@@ -303,7 +314,7 @@ fn a_replication_cut_off_at_the_deadline_counts_its_unfinished_work() {
 fn an_empty_world_drains_at_once() {
     let mut config = small(0.0, 0.0, 0.0, 0.0);
     config.arrivals_per_hour = 0.0;
-    let metrics = run(&config, &bisect(), 1, 0, None).unwrap();
+    let metrics = run(&config, Admission::Label, &bisect(), 1, 0, None).unwrap();
     assert_eq!(metrics.arrived, 0);
     assert_eq!(metrics.runner_hours_per_landed, None);
 }
@@ -313,7 +324,14 @@ fn one_seed_and_one_policy_give_identical_metrics_records_and_traces() {
     let config = small(0.1, 0.01, 0.05, 0.05);
     let traced = || {
         let mut events = Vec::new();
-        let (world, outcome) = replicate(&config, &bisect(), 7, 0, Some(&mut events));
+        let (world, outcome) = replicate(
+            &config,
+            Admission::Label,
+            &bisect(),
+            7,
+            0,
+            Some(&mut events),
+        );
         assert_eq!(outcome, Ok(()));
         let records = (world.metrics(), world.pr_records(), world.runs().to_vec());
         (records, events)
@@ -332,9 +350,10 @@ fn one_seed_and_one_policy_give_identical_metrics_records_and_traces() {
 #[test]
 fn two_policies_at_one_seed_see_identical_arrivals_truths_and_cut_from_targets() {
     let config = stacking();
-    let (floor, _) = replicate(&config, &SchedulerConfig::AllAtOnce {}, 5, 0, None);
-    let (bisect, _) = replicate(&config, &bisect(), 5, 0, None);
-    let (bayes, _) = replicate(&config, &bayes(), 5, 0, None);
+    let floor = SchedulerConfig::AllAtOnce {};
+    let (floor, _) = replicate(&config, Admission::Label, &floor, 5, 0, None);
+    let (bisect, _) = replicate(&config, Admission::Github, &bisect(), 5, 0, None);
+    let (bayes, _) = replicate(&config, Admission::Label, &bayes(), 5, 0, None);
     assert!(floor.truths().len() > 5);
     assert!(floor.truths().iter().any(|t| t.4.is_some()));
     assert_eq!(floor.truths(), bisect.truths());
@@ -352,21 +371,65 @@ fn stacking() -> WorldConfig {
 }
 
 #[test]
-fn every_policy_drains_a_stacking_world_under_churn() {
+fn every_policy_drains_a_stacking_world_under_churn_under_either_admission() {
     let mut blocked = 0;
-    for scheduler in [SchedulerConfig::AllAtOnce {}, bisect(), bayes()] {
+    for (admission, scheduler) in [Admission::Label, Admission::Github]
+        .into_iter()
+        .flat_map(|a| {
+            [
+                (a, SchedulerConfig::AllAtOnce {}),
+                (a, bisect()),
+                (a, bayes()),
+            ]
+        })
+    {
         // Seeds at which a pull request that arrived stacked landed.
         let mut landed_stacked = 0;
+        let mut rebases = 0;
+        // A batch started after a member's own CI passed, at a later instant.
+        let mut gated = false;
         for seed in 1..=4 {
             let mut events = Vec::new();
-            let (world, outcome) = replicate(&stacking(), &scheduler, seed, 0, Some(&mut events));
-            assert_eq!(outcome, Ok(()), "{scheduler:?} at seed {seed}");
-            assert_eq!(world.check_invariants(), Ok(()), "{scheduler:?}");
+            let (world, outcome) = replicate(
+                &stacking(),
+                admission,
+                &scheduler,
+                seed,
+                0,
+                Some(&mut events),
+            );
+            let what = format!("{scheduler:?} under {admission:?} at seed {seed}");
+            assert_eq!(outcome, Ok(()), "{what}");
+            assert_eq!(world.check_invariants(), Ok(()), "{what}");
+            assert_eq!(crate::trace::check_lives(&events), Ok(()), "{what}");
             let m = world.metrics();
             let left = m.landed + m.ejected_bad + m.ejected_good + m.withdrawn + m.blocked;
             assert_eq!(m.arrived, left + m.unfinished, "{m:?}");
-            assert_eq!(m.unfinished, 0, "{scheduler:?} at seed {seed}: {m:?}");
+            assert_eq!(m.unfinished, 0, "{what}: {m:?}");
             blocked += m.blocked;
+            rebases += m.rebases;
+            if admission == Admission::Github {
+                let stacked_admit = events
+                    .iter()
+                    .find(|e| matches!(e, TraceEvent::Admit { base: Some(_), .. }));
+                assert_eq!(stacked_admit, None, "{what}");
+            }
+            let mut passed_at = BTreeMap::new();
+            for event in &events {
+                match event {
+                    TraceEvent::PrCiEnd {
+                        t,
+                        pr,
+                        cancelled: false,
+                    } => {
+                        passed_at.insert(*pr, *t);
+                    }
+                    TraceEvent::Start { t, members, .. } => {
+                        gated |= members.iter().any(|m| passed_at.get(m) < Some(t));
+                    }
+                    _ => {}
+                }
+            }
             let stacked: Vec<u64> = events
                 .iter()
                 .filter_map(|e| match e {
@@ -383,8 +446,12 @@ fn every_policy_drains_a_stacking_world_under_churn() {
         }
         assert!(
             landed_stacked > 0,
-            "{scheduler:?} never landed a stacked pull request"
+            "{scheduler:?} under {admission:?} never landed a stacked pull request"
         );
+        assert!(gated, "{scheduler:?} under {admission:?}");
+        if admission == Admission::Github {
+            assert!(rebases > 0, "{scheduler:?} under {admission:?}");
+        }
     }
     assert!(blocked > 0, "no pull request was ever blocked");
 }
@@ -412,7 +479,7 @@ fn all_at_once_ejects_every_member_of_a_failed_batch() {
     // Seed-pinned: at this seed some failing batch holds a pull request
     // that interacts with nothing, so the floor ejects a good one.
     let config = small(0.0, 0.05, 0.0, 0.0);
-    let world = replicate_cleanly(&config, &SchedulerConfig::AllAtOnce {}, 3);
+    let world = replicate_cleanly(&config, Admission::Label, &SchedulerConfig::AllAtOnce {}, 3);
     let exits: BTreeMap<PrNumber, Option<(u64, Exit)>> = world
         .pr_records()
         .into_iter()
@@ -448,7 +515,7 @@ fn bisect_lands_every_good_and_ejects_every_bad_pull_request_without_flakes() {
     // read as its own only once everything beneath it passed.
     for seed in 1..=4 {
         let config = small(0.2, 0.0, 0.0, 0.1);
-        let world = replicate_cleanly(&config, &bisect(), seed);
+        let world = replicate_cleanly(&config, Admission::Label, &bisect(), seed);
         let m = world.metrics();
         assert_eq!(
             (m.ejected_good, m.unfinished, m.withdrawn),
@@ -467,7 +534,7 @@ fn bisect_lands_every_good_pull_request_beside_interacting_pairs_without_flakes(
     // seed-specific: the 48-hour drain is ample for six hours of arrivals.
     for seed in 1..=4 {
         let config = small(0.05, 0.05, 0.0, 0.0);
-        let world = replicate_cleanly(&config, &bisect(), seed);
+        let world = replicate_cleanly(&config, Admission::Label, &bisect(), seed);
         let m = world.metrics();
         assert_eq!((m.ejected_good, m.unfinished), (0, 0), "{m:?}");
         assert!(m.landed > 0 && m.ejected_bad > 0, "{m:?}");
@@ -479,8 +546,10 @@ fn every_policy_runs_cleanly_under_repushes_and_withdrawals() {
     for seed in 1..=4 {
         let config = churning(0.1, 0.02, 0.05);
         for scheduler in [SchedulerConfig::AllAtOnce {}, bisect(), bayes()] {
-            let world = replicate_cleanly(&config, &scheduler, seed);
-            assert!(world.metrics().withdrawn > 0, "{:?}", world.metrics());
+            for admission in [Admission::Label, Admission::Github] {
+                let world = replicate_cleanly(&config, admission, &scheduler, seed);
+                assert!(world.metrics().withdrawn > 0, "{:?}", world.metrics());
+            }
         }
     }
 }
@@ -531,7 +600,7 @@ fn flaky() -> WorldConfig {
 #[test]
 fn bayes_ejects_only_members_of_failed_runs_it_names_in_a_flake_free_world() {
     let config = small(0.2, 0.0, 0.0, 0.1);
-    let world = replicate_cleanly(&config, &bayes(), 1);
+    let world = replicate_cleanly(&config, Admission::Label, &bayes(), 1);
     assert!(assert_ejections_name_failed_runs_of_their_tree(&world) > 0);
     let m = world.metrics();
     assert!(m.landed > 0 && m.ejected_bad > 0, "{m:?}");
@@ -543,14 +612,14 @@ fn bayes_ejects_only_members_of_failed_runs_it_names_in_a_flake_free_world() {
 #[test]
 fn bayes_ejects_no_good_pull_request_where_bisect_does_in_a_flaky_world() {
     let config = flaky();
-    let world = replicate_cleanly(&config, &bayes(), 1);
+    let world = replicate_cleanly(&config, Admission::Label, &bayes(), 1);
     assert_ejections_name_failed_runs_of_their_tree(&world);
     let m = world.metrics();
     assert!(m.landed > 0, "{m:?}");
     // Seed-pinned comparison, not an invariant: `Bayes` ejects a good pull
     // request when two lone runs of it flake, `Bisect` when one does.
     assert_eq!(m.ejected_good, 0, "{m:?}");
-    let baseline = replicate_cleanly(&config, &bisect(), 1).metrics();
+    let baseline = replicate_cleanly(&config, Admission::Label, &bisect(), 1).metrics();
     assert!(baseline.ejected_good > 0, "{baseline:?}");
 }
 
@@ -558,7 +627,14 @@ fn bayes_ejects_no_good_pull_request_where_bisect_does_in_a_flaky_world() {
 fn every_policy_in_the_example_world_runs_one_replication_cleanly() {
     let config = SimConfig::parse(EXAMPLE).unwrap();
     for policy in &config.policy {
-        let (world, outcome) = replicate(&config.world, &policy.scheduler, config.seed, 0, None);
+        let (world, outcome) = replicate(
+            &config.world,
+            policy.admission,
+            &policy.scheduler,
+            config.seed,
+            0,
+            None,
+        );
         assert_eq!(outcome, Ok(()), "policy {}", policy.name);
         assert_eq!(world.check_invariants(), Ok(()), "policy {}", policy.name);
     }
@@ -590,9 +666,10 @@ fn the_json_document_holds_every_policy_and_a_trace_from_time_zero() {
     let report = simulate(&config, true);
     assert!(!report.failed(), "{report}");
     let document: serde_json::Value =
-        serde_json::from_str(&report.to_json("stacking", &config)).unwrap();
-    assert_eq!(document["schema"], SCHEMA);
+        serde_json::from_str(&report.to_json("stacking", &config, EXAMPLE)).unwrap();
+    assert_eq!(document["schema"], 2);
     assert_eq!(document["name"], "stacking");
+    assert_eq!(document["config_text"], EXAMPLE);
     assert_eq!(document["config"]["world"]["p_stacked"], 0.5);
     let policies = document["policies"].as_array().unwrap();
     assert_eq!(policies.len(), config.policy.len());
@@ -611,7 +688,26 @@ fn the_json_document_holds_every_policy_and_a_trace_from_time_zero() {
         );
         let mut arrived = BTreeSet::new();
         let mut started = BTreeSet::new();
+        // Per pull request, its PR CI run's state: requested or running.
+        let mut pr_ci: BTreeMap<u64, &str> = BTreeMap::new();
         for event in trace {
+            let pr = event["pr"].as_u64();
+            match event["kind"].as_str().unwrap() {
+                "pr_ci" => {
+                    let before = pr_ci.insert(pr.unwrap(), "requested");
+                    assert_eq!(before, None, "{event}: a run already open");
+                }
+                "pr_ci_begin" => {
+                    let state = pr_ci.get_mut(&pr.unwrap());
+                    assert_eq!(state.as_deref(), Some(&"requested"), "{event}");
+                    *state.unwrap() = "running";
+                }
+                "pr_ci_end" => {
+                    let state = pr_ci.remove(&pr.unwrap());
+                    assert!(state.is_some(), "{event}: no run open");
+                }
+                _ => {}
+            }
             if event["kind"] == "arrive" {
                 arrived.insert(event["pr"].as_u64().unwrap());
             }
@@ -629,5 +725,10 @@ fn the_json_document_holds_every_policy_and_a_trace_from_time_zero() {
             }
         }
         assert!(started.len() > 1, "{}", configured.name);
+        assert!(
+            pr_ci.values().all(|&state| state != "running"),
+            "{}: a PR CI run begun and never ended: {pr_ci:?}",
+            configured.name
+        );
     }
 }

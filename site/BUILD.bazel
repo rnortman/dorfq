@@ -1,6 +1,9 @@
+load(":wasm.bzl", "wasm_module")
+
 # The report site's data: each shipped simulator example run through
 # `dorfq-sim run --json`, plus the index the page reads to list them. The
-# page itself (index.html, app.js, style.css) is static and has no build.
+# page itself (index.html, app.js, style.css, sim-worker.js) is static and
+# has no build.
 # TODO(test-site-app-js-untested-against-report-schema): nothing checks that
 # app.js parses or that the fields it reads exist in these documents.
 #
@@ -29,4 +32,13 @@ genrule(
 filegroup(
     name = "reports",
     srcs = [":report_index"] + [":report_" + example for example in EXAMPLES],
+)
+
+# The playground's simulator: dorfq-sim compiled to WebAssembly. Part of
+# `//...`, so the gate builds it and a dependency that stops compiling for
+# wasm32 is a red build, not a red deploy.
+wasm_module(
+    name = "wasm",
+    out = "dorfq_sim_wasm.wasm",
+    deps = ["//crates/dorfq-sim-wasm:dorfq_sim_wasm"],
 )

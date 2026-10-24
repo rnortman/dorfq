@@ -62,7 +62,7 @@ fn run(path: &Path, trace: bool, json: Option<&Path>) -> ExitCode {
             eprintln!("dorfq-sim: {}: no UTF-8 file stem", path.display());
             return ExitCode::FAILURE;
         };
-        if let Err(error) = fs::write(out, report.to_json(name, &config)) {
+        if let Err(error) = fs::write(out, report.to_json(name, &config, &text)) {
             eprintln!("dorfq-sim: {}: {error}", out.display());
             return ExitCode::FAILURE;
         }

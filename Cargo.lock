@@ -241,6 +241,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dorfq-sim-wasm"
+version = "0.0.0"
+dependencies = [
+ "dorfq-sim",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

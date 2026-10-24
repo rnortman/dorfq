@@ -1,6 +1,6 @@
 //! Per-pull-request and per-run records, and one replication's summary.
 
-use dorfq_core::{BatchId, CiStatus, EjectReason, PrNumber};
+use dorfq_core::{BatchId, CiStatus, EjectReason, PrNumber, Sha};
 use serde::Serialize;
 
 const HOUR: f64 = crate::HOUR as f64;
@@ -27,8 +27,11 @@ pub enum Exit {
 pub struct PrRecord {
     pub number: PrNumber,
     pub arrived_at: u64,
-    /// When and how it left; `None` while queued.
+    /// When and how it left; `None` while in the world.
     pub left: Option<(u64, Exit)>,
+    /// Rebases pushed: after a conflict, or a landed base under `github`
+    /// admission.
+    pub rebases: u32,
 }
 
 /// One run that reached a runner.
@@ -51,6 +54,20 @@ pub struct RunRecord {
     pub landed: bool,
 }
 
+/// One pull request's own CI run that reached a runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrCiRecord {
+    pub pr: PrNumber,
+    /// The head it ran on.
+    pub head: Sha,
+    pub started_at: u64,
+    /// Seconds of runner time used: the whole duration once it completed,
+    /// the elapsed time once cancelled, 0 while running.
+    pub consumed: u64,
+    /// True when a head change cut it short.
+    pub cancelled: bool,
+}
+
 /// One replication's summary; `None` where the set it summarises is empty.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Metrics {
@@ -63,16 +80,24 @@ pub struct Metrics {
     /// Left because a base left without landing.
     pub blocked: usize,
     pub unfinished: usize,
+    /// Rebases pushed, over every pull request.
+    pub rebases: u64,
+    /// Batch runs that reached a runner, cancelled included.
     pub runs: usize,
     pub mean_batch_size: Option<f64>,
-    /// Runner time used: every finished or cancelled run's consumed time,
-    /// plus the elapsed time of runs still running when the replication
-    /// stopped.
+    /// Pull requests' own CI runs that reached a runner, cancelled included.
+    pub pr_ci_runs: usize,
+    /// Runner time used by batch runs and PR CI runs alike: every finished
+    /// or cancelled run's consumed time, plus the elapsed time of runs
+    /// still running when the replication stopped.
     pub runner_hours: f64,
+    /// The part of `runner_hours` PR CI runs used.
+    pub pr_ci_hours: f64,
     pub runner_hours_per_landed: Option<f64>,
-    /// The share of `runner_hours` spent on runs that ended without landing
-    /// (failed, cancelled, refused, passed on a dead base). Runs still
-    /// running at the stop have no outcome and are not counted as waste.
+    /// The share of batch runs' runner time spent on batch runs that ended
+    /// without landing (failed, cancelled, refused, passed on a dead base).
+    /// Runs still running at the stop have no outcome and are not counted
+    /// as waste. PR CI is not in it, on either side.
     pub wasted_fraction: Option<f64>,
     pub land_p50_hours: Option<f64>,
     pub land_p95_hours: Option<f64>,
@@ -96,14 +121,22 @@ fn ratio(numerator: f64, denominator: f64) -> Option<f64> {
     (denominator > 0.0).then(|| numerator / denominator)
 }
 
+/// Runner-seconds used so far by the runs still running, by kind of run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunningSeconds {
+    pub batches: u64,
+    pub pr_ci: u64,
+}
+
 impl Metrics {
     /// Summarises the records of a replication that ended at `elapsed`
-    /// seconds on `runners` runners, with runs still running having used
-    /// `running` runner-seconds.
+    /// seconds on `runners` runners, with the runs still running having
+    /// used `running`.
     pub fn summarise(
         prs: &[PrRecord],
         runs: &[RunRecord],
-        running: u64,
+        pr_ci: &[PrCiRecord],
+        running: RunningSeconds,
         runners: usize,
         elapsed: u64,
     ) -> Metrics {
@@ -115,6 +148,7 @@ impl Metrics {
         let mut unfinished = 0;
         let mut land_hours = Vec::new();
         let mut reject_hours = Vec::new();
+        let rebases = prs.iter().map(|p| u64::from(p.rebases)).sum();
         for pr in prs {
             let Some((left_at, exit)) = &pr.left else {
                 unfinished += 1;
@@ -141,10 +175,11 @@ impl Metrics {
         }
         land_hours.sort_by(f64::total_cmp);
         reject_hours.sort_by(f64::total_cmp);
-        let consumed: u64 = runs.iter().map(|r| r.consumed).sum::<u64>() + running;
+        let consumed: u64 = runs.iter().map(|r| r.consumed).sum::<u64>() + running.batches;
         let wasted: u64 = runs.iter().filter(|r| !r.landed).map(|r| r.consumed).sum();
         let members: usize = runs.iter().map(|r| r.members).sum();
-        let runner_hours = consumed as f64 / HOUR;
+        let pr_ci_consumed = pr_ci.iter().map(|r| r.consumed).sum::<u64>() + running.pr_ci;
+        let runner_hours = (consumed + pr_ci_consumed) as f64 / HOUR;
         Metrics {
             arrived: prs.len(),
             landed,
@@ -153,9 +188,12 @@ impl Metrics {
             withdrawn,
             blocked,
             unfinished,
+            rebases,
             runs: runs.len(),
             mean_batch_size: ratio(members as f64, runs.len() as f64),
+            pr_ci_runs: pr_ci.len(),
             runner_hours,
+            pr_ci_hours: pr_ci_consumed as f64 / HOUR,
             runner_hours_per_landed: ratio(runner_hours, landed as f64),
             wasted_fraction: ratio(wasted as f64, consumed as f64),
             land_p50_hours: percentile(&land_hours, 0.5),
@@ -176,6 +214,7 @@ mod tests {
             number: PrNumber(number),
             arrived_at,
             left,
+            rebases: 0,
         }
     }
 
@@ -188,6 +227,16 @@ mod tests {
             verdict: None,
             tree: Vec::new(),
             landed,
+        }
+    }
+
+    fn pr_ci(consumed: u64, cancelled: bool) -> PrCiRecord {
+        PrCiRecord {
+            pr: PrNumber(1),
+            head: Sha::parse(&format!("{:040x}", 2)).expect("hex"),
+            started_at: 0,
+            consumed,
+            cancelled,
         }
     }
 
@@ -212,7 +261,11 @@ mod tests {
             pr(7, 0, Some((60, Exit::Blocked { on: PrNumber(5) }))),
         ];
         let runs = [run(3600, 2, true), run(3600, 4, false)];
-        let m = Metrics::summarise(&prs, &runs, 0, 2, 7200);
+        let mut prs = prs;
+        prs[0].rebases = 2;
+        prs[5].rebases = 1;
+        let m = Metrics::summarise(&prs, &runs, &[], RunningSeconds::default(), 2, 7200);
+        assert_eq!(m.rebases, 3);
         assert_eq!(
             (
                 m.arrived,
@@ -238,9 +291,10 @@ mod tests {
 
     #[test]
     fn empty_sets_summarise_to_none() {
-        let m = Metrics::summarise(&[], &[], 0, 2, 0);
+        let m = Metrics::summarise(&[], &[], &[], RunningSeconds::default(), 2, 0);
         assert_eq!(m.arrived, 0);
         assert_eq!(m.runner_hours, 0.0);
+        assert_eq!((m.pr_ci_runs, m.pr_ci_hours), (0, 0.0));
         assert_eq!(m.mean_batch_size, None);
         assert_eq!(m.runner_hours_per_landed, None);
         assert_eq!(m.wasted_fraction, None);
@@ -252,10 +306,44 @@ mod tests {
     #[test]
     fn runs_still_running_cost_runner_time_but_are_not_waste() {
         let runs = [run(3600, 2, true), run(0, 2, false)];
-        let m = Metrics::summarise(&[], &runs, 3600, 2, 3600);
+        let m = Metrics::summarise(
+            &[],
+            &runs,
+            &[],
+            RunningSeconds {
+                batches: 3600,
+                pr_ci: 0,
+            },
+            2,
+            3600,
+        );
         assert_eq!(m.runner_hours, 2.0);
         assert_eq!(m.wasted_fraction, Some(0.0));
         assert_eq!(m.utilisation, Some(1.0));
+    }
+
+    #[test]
+    fn pr_ci_costs_runner_time_but_is_not_batch_waste() {
+        let prs = [pr(1, 0, Some((7200, Exit::Landed)))];
+        let runs = [run(1800, 1, true), run(1800, 1, false)];
+        let pr_ci = [pr_ci(1800, false), pr_ci(900, true)];
+        let m = Metrics::summarise(
+            &prs,
+            &runs,
+            &pr_ci,
+            RunningSeconds {
+                batches: 0,
+                pr_ci: 900,
+            },
+            2,
+            7200,
+        );
+        assert_eq!((m.runs, m.pr_ci_runs), (2, 2));
+        assert_eq!(m.pr_ci_hours, 1.0);
+        assert_eq!(m.runner_hours, 2.0);
+        assert_eq!(m.runner_hours_per_landed, Some(2.0));
+        assert_eq!(m.wasted_fraction, Some(0.5));
+        assert_eq!(m.utilisation, Some(0.5));
     }
 
     #[test]

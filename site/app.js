@@ -3,7 +3,7 @@
 // replication. Reads the documents `dorfq-sim run --json` writes.
 "use strict";
 
-const SCHEMA = 1;
+const SCHEMA = 2;
 const BASELINE = "github-like";
 const DEFAULT_REPORT = "busy";
 
@@ -12,15 +12,17 @@ const REPORT_NOTES = {
   busy:
     "bisect's max_batch was chosen by measurement in this world, and its best " +
     "measured cap is 1: its column is the naive queue on all six runners, so " +
-    "its deltas against github-like show the sixth runner, not pooling.",
+    "its deltas against github-like show the sixth runner and GitHub's " +
+    "admission, not pooling. Neither keeps up at any cap: both leave about a " +
+    "quarter of the arrivals unfinished. bayes, best at 4 to 6, comes close.",
 };
 
 // Metric rows, as the command line's table prints them: key and decimals.
 const ROWS = [
   ["arrived", 1], ["landed", 1], ["ejected_bad", 1], ["ejected_good", 1],
-  ["withdrawn", 1], ["blocked", 1], ["unfinished", 1], ["runs", 1],
-  ["mean_batch_size", 2], ["runner_hours", 1], ["runner_hours_per_landed", 2],
-  ["wasted_fraction", 3], ["land_p50_hours", 2], ["land_p95_hours", 2],
+  ["withdrawn", 1], ["blocked", 1], ["unfinished", 1], ["rebases", 1], ["runs", 1],
+  ["mean_batch_size", 2], ["pr_ci_runs", 1], ["runner_hours", 1], ["pr_ci_hours", 1],
+  ["runner_hours_per_landed", 2], ["wasted_fraction", 3], ["land_p50_hours", 2], ["land_p95_hours", 2],
   ["reject_p50_hours", 2], ["reject_p95_hours", 2], ["utilisation", 3],
 ];
 
@@ -79,7 +81,7 @@ async function boot() {
 }
 
 function offerPicker(message) {
-  setStatus(message, false);
+  setStatus(SERVED ? message : `${message} ${PLAYGROUND_NEEDS_HTTP}`, false);
   $("report-select").hidden = true;
   $("file-label").hidden = false;
 }
@@ -126,6 +128,7 @@ function show(doc) {
   try {
     renderComparison(doc);
     replay.load(doc);
+    playground.load(doc);
   } catch (error) {
     console.error(error);
     setStatus(`The report was loaded but could not be rendered: ${error.message}`, true);
@@ -142,6 +145,7 @@ function describeConfig(cfg) {
   const parts = [cfg.kind];
   if (cfg.lanes !== undefined) parts.push(`lanes ${cfg.lanes}`);
   if (cfg.max_batch !== undefined) parts.push(`max_batch ${cfg.max_batch}`);
+  if (cfg.admission !== undefined) parts.push(cfg.admission);
   return parts.join(" · ");
 }
 
@@ -158,33 +162,10 @@ function stat(policy, key) {
   };
 }
 
-function percent(p) {
-  return `${Number((p * 100).toPrecision(3))}%`;
-}
-
-function describeWorld(doc) {
-  const c = doc.config;
-  const w = c.world;
-  return (
-    `${w.arrivals_per_hour} pull requests an hour for ${w.hours} hours, then up to ` +
-    `${w.drain_hours} hours to drain, on ${w.runners} CI runners; a run takes ` +
-    `${w.ci_minutes.min}–${w.ci_minutes.max} minutes. ${percent(w.p_bad)} of pull requests ` +
-    `are bad on their own, ${percent(w.p_interact)} of pairs whose queue time overlaps break ` +
-    `only together, ${percent(w.p_conflict)} arrive conflicting with trunk, and ` +
-    `${percent(w.p_flake)} of runs fail for no reason. A queued pull request is re-pushed ` +
-    `${w.repush_per_hour} times an hour and withdrawn ${w.withdraw_per_hour} times an hour. ` +
-    `${percent(w.p_stacked)} of arrivals are cut from a recent branch and stack on it only ` +
-    `while it is still queued — so a faster policy sees fewer stacks — and ` +
-    `${percent(w.p_atomic)} of those that stack land only with their ancestors. ` +
-    `${c.replications} replications from seed ${c.seed}; every policy sees the same ` +
-    `arrivals and the same hidden truths.`
-  );
-}
-
 function renderComparison(doc) {
   $("comparison").hidden = false;
   $("report-name").textContent = doc.name;
-  $("world").textContent = describeWorld(doc);
+  $("config-text").textContent = doc.config_text;
   const note = REPORT_NOTES[doc.name];
   $("report-note").hidden = !note;
   $("report-note").textContent = note || "";
@@ -328,15 +309,23 @@ function eventText(e) {
     }
     case "repush": return `repush ${e.pr}`;
     case "withdraw": return `withdraw ${e.pr}`;
-    case "blocked": return `blocked ${e.pr} on ${e.on}`;
+    case "blocked": return `blocked ${e.pr} ${e.final ? "on" : "with"} ${e.on}`;
     case "start": return `start ${e.batch} ${list(e.members)} on ${e.base === null ? "trunk" : e.base}`;
     case "run_begin": return `ci ${e.batch} begins`;
     case "run_end":
       return `ci ${e.batch} ${e.passed ? "passed" : "failed"}${e.broken ? " broken" : ""}${e.flake ? " flake" : ""}`;
     case "land": return `land ${e.batch} ${list(e.members)}`;
     case "refused": return `refused ${e.batch}: ${e.reason}`;
-    case "eject": return `eject ${e.pr} ${e.justified ? "justified" : "unjustified"}: ${e.reason}`;
+    case "eject":
+      return `eject ${e.pr} ${e.justified ? "justified" : "unjustified"}: ${e.reason}${e.final ? "" : ", rebasing"}`;
     case "retire": return `retire ${e.batch}${e.cancelled ? " cancelled" : ""}`;
+    case "pr_ci": return `pr-ci ${e.pr}`;
+    case "pr_ci_begin": return `pr-ci ${e.pr} begins`;
+    case "pr_ci_end": return `pr-ci ${e.pr} ${e.cancelled ? "cancelled" : "passed"}`;
+    case "rebase": return `rebase ${e.pr} ${e.why === "base_landed" ? "base landed" : "conflict"}`;
+    case "admit": return `admit ${e.pr}${e.base === null ? "" : ` on ${e.base}`}`;
+    case "recheck": return `recheck ${e.pr}`;
+    case "wait": return `wait ${e.pr} on ${e.on}`;
     case "step": {
       let s = `queued=${e.queued} in_flight=${e.in_flight}`;
       if (e.land.length) s += ` | land ${list(e.land)}`;
@@ -349,7 +338,18 @@ function eventText(e) {
   }
 }
 
-// One policy's trace folded into the world as it stood at a time.
+// Why an arrived pull request is outside the queue, by the event that put
+// it there: in full, and short enough to sit under a chip.
+const OUTSIDE = {
+  pr_ci: { long: "PR CI", short: "PR CI" },
+  rebasing: { long: "rebasing", short: "rebasing" },
+  with_base: { long: "out with base", short: "with base" },
+  waiting_for_base: { long: "waiting for base", short: "for base" },
+};
+
+// One policy's trace folded into the world as it stood at a time. A runner
+// job is a batch (`type: "batch"`) or a pull request's own CI run
+// (`type: "pr_ci"`).
 class World {
   constructor(events, runners) {
     this.events = events;
@@ -368,7 +368,26 @@ class World {
     this.runs = [];
     this.trunk = [];
     this.departed = [];
-    this.count = { landed: 0, ejected_bad: 0, ejected_good: 0, withdrawn: 0, blocked: 0, runs: 0 };
+    this.count = {
+      landed: 0, ejected_bad: 0, ejected_good: 0, withdrawn: 0, blocked: 0, runs: 0, pr_ci_runs: 0,
+    };
+  }
+
+  // A queued pull request whose current head's PR CI has not passed: the
+  // forge reports it waiting, and no batch can take it.
+  held(pr) {
+    return this.queued.has(pr.pr) && pr.ci !== null;
+  }
+
+  heldCount() {
+    return [...this.queued].filter((n) => this.held(this.prs.get(n))).length;
+  }
+
+  // Every arrived pull request neither in the queue nor departed, by number.
+  outside() {
+    return [...this.prs.values()]
+      .filter((pr) => pr.left === null && !this.queued.has(pr.pr))
+      .sort((a, b) => a.pr - b.pr);
   }
 
   advanceTo(t) {
@@ -390,21 +409,87 @@ class World {
     this.departed.push(pr);
   }
 
-  freeSlot(batch) {
-    const i = this.slots.indexOf(batch.id);
+  freeSlot(job) {
+    const i = this.slots.indexOf(job);
     if (i >= 0) this.slots[i] = null;
+  }
+
+  takeSlot(job, t) {
+    this.waiting = this.waiting.filter((j) => j !== job);
+    job.began = t;
+    let slot = this.slots.indexOf(null);
+    if (slot < 0) {
+      slot = this.slots.length;
+      this.slots.push(null);
+    }
+    this.slots[slot] = job;
+    job.runner = slot;
+    this.runs.push(job);
   }
 
   apply(e) {
     switch (e.kind) {
       case "arrive":
         this.prs.set(e.pr, {
-          pr: e.pr, base: e.base, atomic: e.atomic, arrived: e.t, state: "queued",
+          pr: e.pr, base: e.base, atomic: e.atomic, arrived: e.t, state: "queued", left: null,
           bad: Boolean(e.truth && e.truth.bad), conflicts: Boolean(e.truth && e.truth.conflicts),
-          batches: new Set(), repushed: null,
+          batches: new Set(), repushed: null, ci: null, place: null, rebases: 0,
         });
+        break;
+      case "admit": {
+        const pr = this.prs.get(e.pr);
+        if (!pr) break;
+        pr.base = e.base;
+        pr.place = null;
         this.queued.add(e.pr);
         break;
+      }
+      case "recheck":
+        this.queued.delete(e.pr);
+        break;
+      case "rebase": {
+        const pr = this.prs.get(e.pr);
+        if (!pr) break;
+        pr.place = "rebasing";
+        pr.rebases += 1;
+        break;
+      }
+      case "wait": {
+        const pr = this.prs.get(e.pr);
+        if (!pr) break;
+        pr.place = "waiting_for_base";
+        pr.on = e.on;
+        break;
+      }
+      case "pr_ci": {
+        const pr = this.prs.get(e.pr);
+        if (!pr) break;
+        const job = {
+          type: "pr_ci", pr: e.pr, requested: e.t, began: null, ended: null, runner: null, verdict: null,
+        };
+        pr.ci = job;
+        pr.place = "pr_ci";
+        this.waiting.push(job);
+        break;
+      }
+      case "pr_ci_begin": {
+        const pr = this.prs.get(e.pr);
+        if (!pr || !pr.ci) break;
+        this.takeSlot(pr.ci, e.t);
+        this.count.pr_ci_runs += 1;
+        break;
+      }
+      case "pr_ci_end": {
+        const pr = this.prs.get(e.pr);
+        if (!pr || !pr.ci) break;
+        const job = pr.ci;
+        job.ended = e.t;
+        job.verdict = e.cancelled ? "cancelled" : "passed";
+        if (job.began === null) this.waiting = this.waiting.filter((j) => j !== job);
+        else this.freeSlot(job);
+        pr.ci = null;
+        break;
+      }
       case "repush": {
         const pr = this.prs.get(e.pr);
         if (pr) pr.repushed = e.t;
@@ -415,12 +500,20 @@ class World {
         this.depart(e.pr, "withdrawn", e.t, {});
         break;
       case "blocked":
-        this.count.blocked += 1;
-        this.depart(e.pr, "blocked", e.t, { on: e.on });
+        if (e.final) {
+          this.count.blocked += 1;
+          this.depart(e.pr, "blocked", e.t, { on: e.on });
+        } else {
+          const pr = this.prs.get(e.pr);
+          if (!pr) break;
+          pr.place = "with_base";
+          pr.on = e.on;
+          this.queued.delete(e.pr);
+        }
         break;
       case "start": {
         const batch = {
-          id: e.batch, base: e.base, members: e.members, started: e.t,
+          type: "batch", id: e.batch, base: e.base, members: e.members, started: e.t,
           began: null, ended: null, runner: null, verdict: null, landed: false,
         };
         this.batches.set(e.batch, batch);
@@ -434,16 +527,7 @@ class World {
       case "run_begin": {
         const batch = this.batches.get(e.batch);
         if (!batch) break;
-        this.waiting = this.waiting.filter((b) => b !== batch);
-        batch.began = e.t;
-        let slot = this.slots.indexOf(null);
-        if (slot < 0) {
-          slot = this.slots.length;
-          this.slots.push(null);
-        }
-        this.slots[slot] = batch.id;
-        batch.runner = slot;
-        this.runs.push(batch);
+        this.takeSlot(batch, e.t);
         this.count.runs += 1;
         break;
       }
@@ -477,6 +561,10 @@ class World {
         break;
       }
       case "eject": {
+        if (!e.final) {
+          this.queued.delete(e.pr);
+          break;
+        }
         if (e.justified) this.count.ejected_bad += 1;
         else this.count.ejected_good += 1;
         this.depart(e.pr, "ejected", e.t, { reason: e.reason, justified: e.justified });
@@ -580,8 +668,9 @@ function draw(canvas, world, hits) {
   hits.length = 0;
 
   const now = world.now;
-  let y = drawRunners(ctx, world, hits, now, width);
-  y = drawQueue(ctx, world, hits, now, width, y + 14, height - 150);
+  const y = drawRunners(ctx, world, hits, now, width);
+  drawQueue(ctx, world, hits, now, width, y + 14, height - 212);
+  drawOutside(ctx, world, hits, now, width, height - 196);
   drawDeparted(ctx, world, hits, now, width, height - 128);
   drawTrunk(ctx, world, hits, now, width, height - 56);
 }
@@ -638,6 +727,24 @@ function drawRunners(ctx, world, hits, now, width) {
     const bw = Math.max(x(end) - bx, 2);
     const by = top + b.runner * ROW + 3;
     const running = b.ended === null;
+    if (b.type === "pr_ci") {
+      const colour = running ? COLOURS.accent : VERDICT[b.verdict];
+      roundRect(ctx, bx + 1, by + 1, bw - 2, ROW - 8, 4);
+      ctx.globalAlpha = 0.18;
+      ctx.fillStyle = colour;
+      ctx.fill();
+      ctx.globalAlpha = running ? 1 : 0.85;
+      ctx.strokeStyle = colour;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.lineWidth = 1;
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = COLOURS.text;
+      const label = fitText(ctx, `#${b.pr}`, bw - 8);
+      if (label) ctx.fillText(label, bx + 4, by + (ROW - 6) / 2);
+      hits.push({ x: bx, y: by, w: bw, h: ROW - 6, text: () => prCiText(b) });
+      continue;
+    }
     ctx.globalAlpha = running ? 1 : b.verdict === "passed" && !b.landed ? 0.5 : 0.85;
     ctx.fillStyle = running ? COLOURS.accent : VERDICT[b.verdict];
     roundRect(ctx, bx, by, bw, ROW - 6, 4);
@@ -669,38 +776,51 @@ function drawRunners(ctx, world, hits, now, width) {
   ctx.fillText("waiting", 12, wy + ROW / 2);
   let wx = LEFT;
   for (const b of world.waiting) {
-    const label = `${b.id} ${list(b.members)}`;
+    const label = b.type === "pr_ci" ? `#${b.pr}` : `${b.id} ${list(b.members)}`;
     const w = Math.min(ctx.measureText(label).width + 12, 220);
     if (wx + w > right) {
       ctx.fillStyle = COLOURS.muted;
       ctx.fillText(`+${world.waiting.length - world.waiting.indexOf(b)}`, wx, wy + ROW / 2);
       break;
     }
-    ctx.setLineDash([4, 3]);
-    ctx.strokeStyle = COLOURS.accent;
+    ctx.setLineDash(b.type === "pr_ci" ? [2, 2] : [4, 3]);
+    ctx.strokeStyle = b.type === "pr_ci" ? COLOURS.muted : COLOURS.accent;
     roundRect(ctx, wx, wy + 3, w, ROW - 6, 4);
     ctx.stroke();
     ctx.setLineDash([]);
     ctx.fillStyle = COLOURS.text;
     ctx.fillText(fitText(ctx, label, w - 10), wx + 6, wy + ROW / 2);
-    hits.push({ x: wx, y: wy + 3, w, h: ROW - 6, text: () => batchText(world, b) });
+    const text = b.type === "pr_ci" ? () => prCiText(b) : () => batchText(world, b);
+    hits.push({ x: wx, y: wy + 3, w, h: ROW - 6, text });
     wx += w + GAP;
   }
   return wy + ROW;
 }
 
-function drawChip(ctx, pr, x, y, now, faded) {
+// `look` is "queue" for a chip in the queue, "outside" for one on the
+// outside strip, and "departed" for one that left.
+function drawChip(ctx, world, pr, x, y, now, faded, look) {
   const inBatch = pr.batches.size > 0;
+  const held = look === "queue" && world.held(pr);
   const age = now - pr.arrived;
   const pop = pr.state === "queued" && age < 1200 ? 1 + 0.25 * (1 - age / 1200) : 1;
   const w = CHIP_W * pop;
   const h = CHIP_H * pop;
   const cx = x - (w - CHIP_W) / 2;
   const cy = y - (h - CHIP_H) / 2;
-  ctx.globalAlpha = faded;
+  ctx.globalAlpha = faded * (held || look === "outside" ? 0.55 : 1);
   ctx.fillStyle = pr.state === "queued" ? (inBatch ? "#22385a" : COLOURS.chip) : DEPARTURE[pr.state];
   roundRect(ctx, cx, cy, w, h, 5);
   ctx.fill();
+  ctx.globalAlpha = faded;
+  if (held || look === "outside") {
+    ctx.strokeStyle = COLOURS.muted;
+    ctx.setLineDash(held ? [2, 2] : [5, 3]);
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.lineWidth = 1;
+  }
   if (pr.state === "queued" && (inBatch || pr.atomic)) {
     ctx.strokeStyle = pr.atomic ? COLOURS.warn : COLOURS.accent;
     ctx.lineWidth = 2;
@@ -740,7 +860,8 @@ function drawChip(ctx, pr, x, y, now, faded) {
 }
 
 function drawQueue(ctx, world, hits, now, width, top, bottom) {
-  sectionLabel(ctx, `queue — ${world.queued.size} pull requests, stacks drawn from base to child`, 12, top);
+  const held = world.heldCount();
+  sectionLabel(ctx, `queue — ${world.queued.size} pull requests, ${held} held for their own CI, stacks drawn from base to child`, 12, top);
   const right = width - 12;
   let x = 12;
   let y = top + 22;
@@ -798,7 +919,7 @@ function drawQueue(ctx, world, hits, now, width, top, bottom) {
   }
   for (const [n, at] of place) {
     const pr = world.prs.get(n);
-    drawChip(ctx, pr, at.x, at.y, now, 1);
+    drawChip(ctx, world, pr, at.x, at.y, now, 1, "queue");
     hits.push({ x: at.x, y: at.y, w: CHIP_W, h: CHIP_H, text: () => prText(world, pr) });
   }
   if (hidden > 0) {
@@ -806,6 +927,30 @@ function drawQueue(ctx, world, hits, now, width, top, bottom) {
     ctx.fillText(`+${hidden} more`, right - 70, bottom - 6);
   }
   return y + rowH;
+}
+
+function drawOutside(ctx, world, hits, now, width, top) {
+  const outside = world.outside();
+  sectionLabel(ctx, `outside the queue — ${outside.length}: ${Object.values(OUTSIDE).map((o) => o.long).join(", ")}`, 12, top);
+  const right = width - 12;
+  const y = top + 14;
+  let x = 12;
+  for (const pr of outside) {
+    if (x + CHIP_W > right) {
+      ctx.fillStyle = COLOURS.muted;
+      ctx.fillText(`+${outside.length - outside.indexOf(pr)}`, x, y + CHIP_H / 2);
+      break;
+    }
+    drawChip(ctx, world, pr, x, y, now, 1, "outside");
+    ctx.fillStyle = COLOURS.muted;
+    ctx.font = "9px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(fitText(ctx, OUTSIDE[pr.place]?.short || "", CHIP_W + GAP), x + CHIP_W / 2, y + CHIP_H + 8);
+    ctx.textAlign = "left";
+    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+    hits.push({ x, y, w: CHIP_W, h: CHIP_H, text: () => prText(world, pr) });
+    x += CHIP_W + GAP;
+  }
 }
 
 function drawDeparted(ctx, world, hits, now, width, top) {
@@ -817,7 +962,7 @@ function drawDeparted(ctx, world, hits, now, width, top) {
     const age = now - pr.left;
     if (age > DEPARTED_FOR) break;
     if (x + CHIP_W > width - 12) break;
-    drawChip(ctx, pr, x, y, now, 1 - 0.75 * (age / DEPARTED_FOR));
+    drawChip(ctx, world, pr, x, y, now, 1 - 0.75 * (age / DEPARTED_FOR), "departed");
     hits.push({ x, y, w: CHIP_W, h: CHIP_H, text: () => prText(world, pr) });
     x += CHIP_W + GAP;
   }
@@ -873,11 +1018,28 @@ function batchText(world, b) {
   return lines.join("\n");
 }
 
+function prCiText(job) {
+  const lines = [`PR CI of #${job.pr}`, `requested ${clockText(job.requested)}`];
+  if (job.began !== null) lines.push(`ran ${clockText(job.began)}–${job.ended === null ? "now" : clockText(job.ended)}`);
+  if (job.verdict) lines.push(job.verdict);
+  return lines.join("\n");
+}
+
 function prText(world, pr) {
   const lines = [`#${pr.pr} arrived ${clockText(pr.arrived)}`];
   if (pr.base !== null) lines.push(`stacked on #${pr.base}`);
   if (pr.atomic) lines.push("lands only with its stack");
   if (pr.batches.size) lines.push(`in batch ${[...pr.batches].join(", ")}`);
+  if (pr.state === "queued") {
+    if (world.queued.has(pr.pr)) {
+      if (world.held(pr)) lines.push("held: its own CI has not passed on this head");
+    } else {
+      let where = `outside the queue: ${OUTSIDE[pr.place]?.long || "-"}`;
+      if (pr.place === "with_base" || pr.place === "waiting_for_base") where += ` #${pr.on}`;
+      lines.push(where);
+    }
+  }
+  if (pr.rebases) lines.push(`rebased ${pr.rebases} time${pr.rebases === 1 ? "" : "s"}`);
   const truth = [pr.bad && "bad", pr.conflicts && "conflicts with trunk"].filter(Boolean);
   lines.push(`truth: ${truth.length ? truth.join(", ") : "good"}`);
   if (pr.state !== "queued") {
@@ -989,8 +1151,9 @@ const replay = {
     const c = world.count;
     const running = world.slots.filter((s) => s !== null).length;
     const items = [
-      ["queued", world.queued.size], ["running", `${running}/${world.runners}`],
-      ["waiting", world.waiting.length], ["runs", c.runs], ["landed", c.landed],
+      ["queued", world.queued.size], ["held", world.heldCount()],
+      ["outside", world.outside().length], ["running", `${running}/${world.runners}`],
+      ["waiting", world.waiting.length], ["runs", c.runs], ["PR CI runs", c.pr_ci_runs], ["landed", c.landed],
       ["ejected bad", c.ejected_bad], ["ejected good", c.ejected_good],
       ["blocked", c.blocked], ["withdrawn", c.withdrawn],
     ];
@@ -1040,6 +1203,120 @@ function hover(event) {
   tip.style.top = `${y + 14}px`;
 }
 
+// ---- the playground ------------------------------------------------------
+
+const PLAYGROUND_NEEDS_HTTP = "The playground needs the page served over HTTP.";
+// Opened from a file, the browser starts no worker and fetches no module.
+const SERVED = location.protocol !== "file:";
+
+// Runs an edited configuration through the simulator compiled to
+// WebAssembly, in a worker, and shows the result as any other report. A run
+// cannot be interrupted, so cancel terminates the worker; the next run
+// starts a fresh one, as it does after a crash, which leaves the module's
+// instance unusable.
+const playground = {
+  worker: null,
+  started: null,
+  ticker: null,
+  running: false,
+
+  load(doc) {
+    $("playground").hidden = false;
+    $("playground-text").value = doc.config_text;
+    $("playground-offline").hidden = SERVED;
+    $("playground-run").disabled = !SERVED || this.running;
+  },
+
+  status(text, error) {
+    const el = $("playground-status");
+    el.textContent = text;
+    el.classList.toggle("error", Boolean(error));
+  },
+
+  run() {
+    if (this.running) return;
+    this.running = true;
+    if (this.worker === null) {
+      this.worker = new Worker("sim-worker.js");
+      this.worker.onmessage = (event) => this.reply(event.data);
+      this.worker.onerror = (event) => {
+        this.finish();
+        this.drop();
+        this.status(`The simulator's worker failed: ${event.message}`, true);
+      };
+    }
+    this.started = performance.now();
+    $("playground-run").disabled = true;
+    $("playground-cancel").disabled = false;
+    this.tick();
+    this.ticker = setInterval(() => this.tick(), 200);
+    this.worker.postMessage($("playground-text").value);
+  },
+
+  tick() {
+    this.status(`running… ${this.elapsed()}`);
+  },
+
+  elapsed() {
+    return `${((performance.now() - this.started) / 1000).toFixed(1)} s`;
+  },
+
+  finish() {
+    this.running = false;
+    clearInterval(this.ticker);
+    $("playground-run").disabled = !SERVED;
+    $("playground-cancel").disabled = true;
+  },
+
+  drop() {
+    if (this.worker !== null) this.worker.terminate();
+    this.worker = null;
+  },
+
+  cancel() {
+    this.finish();
+    this.drop();
+    this.status(`cancelled after ${this.elapsed()}`);
+  },
+
+  reply(message) {
+    this.finish();
+    switch (message.kind) {
+      case "document": {
+        const took = this.elapsed();
+        let doc;
+        try {
+          doc = JSON.parse(message.text);
+        } catch (error) {
+          this.status(`The simulator's document is not JSON: ${error.message}`, true);
+          break;
+        }
+        show(doc);
+        this.status(
+          `ran in ${took}. The browser's floating point may differ from the ` +
+            "published reports' in the last place, so its numbers can too.",
+        );
+        break;
+      }
+      case "error":
+        this.status(message.message, true);
+        break;
+      case "crash":
+        this.drop();
+        this.status(`the simulator crashed: ${message.message}`, true);
+        break;
+      case "unavailable":
+        this.drop();
+        this.status(`Could not load the simulator (${message.message}). ${PLAYGROUND_NEEDS_HTTP}`, true);
+        break;
+      default:
+        this.status(`The simulator's worker replied ${JSON.stringify(message.kind)}.`, true);
+    }
+  },
+};
+
+$("playground-run").addEventListener("click", () => playground.run());
+$("playground-cancel").addEventListener("click", () => playground.cancel());
 $("play").addEventListener("click", () => replay.toggle());
 $("scrubber").addEventListener("input", (e) => replay.seek(Number(e.target.value)));
 $("canvas").addEventListener("mousemove", hover);
