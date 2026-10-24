@@ -5,21 +5,33 @@
 //! [`dorfq_core`] contract through its [`Ledger`](dorfq_core::ledger::Ledger)
 //! and answers a breach with [`ForgeError::Permanent`]. Behind it each pull request is bad or good,
 //! conflicts with trunk or not, and carries a key from which the truth of
-//! every pair is a function. Runs take a uniform time on a fixed number of
-//! runners and fail when their tree is broken or the flake draw fires.
-//! Time is the simulator's: the scheduler never sees it.
+//! every pair is a function. A batch's run starts the instant the batch
+//! does, takes a uniform time and fails when its tree is broken or the
+//! flake draw fires. The world has no runner pool: CI capacity is not the
+//! constraint, and the only bound on concurrent batch runs is the
+//! scheduler's own `lanes`. Time is the simulator's: the scheduler never
+//! sees it.
 //!
-//! An arrival may be cut from a recent arrival's branch; it is stacked on
-//! that pull request while it is in the world, and may be `Atomic`. A base that
-//! leaves without landing takes everything stacked on it with it
-//! (`Blocked`), and a re-push restacks every descendant.
+//! Pull requests arrive as stacks: a burst of one or more created at one
+//! instant, each stacked on the one before it, its size drawn from
+//! `stack_sizes`. A stack may be atomic, every pull request above its root
+//! `Atomic`, so it lands only whole. A stack may grow once, later: a second
+//! burst on top of what is left of it, or on trunk if nothing is. Only a
+//! stack's root can conflict with trunk; everything above it was cut from
+//! the stack's branch. A base that leaves without landing takes everything
+//! stacked on it with it (`Blocked`), and a re-push restacks every
+//! descendant.
 //!
-//! Every pull request also runs its own CI, on the same runners as batch
-//! runs, each time it gets a head: at arrival and at every re-push. A run
+//! Every pull request also runs its own CI, beside the queue, each time it
+//! gets a head: at arrival and at every re-push. A run starts at once,
 //! takes a uniform time and passes; a head change cancels the old head's
 //! run. As the GitHub forge does, the world reports a pull request
 //! `Waiting(OwnCiPending)` until its current head's run has passed, so no
-//! batch takes it before then. Each pull request draws its runs' durations
+//! batch takes it before then. With `pr_ci_on_base_landed`, a landed base
+//! makes the pull requests stacked on it run again: the run of each direct
+//! child is the queue's doing, splitting the stack there, and is *billed*,
+//! counted in `runner_hours`; every other PR CI run is the author's and
+//! costs the queue nothing. Each pull request draws its runs' durations
 //! and its rebase delays from its own clock, seeded from its key, so the
 //! n-th draw of a pull request is the same under every policy.
 //!
@@ -36,9 +48,9 @@
 //!
 //! Every draw comes from SplitMix64 streams split by purpose (arrivals,
 //! truth, CI, churn, stacks), so two policies at one seed see the same
-//! arrivals, the same truths and the same cut-from targets. Whether a cut
-//! arrival stacks is the policy's doing: one that has already landed or
-//! ejected the target sees it arrive on trunk.
+//! stacks and the same truths. Where a growth lands is the policy's doing:
+//! one that has already landed or ejected the stack sees it arrive on what
+//! is left of it, or on trunk.
 //!
 //! [`simulate`] runs every policy of a [`SimConfig`] at every replication
 //! and returns a [`Report`]: runner-hours per landed pull request, time to

@@ -3,7 +3,7 @@
 // replication. Reads the documents `dorfq-sim run --json` writes.
 "use strict";
 
-const SCHEMA = 2;
+const SCHEMA = 3;
 const BASELINE = "github-like";
 const DEFAULT_REPORT = "busy";
 
@@ -11,19 +11,20 @@ const DEFAULT_REPORT = "busy";
 const REPORT_NOTES = {
   busy:
     "bisect's max_batch was chosen by measurement in this world, and its best " +
-    "measured cap is 1: its column is the naive queue on all six runners, so " +
-    "its deltas against github-like show the sixth runner and GitHub's " +
-    "admission, not pooling. Neither keeps up at any cap: both leave about a " +
-    "quarter of the arrivals unfinished. bayes, best at 4 to 6, comes close.",
+    "measured cap is 1: its column is the naive queue on the same six lanes " +
+    "as github-like, so its deltas against github-like show GitHub's " +
+    "admission, not pooling. bayes, best at 4 to 6, lands the most at the " +
+    "lowest cost per landed pull request of the policies that keep their good " +
+    "pull requests; its 95th-percentile time to land is longer than bisect's.",
 };
 
 // Metric rows, as the command line's table prints them: key and decimals.
 const ROWS = [
   ["arrived", 1], ["landed", 1], ["ejected_bad", 1], ["ejected_good", 1],
   ["withdrawn", 1], ["blocked", 1], ["unfinished", 1], ["rebases", 1], ["runs", 1],
-  ["mean_batch_size", 2], ["pr_ci_runs", 1], ["runner_hours", 1], ["pr_ci_hours", 1],
+  ["mean_batch_size", 2], ["billed_pr_ci_runs", 1], ["runner_hours", 1], ["billed_pr_ci_hours", 1],
   ["runner_hours_per_landed", 2], ["wasted_fraction", 3], ["land_p50_hours", 2], ["land_p95_hours", 2],
-  ["reject_p50_hours", 2], ["reject_p95_hours", 2], ["utilisation", 3],
+  ["reject_p50_hours", 2], ["reject_p95_hours", 2],
 ];
 
 // Headline deltas against the baseline; lower is better for every one.
@@ -311,7 +312,6 @@ function eventText(e) {
     case "withdraw": return `withdraw ${e.pr}`;
     case "blocked": return `blocked ${e.pr} ${e.final ? "on" : "with"} ${e.on}`;
     case "start": return `start ${e.batch} ${list(e.members)} on ${e.base === null ? "trunk" : e.base}`;
-    case "run_begin": return `ci ${e.batch} begins`;
     case "run_end":
       return `ci ${e.batch} ${e.passed ? "passed" : "failed"}${e.broken ? " broken" : ""}${e.flake ? " flake" : ""}`;
     case "land": return `land ${e.batch} ${list(e.members)}`;
@@ -319,8 +319,7 @@ function eventText(e) {
     case "eject":
       return `eject ${e.pr} ${e.justified ? "justified" : "unjustified"}: ${e.reason}${e.final ? "" : ", rebasing"}`;
     case "retire": return `retire ${e.batch}${e.cancelled ? " cancelled" : ""}`;
-    case "pr_ci": return `pr-ci ${e.pr}`;
-    case "pr_ci_begin": return `pr-ci ${e.pr} begins`;
+    case "pr_ci": return `pr-ci ${e.pr}${e.billed ? " billed" : ""}`;
     case "pr_ci_end": return `pr-ci ${e.pr} ${e.cancelled ? "cancelled" : "passed"}`;
     case "rebase": return `rebase ${e.pr} ${e.why === "base_landed" ? "base landed" : "conflict"}`;
     case "admit": return `admit ${e.pr}${e.base === null ? "" : ` on ${e.base}`}`;
@@ -347,13 +346,24 @@ const OUTSIDE = {
   waiting_for_base: { long: "waiting for base", short: "for base" },
 };
 
-// One policy's trace folded into the world as it stood at a time. A runner
-// job is a batch (`type: "batch"`) or a pull request's own CI run
-// (`type: "pr_ci"`).
+// Ends `batch` with the verdict of `e`, a run_end or retire event.
+function endBatch(batch, e) {
+  batch.ended = e.t;
+  if (e.kind === "retire") {
+    batch.verdict = "cancelled";
+  } else {
+    batch.verdict = e.passed ? "passed" : e.flake ? "flake" : "failed";
+    batch.broken = e.broken;
+  }
+}
+
+// One policy's trace folded into the world as it stood at a time. Each of
+// the policy's lanes holds one running batch; a pull request's own CI run
+// takes no lane.
 class World {
-  constructor(events, runners) {
+  constructor(events, lanes) {
     this.events = events;
-    this.runners = runners;
+    this.lanes = lanes;
     this.reset();
   }
 
@@ -363,13 +373,12 @@ class World {
     this.prs = new Map();
     this.queued = new Set();
     this.batches = new Map();
-    this.waiting = [];
-    this.slots = new Array(this.runners).fill(null);
+    this.slots = new Array(this.lanes).fill(null);
     this.runs = [];
     this.trunk = [];
     this.departed = [];
     this.count = {
-      landed: 0, ejected_bad: 0, ejected_good: 0, withdrawn: 0, blocked: 0, runs: 0, pr_ci_runs: 0,
+      landed: 0, ejected_bad: 0, ejected_good: 0, withdrawn: 0, blocked: 0, runs: 0, billed_pr_ci_runs: 0,
     };
   }
 
@@ -414,17 +423,41 @@ class World {
     if (i >= 0) this.slots[i] = null;
   }
 
-  takeSlot(job, t) {
-    this.waiting = this.waiting.filter((j) => j !== job);
-    job.began = t;
+  // A plan lands, starts, ejects and retires in that order, so a start can
+  // precede, at the same instant, the retire or run end that frees its lane.
+  // With no lane free, the batch the first such later event ends is ended
+  // now, as that event will end it, and its lane taken; only if there is
+  // none does the picture grow a lane.
+  takeSlot(batch) {
     let slot = this.slots.indexOf(null);
+    if (slot < 0) {
+      const ending = this.endingNow(batch.started);
+      if (ending !== null) {
+        slot = ending.lane;
+        this.slots[slot] = null;
+      }
+    }
     if (slot < 0) {
       slot = this.slots.length;
       this.slots.push(null);
     }
-    this.slots[slot] = job;
-    job.runner = slot;
-    this.runs.push(job);
+    this.slots[slot] = batch;
+    batch.lane = slot;
+    this.runs.push(batch);
+  }
+
+  // The running batch that a retire or run end later at instant `t` ends,
+  // ended with that event's verdict; null if there is none.
+  endingNow(t) {
+    for (let i = this.index + 1; i < this.events.length && this.events[i].t === t; i += 1) {
+      const e = this.events[i];
+      if (e.kind !== "retire" && e.kind !== "run_end") continue;
+      const batch = this.batches.get(e.batch);
+      if (!batch || batch.ended !== null || batch.lane === null) continue;
+      endBatch(batch, e);
+      return batch;
+    }
+    return null;
   }
 
   apply(e) {
@@ -464,30 +497,14 @@ class World {
       case "pr_ci": {
         const pr = this.prs.get(e.pr);
         if (!pr) break;
-        const job = {
-          type: "pr_ci", pr: e.pr, requested: e.t, began: null, ended: null, runner: null, verdict: null,
-        };
-        pr.ci = job;
+        pr.ci = { billed: e.billed };
         pr.place = "pr_ci";
-        this.waiting.push(job);
-        break;
-      }
-      case "pr_ci_begin": {
-        const pr = this.prs.get(e.pr);
-        if (!pr || !pr.ci) break;
-        this.takeSlot(pr.ci, e.t);
-        this.count.pr_ci_runs += 1;
+        if (e.billed) this.count.billed_pr_ci_runs += 1;
         break;
       }
       case "pr_ci_end": {
         const pr = this.prs.get(e.pr);
-        if (!pr || !pr.ci) break;
-        const job = pr.ci;
-        job.ended = e.t;
-        job.verdict = e.cancelled ? "cancelled" : "passed";
-        if (job.began === null) this.waiting = this.waiting.filter((j) => j !== job);
-        else this.freeSlot(job);
-        pr.ci = null;
+        if (pr) pr.ci = null;
         break;
       }
       case "repush": {
@@ -513,30 +530,22 @@ class World {
         break;
       case "start": {
         const batch = {
-          type: "batch", id: e.batch, base: e.base, members: e.members, started: e.t,
-          began: null, ended: null, runner: null, verdict: null, landed: false,
+          id: e.batch, base: e.base, members: e.members, started: e.t,
+          ended: null, lane: null, verdict: null, landed: false,
         };
         this.batches.set(e.batch, batch);
-        this.waiting.push(batch);
+        this.takeSlot(batch);
+        this.count.runs += 1;
         for (const m of e.members) {
           const pr = this.prs.get(m);
           if (pr) pr.batches.add(e.batch);
         }
         break;
       }
-      case "run_begin": {
-        const batch = this.batches.get(e.batch);
-        if (!batch) break;
-        this.takeSlot(batch, e.t);
-        this.count.runs += 1;
-        break;
-      }
       case "run_end": {
         const batch = this.batches.get(e.batch);
-        if (!batch) break;
-        batch.ended = e.t;
-        batch.verdict = e.passed ? "passed" : e.flake ? "flake" : "failed";
-        batch.broken = e.broken;
+        if (!batch || batch.ended !== null) break;
+        endBatch(batch, e);
         this.freeSlot(batch);
         break;
       }
@@ -574,11 +583,8 @@ class World {
         const batch = this.batches.get(e.batch);
         if (!batch) break;
         batch.retired = e.t;
-        if (batch.began === null) {
-          this.waiting = this.waiting.filter((b) => b !== batch);
-        } else if (batch.ended === null) {
-          batch.ended = e.t;
-          batch.verdict = "cancelled";
+        if (batch.ended === null) {
+          endBatch(batch, e);
           this.freeSlot(batch);
         }
         for (const m of batch.members) {
@@ -611,6 +617,18 @@ const CHIP_W = 46;
 const CHIP_H = 22;
 const GAP = 6;
 const DEPARTED_FOR = 3 * 3600;
+// The canvas, top to bottom: the lanes' header, the lanes, the gap before the
+// queue, the queue's band, and the outside, departed and trunk strips,
+// anchored to the bottom.
+const LANES_TOP = 26;
+const QUEUE_GAP = 14;
+const QUEUE_BAND = 330;
+const BOTTOM_STRIPS = 212;
+
+// The canvas height that gives `lanes` lanes and a queue band of fixed height.
+function canvasHeight(lanes) {
+  return LANES_TOP + lanes * ROW + QUEUE_GAP + QUEUE_BAND + BOTTOM_STRIPS;
+}
 
 function roundRect(ctx, x, y, w, h, r) {
   ctx.beginPath();
@@ -668,8 +686,8 @@ function draw(canvas, world, hits) {
   hits.length = 0;
 
   const now = world.now;
-  const y = drawRunners(ctx, world, hits, now, width);
-  drawQueue(ctx, world, hits, now, width, y + 14, height - 212);
+  const y = drawLanes(ctx, world, hits, now, width);
+  drawQueue(ctx, world, hits, now, width, y + QUEUE_GAP, height - BOTTOM_STRIPS);
   drawOutside(ctx, world, hits, now, width, height - 196);
   drawDeparted(ctx, world, hits, now, width, height - 128);
   drawTrunk(ctx, world, hits, now, width, height - 56);
@@ -682,11 +700,11 @@ function sectionLabel(ctx, text, x, y) {
   ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 }
 
-function drawRunners(ctx, world, hits, now, width) {
-  const top = 26;
+function drawLanes(ctx, world, hits, now, width) {
+  const top = LANES_TOP;
   const right = width - 12;
   const x = (t) => LEFT + ((t - (now - WINDOW)) / WINDOW) * (right - LEFT);
-  sectionLabel(ctx, "runners", 12, 12);
+  sectionLabel(ctx, "batches", 12, 12);
 
   ctx.strokeStyle = COLOURS.line;
   ctx.fillStyle = COLOURS.faint;
@@ -704,7 +722,7 @@ function drawRunners(ctx, world, hits, now, width) {
   for (let i = 0; i < world.slots.length; i += 1) {
     const ry = top + i * ROW;
     ctx.fillStyle = COLOURS.muted;
-    ctx.fillText(`runner ${i + 1}`, 12, ry + ROW / 2);
+    ctx.fillText(`lane ${i + 1}`, 12, ry + ROW / 2);
     ctx.strokeStyle = COLOURS.line;
     ctx.beginPath();
     ctx.moveTo(LEFT, ry + ROW);
@@ -720,31 +738,13 @@ function drawRunners(ctx, world, hits, now, width) {
     const b = world.runs[i];
     const end = b.ended === null ? now : b.ended;
     if (end < now - WINDOW) {
-      if (b.began < now - 2 * WINDOW) break;
+      if (b.started < now - 2 * WINDOW) break;
       continue;
     }
-    const bx = Math.max(x(b.began), LEFT - 4);
+    const bx = Math.max(x(b.started), LEFT - 4);
     const bw = Math.max(x(end) - bx, 2);
-    const by = top + b.runner * ROW + 3;
+    const by = top + b.lane * ROW + 3;
     const running = b.ended === null;
-    if (b.type === "pr_ci") {
-      const colour = running ? COLOURS.accent : VERDICT[b.verdict];
-      roundRect(ctx, bx + 1, by + 1, bw - 2, ROW - 8, 4);
-      ctx.globalAlpha = 0.18;
-      ctx.fillStyle = colour;
-      ctx.fill();
-      ctx.globalAlpha = running ? 1 : 0.85;
-      ctx.strokeStyle = colour;
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-      ctx.lineWidth = 1;
-      ctx.globalAlpha = 1;
-      ctx.fillStyle = COLOURS.text;
-      const label = fitText(ctx, `#${b.pr}`, bw - 8);
-      if (label) ctx.fillText(label, bx + 4, by + (ROW - 6) / 2);
-      hits.push({ x: bx, y: by, w: bw, h: ROW - 6, text: () => prCiText(b) });
-      continue;
-    }
     ctx.globalAlpha = running ? 1 : b.verdict === "passed" && !b.landed ? 0.5 : 0.85;
     ctx.fillStyle = running ? COLOURS.accent : VERDICT[b.verdict];
     roundRect(ctx, bx, by, bw, ROW - 6, 4);
@@ -770,31 +770,7 @@ function drawRunners(ctx, world, hits, now, width) {
   ctx.lineTo(right, top + world.slots.length * ROW);
   ctx.stroke();
   ctx.globalAlpha = 1;
-
-  const wy = top + world.slots.length * ROW + 6;
-  ctx.fillStyle = COLOURS.muted;
-  ctx.fillText("waiting", 12, wy + ROW / 2);
-  let wx = LEFT;
-  for (const b of world.waiting) {
-    const label = b.type === "pr_ci" ? `#${b.pr}` : `${b.id} ${list(b.members)}`;
-    const w = Math.min(ctx.measureText(label).width + 12, 220);
-    if (wx + w > right) {
-      ctx.fillStyle = COLOURS.muted;
-      ctx.fillText(`+${world.waiting.length - world.waiting.indexOf(b)}`, wx, wy + ROW / 2);
-      break;
-    }
-    ctx.setLineDash(b.type === "pr_ci" ? [2, 2] : [4, 3]);
-    ctx.strokeStyle = b.type === "pr_ci" ? COLOURS.muted : COLOURS.accent;
-    roundRect(ctx, wx, wy + 3, w, ROW - 6, 4);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = COLOURS.text;
-    ctx.fillText(fitText(ctx, label, w - 10), wx + 6, wy + ROW / 2);
-    const text = b.type === "pr_ci" ? () => prCiText(b) : () => batchText(world, b);
-    hits.push({ x: wx, y: wy + 3, w, h: ROW - 6, text });
-    wx += w + GAP;
-  }
-  return wy + ROW;
+  return top + world.slots.length * ROW;
 }
 
 // `look` is "queue" for a chip in the queue, "outside" for one on the
@@ -1010,18 +986,10 @@ function drawTrunk(ctx, world, hits, now, width, top) {
 
 function batchText(world, b) {
   const lines = [`batch ${b.id} ${list(b.members)}`, `on ${b.base === null ? "trunk" : `batch ${b.base}`}`,
-    `started ${clockText(b.started)}`];
-  if (b.began !== null) lines.push(`ran ${clockText(b.began)}–${b.ended === null ? "now" : clockText(b.ended)}`);
+    `ran ${clockText(b.started)}–${b.ended === null ? "now" : clockText(b.ended)}`];
   if (b.verdict) lines.push(b.verdict + (b.broken ? " (tree broken)" : ""));
   if (b.landed) lines.push("landed");
   if (b.refused) lines.push(`refused: ${b.refused}`);
-  return lines.join("\n");
-}
-
-function prCiText(job) {
-  const lines = [`PR CI of #${job.pr}`, `requested ${clockText(job.requested)}`];
-  if (job.began !== null) lines.push(`ran ${clockText(job.began)}–${job.ended === null ? "now" : clockText(job.ended)}`);
-  if (job.verdict) lines.push(job.verdict);
   return lines.join("\n");
 }
 
@@ -1032,7 +1000,9 @@ function prText(world, pr) {
   if (pr.batches.size) lines.push(`in batch ${[...pr.batches].join(", ")}`);
   if (pr.state === "queued") {
     if (world.queued.has(pr.pr)) {
-      if (world.held(pr)) lines.push("held: its own CI has not passed on this head");
+      if (world.held(pr)) {
+        lines.push(`held: its own CI has not passed on this head${pr.ci.billed ? " (a re-run billed to the queue)" : ""}`);
+      }
     } else {
       let where = `outside the queue: ${OUTSIDE[pr.place]?.long || "-"}`;
       if (pr.place === "with_base" || pr.place === "waiting_for_base") where += ` #${pr.on}`;
@@ -1096,7 +1066,7 @@ const replay = {
     let w = this.worlds.get(this.policy);
     if (!w) {
       const p = this.doc.policies.find((x) => x.name === this.policy);
-      w = new World(p.trace, this.doc.config.world.runners);
+      w = new World(p.trace, policyConfig(this.doc, this.policy).lanes ?? 1);
       this.worlds.set(this.policy, w);
     }
     return w;
@@ -1104,6 +1074,7 @@ const replay = {
 
   select(name) {
     this.policy = name;
+    $("stage").style.setProperty("--stage-height", `${canvasHeight(this.world().lanes)}px`);
     for (const b of $("policy-switch").children) b.setAttribute("aria-checked", String(b.textContent === name));
     this.logIndex = -1;
     this.dirty = true;
@@ -1152,8 +1123,8 @@ const replay = {
     const running = world.slots.filter((s) => s !== null).length;
     const items = [
       ["queued", world.queued.size], ["held", world.heldCount()],
-      ["outside", world.outside().length], ["running", `${running}/${world.runners}`],
-      ["waiting", world.waiting.length], ["runs", c.runs], ["PR CI runs", c.pr_ci_runs], ["landed", c.landed],
+      ["outside", world.outside().length], ["running", `${running}/${world.slots.length}`],
+      ["runs", c.runs], ["PR CI billed", c.billed_pr_ci_runs], ["landed", c.landed],
       ["ejected bad", c.ejected_bad], ["ejected good", c.ejected_good],
       ["blocked", c.blocked], ["withdrawn", c.withdrawn],
     ];

@@ -12,7 +12,7 @@ use crate::trace::TraceEvent;
 
 /// The JSON document's schema number. It changes when a field changes
 /// meaning, not when one is added.
-pub const SCHEMA: u32 = 2;
+pub const SCHEMA: u32 = 3;
 
 /// One policy's replications, in replication order.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,7 +32,7 @@ pub struct Report {
 /// A metric row: its name, the decimals it prints with, and its value.
 type Row = (&'static str, usize, fn(&Metrics) -> Option<f64>);
 
-const ROWS: [Row; 20] = [
+const ROWS: [Row; 19] = [
     ("arrived", 1, |m| Some(m.arrived as f64)),
     ("landed", 1, |m| Some(m.landed as f64)),
     ("ejected_bad", 1, |m| Some(m.ejected_bad as f64)),
@@ -43,16 +43,15 @@ const ROWS: [Row; 20] = [
     ("rebases", 1, |m| Some(m.rebases as f64)),
     ("runs", 1, |m| Some(m.runs as f64)),
     ("mean_batch_size", 2, |m| m.mean_batch_size),
-    ("pr_ci_runs", 1, |m| Some(m.pr_ci_runs as f64)),
+    ("billed_pr_ci_runs", 1, |m| Some(m.billed_pr_ci_runs as f64)),
     ("runner_hours", 1, |m| Some(m.runner_hours)),
-    ("pr_ci_hours", 1, |m| Some(m.pr_ci_hours)),
+    ("billed_pr_ci_hours", 1, |m| Some(m.billed_pr_ci_hours)),
     ("runner_hours_per_landed", 2, |m| m.runner_hours_per_landed),
     ("wasted_fraction", 3, |m| m.wasted_fraction),
     ("land_p50_hours", 2, |m| m.land_p50_hours),
     ("land_p95_hours", 2, |m| m.land_p95_hours),
     ("reject_p50_hours", 2, |m| m.reject_p50_hours),
     ("reject_p95_hours", 2, |m| m.reject_p95_hours),
-    ("utilisation", 3, |m| m.utilisation),
 ];
 
 /// The JSON document.
@@ -208,16 +207,15 @@ mod tests {
             rebases: 0,
             runs: 2,
             mean_batch_size: Some(5.0),
-            pr_ci_runs: 3,
+            billed_pr_ci_runs: 3,
             runner_hours: 6.0,
-            pr_ci_hours: 1.5,
+            billed_pr_ci_hours: 1.5,
             runner_hours_per_landed: per_landed,
             wasted_fraction: Some(0.0),
             land_p50_hours: None,
             land_p95_hours: None,
             reject_p50_hours: None,
             reject_p95_hours: None,
-            utilisation: Some(0.5),
         }
     }
 
@@ -307,22 +305,21 @@ mod tests {
                 "rebases",
                 "runs",
                 "mean_batch_size",
-                "pr_ci_runs",
+                "billed_pr_ci_runs",
                 "runner_hours",
-                "pr_ci_hours",
+                "billed_pr_ci_hours",
                 "runner_hours_per_landed",
                 "wasted_fraction",
                 "land_p50_hours",
                 "land_p95_hours",
                 "reject_p50_hours",
                 "reject_p95_hours",
-                "utilisation",
                 "failure",
             ]
         );
         assert_eq!(
-            row(&table, "pr_ci_hours"),
-            ["pr_ci_hours", "1.5 [1.5–1.5]", "1.5 [1.5–1.5]"]
+            row(&table, "billed_pr_ci_hours"),
+            ["billed_pr_ci_hours", "1.5 [1.5–1.5]", "1.5 [1.5–1.5]"]
         );
     }
 
@@ -358,7 +355,7 @@ mod tests {
         report.policies[0].trace = vec![TraceEvent::Withdraw { t: 3, pr: 1 }];
         let document: serde_json::Value =
             serde_json::from_str(&report.to_json("sim", &config, text)).unwrap();
-        assert_eq!(document["schema"], 2);
+        assert_eq!(document["schema"], 3);
         assert_eq!(document["name"], "sim");
         assert_eq!(document["config_text"], text);
         assert_eq!(document["config"]["seed"], 1);

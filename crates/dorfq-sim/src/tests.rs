@@ -17,17 +17,20 @@ fn small(p_bad: f64, p_interact: f64, p_flake: f64, p_conflict: f64) -> WorldCon
         hours: 6,
         drain_hours: 48,
         arrivals_per_hour: 3.0,
-        runners: 2,
         ci_minutes: Minutes { min: 20, max: 40 },
         pr_ci_minutes: Minutes { min: 5, max: 15 },
         rebase_minutes: Minutes { min: 15, max: 60 },
+        pr_ci_on_base_landed: true,
         p_bad,
         p_interact,
         p_flake,
         p_conflict,
         repush_per_hour: 0.0,
         withdraw_per_hour: 0.0,
-        p_stacked: 0.0,
+        stack_sizes: vec![1.0],
+        p_stack_grows: 0.0,
+        stack_growth_sizes: vec![1.0],
+        stack_growth_minutes: Minutes { min: 0, max: 0 },
         p_atomic: 0.0,
     }
 }
@@ -291,10 +294,9 @@ fn a_violating_plan_is_the_last_step_of_the_trace() {
 
 #[test]
 fn a_replication_cut_off_at_the_deadline_counts_its_unfinished_work() {
-    // One runner and long runs leave work queued when the drain is 0.
+    // Long runs leave work queued when the drain is 0.
     let config = WorldConfig {
         drain_hours: 0,
-        runners: 1,
         ci_minutes: Minutes { min: 90, max: 120 },
         ..small(0.1, 0.0, 0.0, 0.0)
     };
@@ -304,8 +306,8 @@ fn a_replication_cut_off_at_the_deadline_counts_its_unfinished_work() {
     assert!(m.unfinished > 0, "{m:?}");
     assert_eq!(world.now(), deadline);
     assert!(world.runs().iter().all(|r| r.started_at <= deadline));
-    // Seed-pinned: a run is still on the runner at the deadline, and its
-    // elapsed time is charged.
+    // Seed-pinned: a run is still running at the deadline, and its elapsed
+    // time is charged.
     let finished: u64 = world.runs().iter().map(|r| r.consumed).sum();
     assert!(m.runner_hours * HOUR as f64 > finished as f64, "{m:?}");
 }
@@ -348,26 +350,81 @@ fn one_seed_and_one_policy_give_identical_metrics_records_and_traces() {
 }
 
 #[test]
-fn two_policies_at_one_seed_see_identical_arrivals_truths_and_cut_from_targets() {
+fn two_policies_at_one_seed_see_identical_arrivals_truths_and_stacks() {
     let config = stacking();
     let floor = SchedulerConfig::AllAtOnce {};
-    let (floor, _) = replicate(&config, Admission::Label, &floor, 5, 0, None);
-    let (bisect, _) = replicate(&config, Admission::Github, &bisect(), 5, 0, None);
-    let (bayes, _) = replicate(&config, Admission::Label, &bayes(), 5, 0, None);
-    assert!(floor.truths().len() > 5);
-    assert!(floor.truths().iter().any(|t| t.4.is_some()));
-    assert_eq!(floor.truths(), bisect.truths());
-    assert_eq!(floor.truths(), bayes.truths());
+    let mut truths = Vec::new();
+    let mut stacked = false;
+    for admission in [Admission::Label, Admission::Github] {
+        for scheduler in [floor.clone(), bisect(), bayes()] {
+            let (world, _) = replicate(&config, admission, &scheduler, 5, 0, None);
+            let all = world.truths();
+            stacked |= all.iter().any(|t| t.4.is_some());
+            // Where a growth lands is the policy's doing; nothing else is.
+            truths.push(
+                all.into_iter()
+                    .map(|(at, bad, conflicts, key, _)| (at, bad, conflicts, key))
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    assert!(truths[0].len() > 5);
+    assert!(stacked);
+    assert!(truths.iter().all(|t| *t == truths[0]));
 }
 
-/// [`churning`] with half the arrivals cut from a recent branch and half
-/// of those `Atomic`.
+/// [`churning`] with stacks of one to four pull requests, half of them
+/// growing later and half `Atomic`.
 fn stacking() -> WorldConfig {
     WorldConfig {
-        p_stacked: 0.5,
+        stack_sizes: vec![3.0, 2.0, 1.0, 1.0],
+        p_stack_grows: 0.5,
+        stack_growth_sizes: vec![1.0, 1.0],
+        stack_growth_minutes: Minutes { min: 15, max: 90 },
         p_atomic: 0.5,
         ..churning(0.1, 0.02, 0.05)
     }
+}
+
+/// Asserts that every billed PR CI run follows a landing of its pull
+/// request's direct base — at that landing's instant under `label`, at the
+/// push of the rebase it forced under `github` — and that no pull request
+/// has more than one. Returns how many billed runs it checked.
+fn assert_billed_runs_follow_their_direct_base_landing(events: &[TraceEvent]) -> usize {
+    let mut base = BTreeMap::new();
+    let mut landed_at = BTreeMap::new();
+    let mut rebased_for_landing = BTreeSet::new();
+    let mut billed = BTreeSet::new();
+    for event in events {
+        match event {
+            TraceEvent::Arrive { pr, base: b, .. } => {
+                base.insert(*pr, *b);
+            }
+            TraceEvent::Land { t, members, .. } => {
+                landed_at.extend(members.iter().map(|&m| (m, *t)));
+            }
+            TraceEvent::Rebase { pr, why, .. } => {
+                if *why == Rebase::BaseLanded {
+                    rebased_for_landing.insert(*pr);
+                } else {
+                    rebased_for_landing.remove(pr);
+                }
+            }
+            TraceEvent::PrCi {
+                t,
+                pr,
+                billed: true,
+            } => {
+                let b = base[pr].unwrap_or_else(|| panic!("{event}: billed on trunk"));
+                let at = landed_at.get(&b);
+                let forced = at == Some(t) || (at.is_some() && rebased_for_landing.remove(pr));
+                assert!(forced, "{event}: its base {b} landed at {at:?}");
+                assert!(billed.insert(*pr), "{event}: billed twice");
+            }
+            _ => {}
+        }
+    }
+    billed.len()
 }
 
 #[test]
@@ -385,6 +442,7 @@ fn every_policy_drains_a_stacking_world_under_churn_under_either_admission() {
     {
         // Seeds at which a pull request that arrived stacked landed.
         let mut landed_stacked = 0;
+        let mut billed = 0;
         let mut rebases = 0;
         // A batch started after a member's own CI passed, at a later instant.
         let mut gated = false;
@@ -402,7 +460,13 @@ fn every_policy_drains_a_stacking_world_under_churn_under_either_admission() {
             assert_eq!(outcome, Ok(()), "{what}");
             assert_eq!(world.check_invariants(), Ok(()), "{what}");
             assert_eq!(crate::trace::check_lives(&events), Ok(()), "{what}");
+            billed += assert_billed_runs_follow_their_direct_base_landing(&events);
             let m = world.metrics();
+            assert_eq!(
+                m.billed_pr_ci_runs,
+                world.pr_ci_runs().iter().filter(|r| r.billed).count(),
+                "{what}"
+            );
             let left = m.landed + m.ejected_bad + m.ejected_good + m.withdrawn + m.blocked;
             assert_eq!(m.arrived, left + m.unfinished, "{m:?}");
             assert_eq!(m.unfinished, 0, "{what}: {m:?}");
@@ -449,11 +513,54 @@ fn every_policy_drains_a_stacking_world_under_churn_under_either_admission() {
             "{scheduler:?} under {admission:?} never landed a stacked pull request"
         );
         assert!(gated, "{scheduler:?} under {admission:?}");
+        assert!(
+            billed > 0,
+            "{scheduler:?} under {admission:?} billed nothing"
+        );
         if admission == Admission::Github {
             assert!(rebases > 0, "{scheduler:?} under {admission:?}");
         }
     }
     assert!(blocked > 0, "no pull request was ever blocked");
+}
+
+#[test]
+fn with_no_re_run_on_a_landed_base_nothing_is_billed_and_every_policy_drains() {
+    let config = WorldConfig {
+        pr_ci_on_base_landed: false,
+        ..stacking()
+    };
+    for admission in [Admission::Label, Admission::Github] {
+        for scheduler in [SchedulerConfig::AllAtOnce {}, bisect(), bayes()] {
+            for seed in 1..=2 {
+                let mut events = Vec::new();
+                let (world, outcome) =
+                    replicate(&config, admission, &scheduler, seed, 0, Some(&mut events));
+                let what = format!("{scheduler:?} under {admission:?} at seed {seed}");
+                assert_eq!(outcome, Ok(()), "{what}");
+                assert_eq!(world.check_invariants(), Ok(()), "{what}");
+                assert_eq!(crate::trace::check_lives(&events), Ok(()), "{what}");
+                let billed = events
+                    .iter()
+                    .find(|e| matches!(e, TraceEvent::PrCi { billed: true, .. }));
+                assert_eq!(billed, None, "{what}");
+                let m = world.metrics();
+                assert_eq!((m.billed_pr_ci_runs, m.unfinished), (0, 0), "{what}");
+                if admission == Admission::Github {
+                    let landed = |e: &TraceEvent| {
+                        matches!(
+                            e,
+                            TraceEvent::Rebase {
+                                why: Rebase::BaseLanded,
+                                ..
+                            }
+                        )
+                    };
+                    assert!(!events.iter().any(landed), "{what}");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -667,10 +774,12 @@ fn the_json_document_holds_every_policy_and_a_trace_from_time_zero() {
     assert!(!report.failed(), "{report}");
     let document: serde_json::Value =
         serde_json::from_str(&report.to_json("stacking", &config, EXAMPLE)).unwrap();
-    assert_eq!(document["schema"], 2);
+    assert_eq!(document["schema"], 3);
     assert_eq!(document["name"], "stacking");
     assert_eq!(document["config_text"], EXAMPLE);
-    assert_eq!(document["config"]["world"]["p_stacked"], 0.5);
+    assert_eq!(document["config"]["world"]["p_stack_grows"], 0.5);
+    assert!(document["config"]["world"].get("p_stacked").is_none());
+    assert!(document["config"]["world"].get("runners").is_none());
     let policies = document["policies"].as_array().unwrap();
     assert_eq!(policies.len(), config.policy.len());
     for (policy, configured) in policies.iter().zip(&config.policy) {
@@ -688,24 +797,19 @@ fn the_json_document_holds_every_policy_and_a_trace_from_time_zero() {
         );
         let mut arrived = BTreeSet::new();
         let mut started = BTreeSet::new();
-        // Per pull request, its PR CI run's state: requested or running.
-        let mut pr_ci: BTreeMap<u64, &str> = BTreeMap::new();
+        // The pull requests whose PR CI run is open.
+        let mut pr_ci: BTreeSet<u64> = BTreeSet::new();
         for event in trace {
             let pr = event["pr"].as_u64();
             match event["kind"].as_str().unwrap() {
                 "pr_ci" => {
-                    let before = pr_ci.insert(pr.unwrap(), "requested");
-                    assert_eq!(before, None, "{event}: a run already open");
-                }
-                "pr_ci_begin" => {
-                    let state = pr_ci.get_mut(&pr.unwrap());
-                    assert_eq!(state.as_deref(), Some(&"requested"), "{event}");
-                    *state.unwrap() = "running";
+                    assert!(event["billed"].is_boolean(), "{event}");
+                    assert!(pr_ci.insert(pr.unwrap()), "{event}: a run already open");
                 }
                 "pr_ci_end" => {
-                    let state = pr_ci.remove(&pr.unwrap());
-                    assert!(state.is_some(), "{event}: no run open");
+                    assert!(pr_ci.remove(&pr.unwrap()), "{event}: no run open");
                 }
+                "run_begin" | "pr_ci_begin" => panic!("{event}: a removed kind"),
                 _ => {}
             }
             if event["kind"] == "arrive" {
@@ -726,7 +830,7 @@ fn the_json_document_holds_every_policy_and_a_trace_from_time_zero() {
         }
         assert!(started.len() > 1, "{}", configured.name);
         assert!(
-            pr_ci.values().all(|&state| state != "running"),
+            pr_ci.is_empty(),
             "{}: a PR CI run begun and never ended: {pr_ci:?}",
             configured.name
         );

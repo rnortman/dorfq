@@ -129,7 +129,7 @@ mod tests {
         let (tag, document) = call(EXAMPLE);
         assert_eq!(tag, TAG_DOCUMENT);
         assert!(
-            document.starts_with(r#"{"schema":2,"name":"playground","config":"#),
+            document.starts_with(r#"{"schema":3,"name":"playground","config":"#),
             "{}",
             &document[..80.min(document.len())]
         );

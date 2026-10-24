@@ -73,8 +73,6 @@ pub enum TraceEvent {
         base: Option<u64>,
         members: Vec<u64>,
     },
-    /// The batch's run reached a runner.
-    RunBegin { t: u64, batch: u64 },
     /// The run's verdict; `broken` when its tree fails for its content,
     /// `flake` when the flake draw fired.
     RunEnd {
@@ -102,15 +100,14 @@ pub enum TraceEvent {
         justified: bool,
         r#final: bool,
     },
-    /// A batch was retired; `cancelled` when its run was waiting or running.
+    /// A batch was retired; `cancelled` when its run was still running.
     Retire { t: u64, batch: u64, cancelled: bool },
-    /// A pull request's own CI was requested for its current head; it waits
-    /// for a runner.
-    PrCi { t: u64, pr: u64 },
-    /// The pull request's own CI run reached a runner.
-    PrCiBegin { t: u64, pr: u64 },
+    /// A pull request's own CI run started on its current head; `billed`
+    /// when the queue caused it by landing the pull request's direct base
+    /// without it.
+    PrCi { t: u64, pr: u64, billed: bool },
     /// The pull request's own CI run ended: passed, or `cancelled` by a
-    /// head change, waiting or running.
+    /// head change.
     PrCiEnd { t: u64, pr: u64, cancelled: bool },
     /// The pull request's author starts rebasing it, for `why`; the push
     /// follows as `repush`.
@@ -174,7 +171,6 @@ impl fmt::Display for TraceEvent {
                     None => write!(f, " on trunk"),
                 }
             }
-            TraceEvent::RunBegin { batch, .. } => write!(f, "ci {batch} begins"),
             TraceEvent::RunEnd {
                 batch,
                 passed,
@@ -223,8 +219,13 @@ impl fmt::Display for TraceEvent {
                 }
                 Ok(())
             }
-            TraceEvent::PrCi { pr, .. } => write!(f, "pr-ci {pr}"),
-            TraceEvent::PrCiBegin { pr, .. } => write!(f, "pr-ci {pr} begins"),
+            TraceEvent::PrCi { pr, billed, .. } => {
+                write!(f, "pr-ci {pr}")?;
+                if *billed {
+                    write!(f, " billed")?;
+                }
+                Ok(())
+            }
             TraceEvent::PrCiEnd { pr, cancelled, .. } => {
                 let end = if *cancelled { "cancelled" } else { "passed" };
                 write!(f, "pr-ci {pr} {end}")
@@ -276,9 +277,11 @@ impl fmt::Display for TraceEvent {
 /// `blocked` or `eject` that is not final only `rebase` and `repush` come
 /// before its return (`admit`), a `withdraw` or a final `blocked`; after a
 /// `rebase` comes its push or a withdrawal; after a `wait` a rebase, a
-/// push, a final `blocked` or a withdrawal; after a final exit only the
-/// run of its last head begins and ends, and after a landing nothing; and
-/// no `start` names it unless its latest own-CI event is a pass.
+/// push, an `admit`, a final `blocked` or a withdrawal; after a final exit that is not
+/// a landing at most one `pr_ci_end`, its last head's run's; after a
+/// landing one `pr_ci_end` if a billed run was in flight at the landing,
+/// and nothing else; and no `start` names it unless its current head, from
+/// its `arrive` or latest `repush`, has passed its own CI.
 #[cfg(test)]
 pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
     use std::collections::BTreeMap;
@@ -291,17 +294,18 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
 
     #[derive(Default)]
     struct Life {
-        /// Its latest own-CI event was a pass.
+        /// Its current head has passed its own CI.
         checked: bool,
         /// Out with a return pending, since this event.
         returning: Option<String>,
         /// The last `rebase` or `wait` and its text, until the next event
         /// of its own.
         expecting: Option<(Expect, String)>,
-        /// Left for good, by this event; `begins` and `ends` count its last
-        /// run's events since.
+        /// A billed run is in flight: requested and not yet ended.
+        billed: bool,
+        /// Left for good, by this event, and whether by landing; `ends`
+        /// counts its run's ends since.
         exit: Option<(String, bool)>,
-        begins: u32,
         ends: u32,
     }
 
@@ -316,7 +320,6 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
             | TraceEvent::Blocked { pr, .. }
             | TraceEvent::Eject { pr, .. }
             | TraceEvent::PrCi { pr, .. }
-            | TraceEvent::PrCiBegin { pr, .. }
             | TraceEvent::PrCiEnd { pr, .. }
             | TraceEvent::Rebase { pr, .. }
             | TraceEvent::Admit { pr, .. }
@@ -329,38 +332,37 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
             let life = lives.entry(pr).or_default();
             let fail = |why: &str| Err(format!("pr {pr}: {why} at `{text}`"));
             if let Some((exit, landed)) = &life.exit {
-                let run = match event {
-                    TraceEvent::PrCiBegin { .. } => {
-                        life.begins += 1;
-                        true
-                    }
+                let allowed = match event {
+                    TraceEvent::PrCiEnd { .. } if *landed => std::mem::take(&mut life.billed),
                     TraceEvent::PrCiEnd { .. } => {
                         life.ends += 1;
-                        true
+                        life.ends == 1
                     }
                     _ => false,
                 };
-                if !run || *landed || life.begins > 1 || life.ends > 1 {
+                if !allowed {
                     return fail(&format!("after its exit `{exit}`"));
                 }
                 continue;
             }
             match event {
-                TraceEvent::PrCi { .. } => {
-                    life.checked = false;
+                TraceEvent::PrCi { billed, .. } => {
+                    life.billed = *billed;
                     continue;
                 }
                 TraceEvent::PrCiEnd { cancelled, .. } => {
                     life.checked |= !cancelled;
+                    life.billed = false;
                     continue;
                 }
-                TraceEvent::PrCiBegin { .. } => continue,
                 _ => {}
             }
             if let Some((expect, after)) = life.expecting.take() {
                 let fits = match (expect, event) {
                     (_, TraceEvent::Repush { .. } | TraceEvent::Withdraw { .. }) => true,
-                    (Expect::AfterWait, TraceEvent::Rebase { .. }) => true,
+                    (Expect::AfterWait, TraceEvent::Rebase { .. } | TraceEvent::Admit { .. }) => {
+                        true
+                    }
                     (Expect::AfterWait, TraceEvent::Blocked { r#final, .. }) => *r#final,
                     _ => false,
                 };
@@ -377,6 +379,7 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
                 }
             }
             match event {
+                TraceEvent::Arrive { .. } | TraceEvent::Repush { .. } => life.checked = false,
                 TraceEvent::Start { .. } if !life.checked => {
                     return fail("a batch takes an unchecked head");
                 }
@@ -450,7 +453,6 @@ mod tests {
                 base: Some(2),
                 members: vec![5],
             },
-            TraceEvent::RunBegin { t: 4, batch: 2 },
             TraceEvent::RunEnd {
                 t: 5,
                 batch: 2,
@@ -506,8 +508,16 @@ mod tests {
                 batch: 4,
                 cancelled: true,
             },
-            TraceEvent::PrCi { t: 7, pr: 7 },
-            TraceEvent::PrCiBegin { t: 7, pr: 7 },
+            TraceEvent::PrCi {
+                t: 7,
+                pr: 7,
+                billed: false,
+            },
+            TraceEvent::PrCi {
+                t: 7,
+                pr: 7,
+                billed: true,
+            },
             TraceEvent::PrCiEnd {
                 t: 8,
                 pr: 7,
@@ -582,7 +592,6 @@ mod tests {
                 "blocked 8 with 3",
                 "start 2 [1,2] on trunk",
                 "start 3 [5] on 2",
-                "ci 2 begins",
                 "ci 2 passed",
                 "ci 3 failed broken flake",
                 "land 2 [1,2]",
@@ -593,7 +602,7 @@ mod tests {
                 "retire 3",
                 "retire 4 cancelled",
                 "pr-ci 7",
-                "pr-ci 7 begins",
+                "pr-ci 7 billed",
                 "pr-ci 7 passed",
                 "pr-ci 8 cancelled",
                 "rebase 9 conflict",
@@ -615,7 +624,11 @@ mod tests {
             base: None,
             members: vec![7],
         };
-        let pr_ci = TraceEvent::PrCi { t: 0, pr: 7 };
+        let pr_ci = TraceEvent::PrCi {
+            t: 0,
+            pr: 7,
+            billed: false,
+        };
         let passed = TraceEvent::PrCiEnd {
             t: 1,
             pr: 7,
@@ -638,8 +651,21 @@ mod tests {
         };
         let ok = [pr_ci.clone(), passed.clone(), start.clone(), land.clone()];
         assert_eq!(check_lives(&ok), Ok(()));
+        // A billed re-run on the head that passed leaves it checked.
+        let rerun = TraceEvent::PrCi {
+            t: 1,
+            pr: 7,
+            billed: true,
+        };
+        let same_head = [pr_ci.clone(), passed.clone(), rerun, start.clone()];
+        assert_eq!(check_lives(&same_head), Ok(()));
+        let repush = TraceEvent::Repush { t: 1, pr: 7 };
         for (events, why) in [
             (vec![pr_ci.clone(), start.clone()], "unchecked head"),
+            (
+                vec![pr_ci.clone(), passed.clone(), repush, start.clone()],
+                "unchecked head",
+            ),
             (
                 vec![pr_ci, passed, start, land, rebase.clone()],
                 "after its exit",
@@ -648,6 +674,47 @@ mod tests {
         ] {
             let error = check_lives(&events).unwrap_err();
             assert!(error.contains(why), "{error}");
+        }
+    }
+
+    #[test]
+    fn after_a_landing_only_the_end_of_a_billed_run_in_flight_is_admitted() {
+        let pr_ci = |billed| TraceEvent::PrCi {
+            t: 0,
+            pr: 7,
+            billed,
+        };
+        let end = TraceEvent::PrCiEnd {
+            t: 3,
+            pr: 7,
+            cancelled: false,
+        };
+        let start = TraceEvent::Start {
+            t: 1,
+            batch: 1,
+            base: None,
+            members: vec![7],
+        };
+        let land = TraceEvent::Land {
+            t: 2,
+            batch: 1,
+            members: vec![7],
+        };
+        let checked = [pr_ci(false), end.clone(), start];
+        let mut ok = checked.to_vec();
+        ok.extend([pr_ci(true), land.clone(), end.clone()]);
+        assert_eq!(check_lives(&ok), Ok(()));
+        let repush = TraceEvent::Repush { t: 3, pr: 7 };
+        for tail in [
+            vec![land.clone(), end.clone()],
+            vec![pr_ci(false), land.clone(), end.clone()],
+            vec![pr_ci(true), land.clone(), end.clone(), end.clone()],
+            vec![pr_ci(true), land.clone(), repush],
+        ] {
+            let mut events = checked.to_vec();
+            events.extend(tail);
+            let error = check_lives(&events).unwrap_err();
+            assert!(error.contains("after its exit `land 1 [7]`"), "{error}");
         }
     }
 
@@ -683,7 +750,6 @@ mod tests {
             "blocked",
             "start",
             "start",
-            "run_begin",
             "run_end",
             "run_end",
             "land",
@@ -694,7 +760,7 @@ mod tests {
             "retire",
             "retire",
             "pr_ci",
-            "pr_ci_begin",
+            "pr_ci",
             "pr_ci_end",
             "pr_ci_end",
             "rebase",
@@ -723,30 +789,38 @@ mod tests {
             json!({ "kind": "blocked", "t": 3, "pr": 8, "on": 3, "final": false })
         );
         assert_eq!(
-            serde_json::to_value(&events[15]).unwrap(),
+            serde_json::to_value(&events[14]).unwrap(),
             json!({
                 "kind": "eject", "t": 6, "pr": 9, "reason": "conflicts with trunk",
                 "justified": false, "final": false
             })
         );
         assert_eq!(
-            serde_json::to_value(&events[21]).unwrap(),
+            serde_json::to_value(&events[17]).unwrap(),
+            json!({ "kind": "pr_ci", "t": 7, "pr": 7, "billed": false })
+        );
+        assert_eq!(
+            serde_json::to_value(&events[18]).unwrap(),
+            json!({ "kind": "pr_ci", "t": 7, "pr": 7, "billed": true })
+        );
+        assert_eq!(
+            serde_json::to_value(&events[20]).unwrap(),
             json!({ "kind": "pr_ci_end", "t": 8, "pr": 8, "cancelled": true })
         );
         assert_eq!(
-            serde_json::to_value(&events[23]).unwrap(),
+            serde_json::to_value(&events[22]).unwrap(),
             json!({ "kind": "rebase", "t": 9, "pr": 7, "why": "base_landed" })
         );
         assert_eq!(
-            serde_json::to_value(&events[25]).unwrap(),
+            serde_json::to_value(&events[24]).unwrap(),
             json!({ "kind": "admit", "t": 10, "pr": 7, "base": 3 })
         );
         assert_eq!(
-            serde_json::to_value(&events[27]).unwrap(),
+            serde_json::to_value(&events[26]).unwrap(),
             json!({ "kind": "wait", "t": 11, "pr": 7, "on": 3 })
         );
         assert_eq!(
-            serde_json::to_value(&events[28]).unwrap(),
+            serde_json::to_value(&events[27]).unwrap(),
             json!({
                 "kind": "step", "t": 6, "queued": 4, "in_flight": 1, "land": [2],
                 "start": [{ "batch": 5, "members": [6, 7] }, { "batch": 6, "members": [8] }],
