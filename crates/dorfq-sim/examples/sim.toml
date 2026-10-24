@@ -17,13 +17,25 @@ p_flake = 0.02             # a run fails for no reason in the tree
 p_conflict = 0.02          # a pull request arrives with a textual conflict against trunk
 repush_per_hour = 0.0      # per queued pull request: head changes, intent kept
 withdraw_per_hour = 0.0    # per queued pull request: intent cleared
+p_stacked = 0.25           # an arrival is cut from a recent arrival's branch; it stacks on it only while that one is queued
+p_atomic = 0.2             # a stacked arrival lands only with its ancestors
 
 # What pooling costs with no failure response at all.
 [[policy]]
 name = "all-at-once"
 kind = "all-at-once"
 
-# The conventional pipelined bisect with memory: the baseline.
+# GitHub's merge queue, approximately: each pull request built on top of
+# the ones ahead of it, up to five builds in flight; a failed one is removed
+# once everything ahead of it passed, and the rest rebuilt. Unlike GitHub's
+# queue, which refuses stacked pull requests, this column lands them.
+[[policy]]
+name = "github-like"
+kind = "bisect"
+lanes = 5
+max_batch = 1
+
+# The conventional pipelined bisect with memory, pooling up to eight.
 [[policy]]
 name = "bisect"
 kind = "bisect"

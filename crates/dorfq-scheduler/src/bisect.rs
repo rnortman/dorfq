@@ -4,24 +4,31 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use dorfq_core::{
     BatchId, BatchStart, BatchState, CiStatus, ConflictWith, EjectReason, Observation, Plan,
-    PrBase, PrNumber, Scheduler, SchedulerError, Sha,
+    PrNumber, Scheduler, SchedulerError, Sha, StackPolicy,
 };
 
-use crate::{Ejections, Ids, Member, batchable, chain, is_pending};
+use crate::stacks::Stacks;
+use crate::{Ejections, Ids, Member, chain, is_pending};
 
 /// The conventional pipelined bisect: batches in queue order on one chain,
 /// halves a failed batch, and never runs a member set known to fail.
 ///
 /// Every batch it starts is built on the chain end: the newest tip that
-/// still stands once this step's landings run, or trunk. A failed batch
-/// whose tree below it passed is its own failure: one member is ejected,
-/// several are split into two retest groups, which become the chain's next
-/// entries ahead of fresh work. A failed batch whose ancestors are still
-/// running is held until their verdicts are in; one whose base can no longer
-/// land is retired with nothing learned, and everything above a failure is
-/// cancelled. A retest batch retired without a verdict of its own puts its
-/// group back at the front of the retest queue. No fresh batch is built on a
-/// chain end whose tree holds a member set known to fail; that lane idles.
+/// still stands once this step's landings run, or trunk. A fresh batch takes
+/// landing units (an `Atomic` pull request with its ancestors, or one other
+/// pull request) in queue order, bases before children, each only once its
+/// bases are in the batch or in the tree it runs on; an `Atomic` unit larger
+/// than `max_batch` is batched alone. A failed batch whose tree below it
+/// passed is its own failure: one member is ejected; several units are split
+/// into two retest groups, which become the chain's next entries ahead of
+/// fresh work, and a group runs once its members' bases are beneath it; a
+/// single `Atomic` unit has its `Atomic` members ejected. A failed batch
+/// whose ancestors are still running is held until their verdicts are in;
+/// one whose base can no longer land is retired with nothing learned, and
+/// everything above a failure is cancelled. A retest batch retired without a
+/// verdict of its own puts its group back at the front of the retest queue.
+/// No fresh batch is built on a chain end whose tree holds a member set
+/// known to fail; that lane idles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bisect {
     lanes: usize,
@@ -68,6 +75,28 @@ impl Bisect {
     }
 }
 
+/// `members` split into two halves of whole units, each in `members` order:
+/// the first half takes the first `⌈k/2⌉` of the `k` units. `None` when the
+/// members are a single unit.
+fn halves(stacks: &Stacks, members: &[Member]) -> Option<(Vec<Member>, Vec<Member>)> {
+    let numbers: Vec<PrNumber> = members.iter().map(|(pr, _)| *pr).collect();
+    let groups = stacks.partition(&numbers);
+    if groups.len() < 2 {
+        return None;
+    }
+    let first: BTreeSet<PrNumber> = groups[..groups.len().div_ceil(2)]
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    Some(
+        members
+            .iter()
+            .cloned()
+            .partition(|(pr, _)| first.contains(pr)),
+    )
+}
+
 /// What this step does with one tracked batch.
 enum Fate {
     /// Landable and landed by this plan.
@@ -93,12 +122,13 @@ impl Scheduler for Bisect {
             .map(|p| (p.number, &p.head))
             .collect();
         let queued = |(pr, head): &Member| heads.get(pr) == Some(&head);
-        // TODO(scheduler-stacks): stacked pull requests, and the ancestors of
-        // an `Atomic` one, wait; splitting a batch could separate a child
-        // from its base.
-        let ready: BTreeSet<PrNumber> = batchable(observation, |p| p.base == PrBase::Trunk)
-            .into_iter()
+        let atomic: BTreeSet<PrNumber> = observation
+            .prs
+            .iter()
+            .filter(|p| p.stack == StackPolicy::Atomic)
+            .map(|p| p.number)
             .collect();
+        let stacks = Stacks::new(observation);
 
         let tracked: BTreeSet<BatchId> = observation.batches.iter().map(|b| b.id).collect();
         self.split.retain(|id| tracked.contains(id));
@@ -110,6 +140,15 @@ impl Scheduler for Bisect {
                 .partition(|(id, _)| tracked.contains(id));
         self.retesting = started;
         self.failed.retain(|set| set.iter().all(queued));
+        // No batch can split a set lying inside one unit, so remembering it
+        // would bar the unit forever: it is forgotten and the unit runs
+        // whole. Should the unit later come apart, its members are bisected
+        // again from no memory, which costs runs and never a stall.
+        self.failed.retain(|set| {
+            let mut prs = set.iter().map(|(pr, _)| *pr);
+            let within = prs.next().and_then(|first| stacks.unit(first));
+            !within.is_some_and(|unit| prs.all(|pr| unit.contains(&pr)))
+        });
 
         let mut plan = Plan::default();
 
@@ -194,15 +233,33 @@ impl Scheduler for Bisect {
                         .iter()
                         .map(|m| (m.pr, m.head.clone()))
                         .collect();
+                    let reason = EjectReason::BatchFailed { batch: batch.id };
+                    // TODO(trunk-broken-probe): a flaky pass that landed a
+                    // bad pull request breaks trunk, after which every
+                    // singleton fails here and an innocent is ejected.
                     if let [single] = members.as_slice() {
                         if queued(single) {
-                            ejections.eject(single.0, EjectReason::BatchFailed { batch: batch.id });
+                            ejections.eject(single.0, reason);
                         }
-                    } else if self.split.insert(batch.id) {
-                        let (first, rest) = members.split_at(members.len().div_ceil(2));
-                        self.retests.push_front(rest.to_vec());
-                        self.retests.push_front(first.to_vec());
-                        self.failed.push(members.into_iter().collect());
+                    } else if let Some((first, rest)) = halves(&stacks, &members) {
+                        if self.split.insert(batch.id) {
+                            self.retests.push_front(rest);
+                            self.retests.push_front(first);
+                            self.failed.push(members.into_iter().collect());
+                        }
+                    } else {
+                        // One `Atomic` unit failed whole: no landing can
+                        // split it, so its `Atomic` members are ejected and
+                        // the splittable ancestors return to the pool.
+                        let mut tips: Vec<PrNumber> = members
+                            .iter()
+                            .filter(|m| queued(m) && atomic.contains(&m.0))
+                            .map(|(pr, _)| *pr)
+                            .collect();
+                        tips.sort_unstable();
+                        for pr in tips {
+                            ejections.eject(pr, reason.clone());
+                        }
                     }
                     plan.retire.push(batch.id);
                 }
@@ -240,35 +297,78 @@ impl Scheduler for Bisect {
                 .map(|(batch, _)| batch),
         );
 
-        // Start one batch on the chain end: the front retest group, else a
-        // fresh batch.
+        // Start one batch on the chain end: the first runnable retest group,
+        // else a fresh batch.
         let mut taken = in_flight;
         taken.extend(plan.eject.iter().map(|e| e.pr));
         if pending >= self.lanes {
             return Ok(plan);
         }
-        while let Some(group) = self.retests.pop_front() {
-            let group: Vec<Member> = group
+        // The members beneath the chain end beyond the observation's trunk:
+        // the standing batches, and the batches this plan lands, which are
+        // trunk's by the time the start runs.
+        let beneath: BTreeSet<PrNumber> = path
+            .iter()
+            .copied()
+            .chain(
+                observation
+                    .batches
+                    .iter()
+                    .zip(&fates)
+                    .filter(|(_, fate)| matches!(fate, Fate::Land))
+                    .map(|(batch, _)| batch),
+            )
+            .flat_map(|batch| batch.members.iter().map(|m| m.pr))
+            .collect();
+        let footing = stacks.on(&beneath);
+        let mut i = 0;
+        while i < self.retests.len() {
+            // A member whose unit is not wholly in the group leaves it, so a
+            // group never holds part of an `Atomic` stack.
+            let filtered: Vec<Member> = self.retests[i]
+                .iter()
+                .filter(|m| queued(m) && stacks.contains(m.0) && !taken.contains(&m.0))
+                .cloned()
+                .collect();
+            let present: BTreeSet<PrNumber> = filtered.iter().map(|(pr, _)| *pr).collect();
+            let group: Vec<Member> = filtered
                 .into_iter()
-                .filter(|m| queued(m) && ready.contains(&m.0) && !taken.contains(&m.0))
+                .filter(|(pr, _)| {
+                    stacks
+                        .unit(*pr)
+                        .is_some_and(|unit| unit.iter().all(|u| present.contains(u)))
+                })
                 .collect();
             if group.is_empty() {
+                self.retests.remove(i);
                 continue;
             }
-            if self.contains_failed(&group) {
-                let (first, rest) = group.split_at(group.len().div_ceil(2));
-                self.requeue(vec![first.to_vec(), rest.to_vec()]);
+            if self.contains_failed(&group)
+                && let Some((first, rest)) = halves(&stacks, &group)
+            {
+                self.retests[i] = first;
+                self.retests.insert(i + 1, rest);
                 continue;
             }
-            let id = self.ids.mint();
-            plan.start.push(BatchStart::new(
-                id,
-                chain_end.clone(),
-                group.iter().map(|(pr, _)| *pr).collect(),
-            ));
-            self.retesting.insert(id, group);
-            return Ok(plan);
+            if footing
+                .extend(&BTreeSet::new(), group.iter().map(|(pr, _)| *pr))
+                .is_some()
+            {
+                self.retests.remove(i);
+                let id = self.ids.mint();
+                plan.start.push(BatchStart::new(
+                    id,
+                    chain_end.clone(),
+                    group.iter().map(|(pr, _)| *pr).collect(),
+                ));
+                self.retesting.insert(id, group);
+                return Ok(plan);
+            }
+            self.retests[i] = group;
+            i += 1;
         }
+        // Waiting groups keep their members out of the fresh batch.
+        taken.extend(self.retests.iter().flatten().map(|(pr, _)| *pr));
 
         // A batch built on a tree holding a known-failed set runs that set
         // again, so the lane idles.
@@ -280,17 +380,27 @@ impl Scheduler for Bisect {
             return Ok(plan);
         }
         let mut members: Vec<Member> = Vec::new();
-        for pr in &observation.prs {
-            if members.len() == self.max_batch {
+        let mut chosen: BTreeSet<PrNumber> = BTreeSet::new();
+        for unit in stacks.units() {
+            if members.len() >= self.max_batch {
                 break;
             }
-            if !ready.contains(&pr.number) || taken.contains(&pr.number) {
+            if !members.is_empty() && members.len() + unit.len() > self.max_batch {
                 continue;
             }
-            members.push((pr.number, pr.head.clone()));
-            if self.contains_failed(&members) {
-                members.pop();
+            if unit.iter().any(|pr| taken.contains(pr)) {
+                continue;
             }
+            let Some(with) = footing.extend(&chosen, unit.iter().copied()) else {
+                continue;
+            };
+            let mut candidate = members.clone();
+            candidate.extend(unit.iter().map(|pr| (*pr, heads[pr].clone())));
+            if self.contains_failed(&candidate) {
+                continue;
+            }
+            members = candidate;
+            chosen = with;
         }
         if !members.is_empty() {
             plan.start.push(BatchStart::new(
@@ -308,7 +418,7 @@ impl Scheduler for Bisect {
 mod tests {
     use super::*;
     use crate::test_support::*;
-    use dorfq_core::{Hold, LandRefusal, Timestamp};
+    use dorfq_core::{Hold, LandRefusal, PrSnapshot, Timestamp};
 
     fn bisect() -> Bisect {
         Bisect::new(2, 16)
@@ -1112,27 +1222,333 @@ mod tests {
     }
 
     #[test]
-    fn stacked_pull_requests_and_parents_of_atomic_ones_are_never_batched() {
+    fn a_chain_and_a_tree_are_batched_base_first_in_one_fresh_batch() {
         let mut s = bisect();
+        // 5 <- 2 <- 4, 5 <- 3, and 1 on trunk.
         let prs = vec![
             ready(1),
-            stacked(2, 1),
-            ready(3),
-            atomic(stacked(4, 3)),
+            stacked(2, 5),
+            stacked(3, 5),
+            stacked(4, 2),
             ready(5),
         ];
         let plan = step(&mut s, &observation(prs, vec![]));
-        assert_eq!(plan.start, vec![start(1, trunk(), &[1, 5])]);
+        assert_eq!(plan.start, vec![start(1, trunk(), &[1, 5, 2, 3, 4])]);
+    }
+
+    #[test]
+    fn an_atomic_unit_is_taken_whole_or_not_at_all() {
+        let mut s = Bisect::new(1, 3);
+        let prs = vec![ready(1), atomic_stacked(2, 1), ready(3), ready(4)];
+        let plan = step(&mut s, &observation(prs, vec![]));
+        assert_eq!(plan.start, vec![start(1, trunk(), &[1, 2, 3])]);
+        // {2, 3} would take the batch past two: it is skipped, and 4 fits.
+        let mut s = Bisect::new(1, 2);
+        let prs = vec![ready(1), ready(2), atomic_stacked(3, 2), ready(4)];
+        let plan = step(&mut s, &observation(prs, vec![]));
+        assert_eq!(plan.start, vec![start(1, trunk(), &[1, 4])]);
+    }
+
+    #[test]
+    fn an_atomic_unit_larger_than_max_batch_is_batched_alone() {
+        let mut s = Bisect::new(1, 2);
+        let prs = vec![ready(1), stacked(2, 1), atomic_stacked(3, 2), ready(4)];
+        let plan = step(&mut s, &observation(prs, vec![]));
+        assert_eq!(plan.start, vec![start(1, trunk(), &[1, 2, 3])]);
+    }
+
+    #[test]
+    fn a_child_whose_base_stands_in_the_chain_joins_the_fresh_batch() {
+        let mut s = bisect();
+        let prs = vec![ready(1), stacked(2, 1), ready(3)];
+        let plan = step(
+            &mut s,
+            &observation(prs, vec![testing(1, trunk(), &[1], CiStatus::Pending)]),
+        );
+        assert_eq!(plan.start, vec![start(2, tip(1), &[2, 3])]);
+    }
+
+    #[test]
+    fn a_child_whose_base_is_held_back_waits() {
+        // 2's base is in a failed batch held above a pending one: not in the
+        // chain's tree, so 2 is not batched on the chain end.
+        let mut s = Bisect::new(3, 16);
+        let prs = vec![ready(1), stacked(2, 1), ready(3), ready(4)];
+        let plan = step(
+            &mut s,
+            &observation(
+                prs,
+                vec![
+                    testing(1, trunk(), &[3], CiStatus::Pending),
+                    testing(2, tip(1), &[1], ci_failed()),
+                ],
+            ),
+        );
+        assert_eq!(plan.start, vec![start(3, tip(1), &[4])]);
+    }
+
+    #[test]
+    fn a_failed_stack_and_a_neighbour_split_between_whole_units() {
+        let mut s = Bisect::new(1, 16);
+        let prs = vec![ready(1), stacked(2, 1), ready(3)];
+        let plan = step(
+            &mut s,
+            &observation(prs, vec![testing(1, trunk(), &[1, 2, 3], ci_failed())]),
+        );
+        assert_eq!(plan.start, vec![start(2, trunk(), &[1, 2])]);
+        assert_eq!(s.retests, VecDeque::from(vec![vec![(PrNumber(3), sha(3))]]));
+        // An `Atomic` unit stays in one half.
+        let mut s = Bisect::new(1, 16);
+        let prs = vec![ready(1), ready(2), atomic_stacked(3, 2), ready(4)];
+        let plan = step(
+            &mut s,
+            &observation(prs, vec![testing(1, trunk(), &[1, 2, 3, 4], ci_failed())]),
+        );
+        assert_eq!(plan.start, vec![start(2, trunk(), &[1, 2, 3])]);
+    }
+
+    /// A failed chain 1 <- 2 <- 3 <- 4, split into [1, 2] and [3, 4].
+    fn failed_chain(s: &mut Bisect) -> Vec<PrSnapshot> {
+        let prs = vec![ready(1), stacked(2, 1), stacked(3, 2), stacked(4, 3)];
+        let plan = step(
+            s,
+            &observation(
+                prs.clone(),
+                vec![testing(1, trunk(), &[1, 2, 3, 4], ci_failed())],
+            ),
+        );
+        assert!(plan.eject.is_empty());
+        assert_eq!(plan.retire, vec![BatchId(1)]);
+        assert_eq!(plan.start, vec![start(2, trunk(), &[1, 2])]);
+        prs
+    }
+
+    #[test]
+    fn a_suffix_group_starts_on_its_prefix_once_a_lane_is_free() {
+        let mut s = Bisect::new(2, 16);
+        let prs = failed_chain(&mut s);
+        let plan = step(
+            &mut s,
+            &observation(prs, vec![testing(2, trunk(), &[1, 2], CiStatus::Pending)]),
+        );
+        assert_eq!(plan.start, vec![start(3, tip(2), &[3, 4])]);
+    }
+
+    #[test]
+    fn a_suffix_group_with_one_lane_starts_in_the_plan_that_lands_its_prefix() {
+        let mut s = Bisect::new(1, 16);
+        let prs = failed_chain(&mut s);
+        let plan = step(
+            &mut s,
+            &observation(
+                prs.clone(),
+                vec![testing(2, trunk(), &[1, 2], CiStatus::Pending)],
+            ),
+        );
+        assert!(plan.is_empty(), "{plan:?}");
+        let plan = step(
+            &mut s,
+            &observation(prs, vec![testing(2, trunk(), &[1, 2], CiStatus::Passed)]),
+        );
+        assert_eq!(plan.land, vec![BatchId(2)]);
+        assert_eq!(plan.start, vec![start(3, tip(2), &[3, 4])]);
+    }
+
+    #[test]
+    fn a_waiting_suffix_group_is_not_rebatched_elsewhere() {
+        // Seeded: a group whose bases are in the pool.
+        let mut s = Bisect::new(2, 16);
+        s.retests
+            .push_back(vec![(PrNumber(3), sha(3)), (PrNumber(4), sha(4))]);
+        let prs = vec![
+            ready(1),
+            stacked(2, 1),
+            stacked(3, 2),
+            stacked(4, 3),
+            ready(5),
+        ];
+        let plan = step(&mut s, &observation(prs.clone(), vec![]));
+        assert_eq!(plan.start, vec![start(1, trunk(), &[1, 2, 5])]);
+        let plan = step(
+            &mut s,
+            &observation(
+                prs,
+                vec![testing(1, trunk(), &[1, 2, 5], CiStatus::Pending)],
+            ),
+        );
+        assert_eq!(plan.start, vec![start(2, tip(1), &[3, 4])]);
+    }
+
+    #[test]
+    fn an_atomic_tip_above_a_queued_group_member_dissolves_it_into_its_unit() {
+        let mut s = Bisect::new(2, 16);
+        let plan = step(
+            &mut s,
+            &observation(
+                ready_all(&[1, 2]),
+                vec![testing(1, trunk(), &[1, 2], ci_failed())],
+            ),
+        );
+        assert_eq!(plan.start, vec![start(2, trunk(), &[1])]);
+        // 3 arrives `Atomic` on 2: 2 leaves its group {2}, and the unit
+        // {2, 3} is the fresh batch.
+        let prs = vec![ready(1), ready(2), atomic_stacked(3, 2)];
+        let plan = step(
+            &mut s,
+            &observation(prs, vec![testing(2, trunk(), &[1], CiStatus::Pending)]),
+        );
+        assert_eq!(plan.start, vec![start(3, tip(2), &[2, 3])]);
+        assert!(s.retests.is_empty(), "{:?}", s.retests);
+    }
+
+    #[test]
+    fn a_known_failed_set_inside_a_new_atomic_unit_is_forgotten_and_the_unit_runs() {
+        let mut s = Bisect::new(1, 16);
+        let prs = vec![ready(1), stacked(2, 1), ready(3)];
+        let plan = step(
+            &mut s,
+            &observation(
+                prs.clone(),
+                vec![testing(1, trunk(), &[1, 2, 3], ci_failed())],
+            ),
+        );
+        assert_eq!(plan.start, vec![start(2, trunk(), &[1, 2])]);
+        let plan = step(
+            &mut s,
+            &observation(prs.clone(), vec![testing(2, trunk(), &[1, 2], ci_failed())]),
+        );
+        assert_eq!(plan.start, vec![start(3, trunk(), &[1])]);
+        // 4 arrives `Atomic` on 2 while {1} runs: the passed {1} is retired,
+        // the groups {1} and {2} dissolve into the unit {1, 2, 4}, and {3}
+        // runs.
+        let mut prs = prs;
+        prs.push(atomic_stacked(4, 2));
+        let plan = step(
+            &mut s,
+            &observation(
+                prs.clone(),
+                vec![testing(3, trunk(), &[1], CiStatus::Passed)],
+            ),
+        );
+        assert_eq!(plan.retire, vec![BatchId(3)]);
+        assert_eq!(plan.start, vec![start(4, trunk(), &[3])]);
+        let plan = step(
+            &mut s,
+            &observation(prs, vec![testing(4, trunk(), &[3], CiStatus::Passed)]),
+        );
+        assert_eq!(plan.land, vec![BatchId(4)]);
+        assert_eq!(plan.start, vec![start(5, tip(4), &[1, 2, 4])]);
+    }
+
+    #[test]
+    fn an_atomic_tip_above_a_running_group_retires_it_without_a_second_run() {
+        let mut s = Bisect::new(2, 16);
+        step(
+            &mut s,
+            &observation(
+                ready_all(&[1, 2]),
+                vec![testing(1, trunk(), &[1, 2], ci_failed())],
+            ),
+        );
+        let lower = testing(2, trunk(), &[1], CiStatus::Pending);
+        let plan = step(&mut s, &observation(ready_all(&[1, 2]), vec![lower]));
+        assert_eq!(plan.start, vec![start(3, tip(2), &[2])]);
+        // Both pass, but 3 arrived `Atomic` on 2 meanwhile: {2} is retired
+        // instead of landing, its group requeued and dissolved, and the unit
+        // {2, 3} runs on the landing tip.
+        let prs = vec![ready(1), ready(2), atomic_stacked(3, 2)];
+        let plan = step(
+            &mut s,
+            &observation(
+                prs,
+                vec![
+                    testing(2, trunk(), &[1], CiStatus::Passed),
+                    testing(3, tip(2), &[2], CiStatus::Passed),
+                ],
+            ),
+        );
+        assert_eq!(plan.land, vec![BatchId(2)]);
+        assert_eq!(plan.retire, vec![BatchId(3)]);
+        assert_eq!(plan.start, vec![start(4, tip(2), &[2, 3])]);
+        assert!(s.retests.is_empty(), "{:?}", s.retests);
+        assert!(!s.retesting.contains_key(&BatchId(3)), "{:?}", s.retesting);
+    }
+
+    #[test]
+    fn an_atomic_unit_failing_alone_ejects_its_atomic_members_only() {
+        let mut s = Bisect::new(2, 16);
+        let prs = vec![ready(1), stacked(2, 1), atomic_stacked(3, 2), ready(4)];
+        let plan = step(
+            &mut s,
+            &observation(prs, vec![testing(1, trunk(), &[1, 2, 3], ci_failed())]),
+        );
+        assert_eq!(plan.eject, vec![ejection(3, failed_by(1))]);
+        assert_eq!(plan.retire, vec![BatchId(1)]);
+        // The unit is still observed with 3 in it; 4 runs meanwhile.
+        assert_eq!(plan.start, vec![start(2, trunk(), &[4])]);
+        assert!(s.failed.is_empty(), "{:?}", s.failed);
+        assert!(s.retests.is_empty(), "{:?}", s.retests);
+        // 3 is gone: its ancestors are batched next, on 4's tip.
+        let prs = vec![ready(1), stacked(2, 1), ready(4)];
+        let plan = step(
+            &mut s,
+            &observation(prs, vec![testing(2, trunk(), &[4], CiStatus::Pending)]),
+        );
+        assert_eq!(plan.start, vec![start(3, tip(2), &[1, 2])]);
+    }
+
+    #[test]
+    fn two_atomic_tips_failing_as_one_unit_are_both_ejected_in_number_order() {
+        let mut s = Bisect::new(1, 16);
+        let prs = vec![ready(1), atomic_stacked(2, 1), atomic_stacked(3, 1)];
+        let plan = step(
+            &mut s,
+            &observation(prs, vec![testing(1, trunk(), &[1, 3, 2], ci_failed())]),
+        );
+        assert_eq!(
+            plan.eject,
+            vec![ejection(2, failed_by(1)), ejection(3, failed_by(1))]
+        );
+        assert!(plan.start.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn equal_inputs_give_equal_plans_with_stacks() {
+        let prs = vec![
+            ready(1),
+            stacked(2, 1),
+            atomic_stacked(3, 2),
+            ready(4),
+            stacked(5, 4),
+            stacked(6, 5),
+        ];
+        let inputs = [
+            observation(
+                prs.clone(),
+                vec![testing(7, trunk(), &[1, 2, 3, 4, 5, 6], ci_failed())],
+            ),
+            observation(
+                prs,
+                vec![testing(8, trunk(), &[1, 2, 3, 4], CiStatus::Pending)],
+            ),
+        ];
+        let mut a = bisect();
+        let mut b = bisect();
+        for input in &inputs {
+            assert_eq!(a.step(input).unwrap(), b.step(input).unwrap());
+            assert_eq!(a, b);
+        }
     }
 
     #[test]
     fn a_passed_batch_whose_member_gained_an_atomic_child_is_retired() {
         let mut s = bisect();
-        let prs = vec![ready(1), atomic(stacked(2, 1)), ready(3)];
+        let prs = vec![ready(1), atomic_stacked(2, 1), ready(3)];
         let passed = testing(1, trunk(), &[1], CiStatus::Passed);
         let plan = step(&mut s, &observation(prs, vec![passed]));
         assert!(plan.land.is_empty(), "{plan:?}");
         assert_eq!(plan.retire, vec![BatchId(1)]);
-        assert_eq!(plan.start, vec![start(2, trunk(), &[3])]);
+        // 1 returns to the pool and is batched with its `Atomic` child.
+        assert_eq!(plan.start, vec![start(2, trunk(), &[1, 2, 3])]);
     }
 }

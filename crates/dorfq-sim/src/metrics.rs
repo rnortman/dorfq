@@ -1,6 +1,7 @@
 //! Per-pull-request and per-run records, and one replication's summary.
 
 use dorfq_core::{BatchId, CiStatus, EjectReason, PrNumber};
+use serde::Serialize;
 
 const HOUR: f64 = crate::HOUR as f64;
 
@@ -13,7 +14,12 @@ pub enum Exit {
         reason: EjectReason,
         justified: bool,
     },
+    /// Intent cleared.
     Withdrawn,
+    /// Left because its base `on` left without landing.
+    Blocked {
+        on: PrNumber,
+    },
 }
 
 /// One pull request's life.
@@ -46,13 +52,16 @@ pub struct RunRecord {
 }
 
 /// One replication's summary; `None` where the set it summarises is empty.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Metrics {
     pub arrived: usize,
     pub landed: usize,
     pub ejected_bad: usize,
     pub ejected_good: usize,
+    /// Intent cleared.
     pub withdrawn: usize,
+    /// Left because a base left without landing.
+    pub blocked: usize,
     pub unfinished: usize,
     pub runs: usize,
     pub mean_batch_size: Option<f64>,
@@ -102,6 +111,7 @@ impl Metrics {
         let mut ejected_bad = 0;
         let mut ejected_good = 0;
         let mut withdrawn = 0;
+        let mut blocked = 0;
         let mut unfinished = 0;
         let mut land_hours = Vec::new();
         let mut reject_hours = Vec::new();
@@ -126,6 +136,7 @@ impl Metrics {
                     justified: false, ..
                 } => ejected_good += 1,
                 Exit::Withdrawn => withdrawn += 1,
+                Exit::Blocked { .. } => blocked += 1,
             }
         }
         land_hours.sort_by(f64::total_cmp);
@@ -140,6 +151,7 @@ impl Metrics {
             ejected_bad,
             ejected_good,
             withdrawn,
+            blocked,
             unfinished,
             runs: runs.len(),
             mean_batch_size: ratio(members as f64, runs.len() as f64),
@@ -197,6 +209,7 @@ mod tests {
             pr(4, 0, Some((1800, ejected(false)))),
             pr(5, 0, Some((60, Exit::Withdrawn))),
             pr(6, 0, None),
+            pr(7, 0, Some((60, Exit::Blocked { on: PrNumber(5) }))),
         ];
         let runs = [run(3600, 2, true), run(3600, 4, false)];
         let m = Metrics::summarise(&prs, &runs, 0, 2, 7200);
@@ -207,9 +220,10 @@ mod tests {
                 m.ejected_bad,
                 m.ejected_good,
                 m.withdrawn,
+                m.blocked,
                 m.unfinished
             ),
-            (6, 2, 1, 1, 1, 1)
+            (7, 2, 1, 1, 1, 1, 1)
         );
         assert_eq!(m.runs, 2);
         assert_eq!(m.mean_batch_size, Some(3.0));

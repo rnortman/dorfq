@@ -20,4 +20,5 @@ clap = { workspace = true }
 dorfq-core = { path = "../dorfq-core" }
 dorfq-scheduler = { path = "../dorfq-scheduler" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }

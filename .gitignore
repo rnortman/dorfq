@@ -23,6 +23,10 @@ rust-project.json
 *.jsonl
 logs/
 
+# Simulator reports copied beside the site for local viewing; the published
+# ones are built by Bazel.
+/site/reports/
+
 # Per-machine tool configuration that names local paths.
 *.local.toml
 .local/

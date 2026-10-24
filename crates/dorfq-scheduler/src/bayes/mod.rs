@@ -5,7 +5,9 @@
 //! starting at the prior `p_bad`, reset when the head changes. `Pair(i, j)`:
 //! the two fail only together; materialised at the prior `p_interact` once a
 //! failed run exercised both, dropped when either leaves. Beyond those, any
-//! run fails for no reason with probability `p_flake`.
+//! run fails for no reason with probability `p_flake`. A pull request and
+//! one of its enqueued ancestors are never a pair: the forge reports a
+//! stacked pull request ready only when its own CI covered its ancestors.
 //!
 //! A run exercises `Bad` of every member of its tree (its own members and
 //! every ancestor batch's) and every pair of them. A passing run is an

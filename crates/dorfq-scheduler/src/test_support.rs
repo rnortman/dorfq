@@ -53,6 +53,11 @@ pub(crate) fn atomic(pr: PrSnapshot) -> PrSnapshot {
     pr.with_stack(StackPolicy::Atomic)
 }
 
+/// A ready `Atomic` pull request based on pull request `base`.
+pub(crate) fn atomic_stacked(number: u64, base: u64) -> PrSnapshot {
+    atomic(stacked(number, base))
+}
+
 pub(crate) fn ready_all(numbers: &[u64]) -> Vec<PrSnapshot> {
     numbers.iter().map(|&n| ready(n)).collect()
 }

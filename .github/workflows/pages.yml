@@ -1,0 +1,83 @@
+name: Pages
+
+# Publishes the simulator report site: the shipped examples run through
+# `dorfq-sim run --json` by Bazel, beside the static page in site/. The
+# deploy needs the repository's Pages source set to GitHub Actions; until
+# then the deploy job fails and nothing else does.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a newer push supersedes a queued one but never
+# cancels a deployment already running.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      # The same caches as ci.yml, under the same keys, so a push to main
+      # that CI already built is served from them.
+      # TODO(quality-pages-workflow-copies-ci-bazel-setup)
+      - name: Cache Bazel repository cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/bazel-repo
+          key: bazel-repo-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelversion', 'Cargo.lock', 'tools/scrub/Cargo.lock', 'tools/allthechanges/Cargo.lock') }}
+          restore-keys: |
+            bazel-repo-
+
+      - name: Cache Bazel disk cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/bazel-disk
+          key: bazel-disk-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelversion', 'Cargo.lock', 'tools/scrub/Cargo.lock', 'tools/allthechanges/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            bazel-disk-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelversion', 'Cargo.lock', 'tools/scrub/Cargo.lock', 'tools/allthechanges/Cargo.lock') }}-
+            bazel-disk-
+
+      - name: Configure Bazel for CI
+        run: |
+          cat >> .bazelrc.user <<EOF
+          common --repository_cache=$HOME/.cache/bazel-repo
+          common --disk_cache=$HOME/.cache/bazel-disk
+          common --lockfile_mode=error
+          common --show_timestamps
+          common --color=no
+          common --curses=no
+          EOF
+
+      - run: make sim-report
+
+      - name: Assemble the site
+        run: |
+          mkdir -p _site/reports
+          cp site/index.html site/app.js site/style.css _site/
+          cp bazel-bin/site/reports/*.json _site/reports/
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

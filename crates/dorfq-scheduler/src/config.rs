@@ -4,14 +4,14 @@ use std::error::Error;
 use std::fmt;
 
 use dorfq_core::Scheduler;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::bayes::{Bayes, FLOOR, Priors};
 use crate::{AllAtOnce, Bisect};
 
 /// The scheduler to build, as a `[scheduler]` table or a simulator policy
 /// entry names it by `kind`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum SchedulerConfig {
     /// The stub that batches every ready pull request at once.
@@ -28,7 +28,7 @@ pub enum SchedulerConfig {
 }
 
 /// The Bayesian scheduler's parameters.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BayesConfig {
     /// Batches kept pending at once.

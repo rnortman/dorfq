@@ -91,7 +91,7 @@ impl Scheduler for AllAtOnce {
         ejections.eject_conflicting(observation);
 
         if observation.batches.is_empty() {
-            let ready: Vec<PrNumber> = batchable(observation, |_| true);
+            let ready: Vec<PrNumber> = batchable(observation);
             if !ready.is_empty() {
                 plan.start.push(BatchStart::new(
                     self.ids.mint(),

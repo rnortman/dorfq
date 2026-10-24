@@ -47,6 +47,7 @@ with `sed`); there is no target that runs `cargo`, and the gate never will.
 | `make test` | Every test, without the lint aspects (the inner loop) |
 | `make run ARGS=...` | Build and run the `dorfq` binary |
 | `make sim ARGS=...` | Build and run the `dorfq-sim` simulator |
+| `make sim-report` | Run every simulator example to JSON for the report site, under `bazel-bin/site/reports/` |
 | `make optimised` | Build the `dorfq` binary optimised |
 | `make release VERSION=X.Y.Z` | Cut a release: gather the changelog and TODO fragments, bump the crate version, repin |
 | `make todo-gather` | Fold `todo.d/` fragments into `TODO.md`, outside a release |

@@ -9,19 +9,30 @@
 //! runners and fail when their tree is broken or the flake draw fires.
 //! Time is the simulator's: the scheduler never sees it.
 //!
+//! An arrival may be cut from a recent arrival's branch; it is stacked on
+//! that pull request while it is queued, and may be `Atomic`. A base that
+//! leaves without landing takes everything stacked on it with it
+//! (`Blocked`), and a re-push restacks every descendant.
+//!
 //! Every draw comes from SplitMix64 streams split by purpose (arrivals,
-//! truth, CI, churn), so two policies at one seed see the same arrivals and
-//! the same truths.
+//! truth, CI, churn, stacks), so two policies at one seed see the same
+//! arrivals, the same truths and the same cut-from targets. Whether a cut
+//! arrival stacks is the policy's doing: one that has already landed or
+//! ejected the target sees it arrive on trunk.
 //!
 //! [`simulate`] runs every policy of a [`SimConfig`] at every replication
 //! and returns a [`Report`]: runner-hours per landed pull request, time to
 //! land and to reject, wasted runner time and false ejections, one column
-//! per policy.
+//! per policy. Traced, the first replication of each policy is recorded as
+//! [`TraceEvent`]s: every step and its plan, and everything the world did.
+//! [`Report::to_json`] writes the report, its configuration and those
+//! traces as one JSON document, the input of the report site.
 
 mod config;
 mod metrics;
 mod report;
 mod rng;
+mod trace;
 mod world;
 
 use std::error::Error;
@@ -32,8 +43,9 @@ use dorfq_scheduler::SchedulerConfig;
 
 pub use config::{CiMinutes, Policy, SimConfig, SimConfigError, WorldConfig};
 pub use metrics::{Exit, Metrics, PrRecord, RunRecord};
-pub use report::{PolicyReport, Report};
+pub use report::{PolicyReport, Report, SCHEMA};
 pub use rng::{SplitMix64, Streams};
+pub use trace::{PlannedEject, PlannedStart, TraceEvent, Truth};
 pub use world::World;
 
 /// Non-empty plans at one instant after which a scheduler is livelocked.
@@ -83,7 +95,7 @@ impl fmt::Display for SimError {
 impl Error for SimError {}
 
 /// Runs the scheduler `scheduler` describes for replication `k` of `seed`
-/// in `world`, to drain or deadline, appending step and event lines to
+/// in `world`, to drain or deadline, appending its steps and events to
 /// `trace` when given, failed replication or not. `world` must have passed
 /// [`WorldConfig::validate`] and `scheduler` [`SchedulerConfig::validate`].
 pub fn run(
@@ -91,7 +103,7 @@ pub fn run(
     scheduler: &SchedulerConfig,
     seed: u64,
     k: u64,
-    trace: Option<&mut Vec<String>>,
+    trace: Option<&mut Vec<TraceEvent>>,
 ) -> Result<Metrics, SimError> {
     let (world, outcome) = replicate(world, scheduler, seed, k, trace);
     outcome.map(|()| world.metrics())
@@ -104,7 +116,7 @@ fn replicate(
     scheduler: &SchedulerConfig,
     seed: u64,
     k: u64,
-    trace: Option<&mut Vec<String>>,
+    trace: Option<&mut Vec<TraceEvent>>,
 ) -> (World, Result<(), SimError>) {
     let deadline = (config.hours + config.drain_hours) * HOUR;
     let mut world = World::new(config.clone(), Streams::for_replication(seed, k));
@@ -125,17 +137,17 @@ pub fn simulate(config: &SimConfig, trace: bool) -> Report {
         .policy
         .iter()
         .map(|policy| {
-            let mut lines = Vec::new();
+            let mut events = Vec::new();
             let replications = (0..config.replications)
                 .map(|k| {
-                    let lines = (trace && k == 0).then_some(&mut lines);
-                    run(&config.world, &policy.scheduler, config.seed, k, lines)
+                    let events = (trace && k == 0).then_some(&mut events);
+                    run(&config.world, &policy.scheduler, config.seed, k, events)
                 })
                 .collect();
             PolicyReport {
                 name: policy.name.clone(),
                 replications,
-                trace: lines,
+                trace: events,
             }
         })
         .collect();
@@ -149,7 +161,7 @@ fn drive(
     world: &mut World,
     scheduler: &mut dyn Scheduler,
     deadline: u64,
-    mut trace: Option<&mut Vec<String>>,
+    mut trace: Option<&mut Vec<TraceEvent>>,
 ) -> Result<(), SimError> {
     let mut same_instant = 0;
     loop {
@@ -159,8 +171,8 @@ fn drive(
         let observation = world
             .observe()
             .unwrap_or_else(|e| panic!("the simulated world failed to observe at t={at}: {e}"));
-        if let Some(lines) = trace.as_deref_mut() {
-            lines.extend(world.take_trace());
+        if let Some(events) = trace.as_deref_mut() {
+            events.extend(world.take_trace());
         }
         let plan = scheduler
             .step(&observation)
@@ -168,8 +180,8 @@ fn drive(
                 at,
                 message: e.to_string(),
             })?;
-        if let Some(lines) = trace.as_deref_mut() {
-            lines.push(step_line(at, &observation, &plan));
+        if let Some(events) = trace.as_deref_mut() {
+            events.push(step_event(at, &observation, &plan));
         }
         execute(world, &plan).map_err(|e| failure(at, e))?;
         if !plan.is_empty() {
@@ -222,13 +234,8 @@ fn failure(at: u64, error: ForgeError) -> SimError {
     SimError::Violation { at, message }
 }
 
-fn ids(ids: impl Iterator<Item = u64>) -> String {
-    let ids: Vec<String> = ids.map(|i| i.to_string()).collect();
-    format!("[{}]", ids.join(","))
-}
-
-/// One trace line for a step.
-fn step_line(at: u64, o: &Observation, plan: &Plan) -> String {
+/// The trace event for a step.
+fn step_event(t: u64, o: &Observation, plan: &Plan) -> TraceEvent {
     let in_flight = o
         .batches
         .iter()
@@ -242,27 +249,29 @@ fn step_line(at: u64, o: &Observation, plan: &Plan) -> String {
             )
         })
         .count();
-    let starts: Vec<String> = plan
-        .start
-        .iter()
-        .map(|s| {
-            let base = s.base.as_str().trim_start_matches('0');
-            format!("{}{}@{base}", s.id.0, ids(s.prs.iter().map(|p| p.0)))
-        })
-        .collect();
-    let ejects: Vec<String> = plan
-        .eject
-        .iter()
-        .map(|e| format!("{}({})", e.pr.0, e.reason))
-        .collect();
-    format!(
-        "t={at} queued={} in_flight={in_flight} | land {} | start {} | eject {} | retire {}",
-        o.prs.len(),
-        ids(plan.land.iter().map(|b| b.0)),
-        starts.join(" "),
-        ejects.join(" "),
-        ids(plan.retire.iter().map(|b| b.0)),
-    )
+    TraceEvent::Step {
+        t,
+        queued: o.prs.len(),
+        in_flight,
+        land: plan.land.iter().map(|b| b.0).collect(),
+        start: plan
+            .start
+            .iter()
+            .map(|s| PlannedStart {
+                batch: s.id.0,
+                members: s.prs.iter().map(|p| p.0).collect(),
+            })
+            .collect(),
+        eject: plan
+            .eject
+            .iter()
+            .map(|e| PlannedEject {
+                pr: e.pr.0,
+                reason: e.reason.to_string(),
+            })
+            .collect(),
+        retire: plan.retire.iter().map(|b| b.0).collect(),
+    }
 }
 
 #[cfg(test)]

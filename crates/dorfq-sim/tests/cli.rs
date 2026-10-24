@@ -44,6 +44,28 @@ fn trace_prints_each_policy_from_time_zero() {
 }
 
 #[test]
+fn json_writes_the_document_and_still_prints_the_table() {
+    let dir = PathBuf::from(std::env::var("TEST_TMPDIR").expect("TEST_TMPDIR under bazel test"));
+    let path = dir.join("report.json");
+    let out = path.to_str().expect("UTF-8 path");
+    let output = sim(&["run", "--config", env!("DORFQ_SIM_EXAMPLE"), "--json", out]);
+    assert!(output.status.success(), "dorfq-sim run --json: {output:?}");
+    let table = stdout(&output);
+    assert!(table.starts_with("metric "), "{table}");
+    assert!(!table.contains("policy bisect"), "{table}");
+    let document = fs::read_to_string(&path).expect("the document is written");
+    assert!(
+        document.starts_with(r#"{"schema":1,"name":"sim","config":"#),
+        "{document:.80}"
+    );
+    for name in ["all-at-once", "github-like", "bisect", "bayes"] {
+        let column = format!(r#"{{"name":"{name}","replications":[{{"metrics":"#);
+        assert!(document.contains(&column), "no policy {name}");
+    }
+    assert!(document.contains(r#""trace":[{"kind":"step","t":0,"#));
+}
+
+#[test]
 fn an_invalid_probability_exits_one_naming_it() {
     let dir = PathBuf::from(std::env::var("TEST_TMPDIR").expect("TEST_TMPDIR under bazel test"));
     let path = dir.join("bad.toml");

@@ -7,12 +7,13 @@ use dorfq_core::ledger::Ledger;
 use dorfq_core::{
     BatchId, BatchMember, BatchStart, BatchState, BatchStatus, CiStatus, ConflictWith, Departed,
     EjectReason, Failure, Forge, ForgeError, LandRefusal, Observation, PrBase, PrNumber,
-    PrSnapshot, PrStatus, Sha, Timestamp, Withdrawal,
+    PrSnapshot, PrStatus, Sha, StackPolicy, Timestamp, Withdrawal,
 };
 
 use crate::config::WorldConfig;
 use crate::metrics::{Exit, Metrics, PrRecord, RunRecord};
 use crate::rng::{SplitMix64, Streams, mix, unit};
+use crate::trace::{TraceEvent, Truth};
 
 const HOUR: f64 = crate::HOUR as f64;
 
@@ -34,11 +35,23 @@ struct SimPr {
     bad: bool,
     conflicts_with_trunk: bool,
     key: u64,
+    /// The earlier arrival whose branch it was cut from, whether or not it
+    /// stacked on it.
+    cut_from: Option<PrNumber>,
+    /// Whether it stacked on `cut_from`: that one was queued at arrival.
+    stacked: bool,
+    /// Lands only with its ancestors; only ever set on a stacked arrival.
+    atomic: bool,
     repush: Option<EventKey>,
     withdraw: Option<EventKey>,
 }
 
 impl SimPr {
+    /// The pull request it stacked on at arrival; never changes.
+    fn base(&self) -> Option<PrNumber> {
+        self.cut_from.filter(|_| self.stacked)
+    }
+
     fn queued(&self) -> bool {
         self.record.left.is_none()
     }
@@ -64,6 +77,8 @@ struct SimBatch {
 struct Commit {
     parent: Option<Sha>,
     members: Vec<PrNumber>,
+    /// The batch whose tip it is; `None` for the root.
+    batch: Option<BatchId>,
 }
 
 /// The simulated forge and the truth behind it.
@@ -86,8 +101,8 @@ pub struct World {
     ledger: Ledger,
     /// Runner-seconds the runners have been busy.
     busy: u64,
-    /// Event lines since the last [`World::take_trace`]; `None` untraced.
-    trace: Option<Vec<String>>,
+    /// Events since the last [`World::take_trace`]; `None` untraced.
+    trace: Option<Vec<TraceEvent>>,
 }
 
 /// The synthetic commit numbered `n`.
@@ -107,6 +122,7 @@ impl World {
         let root = Commit {
             parent: None,
             members: Vec::new(),
+            batch: None,
         };
         let mut world = World {
             config,
@@ -131,7 +147,7 @@ impl World {
         world
     }
 
-    /// This world, recording event lines for [`World::take_trace`].
+    /// This world, recording events for [`World::take_trace`].
     pub fn traced(mut self) -> World {
         self.trace = Some(Vec::new());
         self
@@ -161,15 +177,16 @@ impl World {
         }
     }
 
-    /// The event lines written since the last call; none when untraced.
-    pub fn take_trace(&mut self) -> Vec<String> {
+    /// The events recorded since the last call; none when untraced.
+    pub fn take_trace(&mut self) -> Vec<TraceEvent> {
         self.trace.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
-    /// Records an event line, formatting it only when traced.
-    fn note(&mut self, line: impl FnOnce() -> String) {
+    /// Records an event at the current time, building it only when traced.
+    fn note(&mut self, event: impl FnOnce(u64) -> TraceEvent) {
+        let t = self.now;
         if let Some(trace) = &mut self.trace {
-            trace.push(line());
+            trace.push(event(t));
         }
     }
 
@@ -205,17 +222,20 @@ impl World {
             .sum()
     }
 
-    /// Every pull request's arrival time and hidden truth (`bad`, conflicts
-    /// with trunk, key), by number.
+    /// Every pull request's arrival time, hidden truth (`bad`, conflicts
+    /// with trunk, key) and the arrival it was cut from, by number.
     #[cfg(test)]
-    pub(crate) fn truths(&self) -> Vec<(u64, bool, bool, u64)> {
+    pub(crate) fn truths(&self) -> Vec<(u64, bool, bool, u64, Option<PrNumber>)> {
         let prs = self.prs.values();
-        prs.map(|p| (p.record.arrived_at, p.bad, p.conflicts_with_trunk, p.key))
-            .collect()
+        prs.map(|p| {
+            let truth = (p.bad, p.conflicts_with_trunk, p.key);
+            (p.record.arrived_at, truth.0, truth.1, truth.2, p.cut_from)
+        })
+        .collect()
     }
 
-    /// Whether `i` and `j` break only together: their keys say so and their
-    /// queue times overlapped.
+    /// Whether `i` and `j` break only together: their keys say so, their
+    /// queue times overlapped, and neither is stacked on the other.
     pub fn interacts(&self, i: PrNumber, j: PrNumber) -> bool {
         let (a, b) = (&self.prs[&i], &self.prs[&j]);
         let left = |p: &SimPr| p.record.left.as_ref().map_or(self.now, |(t, _)| *t);
@@ -223,10 +243,34 @@ impl World {
             && unit(mix(a.key, b.key)) < self.config.p_interact
             && a.record.arrived_at < left(b)
             && b.record.arrived_at < left(a)
+            && !self.descends(i, j)
+            && !self.descends(j, i)
+    }
+
+    /// Whether `ancestor` is on `pr`'s chain of original bases.
+    fn descends(&self, pr: PrNumber, ancestor: PrNumber) -> bool {
+        let mut at = self.prs[&pr].base();
+        while let Some(base) = at {
+            if base == ancestor {
+                return true;
+            }
+            at = self.prs[&base].base();
+        }
+        false
+    }
+
+    /// The queued pull requests stacked on `pr`, directly or not, by number.
+    fn descendants(&self, pr: PrNumber) -> Vec<PrNumber> {
+        let queued = self.prs.iter().filter(|(_, p)| p.queued());
+        queued
+            .filter(|&(&n, _)| self.descends(n, pr))
+            .map(|(&n, _)| n)
+            .collect()
     }
 
     /// Checks the world's invariants: nothing bad landed, no two landed pull
-    /// requests interact, trunk's tree is exactly the landed set, the runner
+    /// requests interact, a landed pull request's base landed at or before
+    /// it, trunk's tree is exactly the landed set, the runner
     /// time runs consumed is the time runners were busy, and no more runs
     /// hold runners than there are.
     pub fn check_invariants(&self) -> Result<(), String> {
@@ -242,6 +286,15 @@ impl World {
             }
             if let Some(&j) = landed[k + 1..].iter().find(|&&j| self.interacts(i, j)) {
                 return Err(format!("prs {} and {} landed but interact", i.0, j.0));
+            }
+            if let Some(base) = self.prs[&i].base() {
+                let left_at = |n: PrNumber| self.prs[&n].record.left.as_ref().map(|(t, _)| *t);
+                if !self.prs[&base].landed() || left_at(base) > left_at(i) {
+                    return Err(format!(
+                        "pr {} landed but its base {} did not land before it",
+                        i.0, base.0
+                    ));
+                }
             }
         }
         let mut trunk_tree = self.tree(&self.trunk);
@@ -344,8 +397,17 @@ impl World {
                 let number = PrNumber(self.next_pr);
                 self.next_pr += 1;
                 let bad = self.streams.truth.bernoulli(self.config.p_bad);
-                let conflicts_with_trunk = self.streams.truth.bernoulli(self.config.p_conflict);
+                let conflicts = self.streams.truth.bernoulli(self.config.p_conflict);
                 let key = self.streams.truth.next_u64();
+                // Every draw is taken whatever the queue holds, so the draws
+                // are the same under every policy.
+                let cut = self.streams.stacks.bernoulli(self.config.p_stacked);
+                // The k-th most recent arrival, with probability 2^-k; the
+                // exponential is at most 53 from a 53-bit draw.
+                let back = 1 + self.streams.stacks.exponential(std::f64::consts::LN_2) as u64;
+                let atomic = self.streams.stacks.bernoulli(self.config.p_atomic);
+                let cut_from = (cut && back < number.0).then(|| PrNumber(number.0 - back));
+                let stacked = cut_from.is_some_and(|b| self.prs[&b].queued());
                 let head = self.mint();
                 let record = PrRecord {
                     number,
@@ -356,39 +418,92 @@ impl World {
                     record,
                     head,
                     bad,
-                    conflicts_with_trunk,
+                    // A branch cut from another cannot conflict with it, and
+                    // whatever of it is on trunk is that branch's content.
+                    conflicts_with_trunk: conflicts && cut_from.is_none(),
                     key,
+                    cut_from,
+                    stacked,
+                    atomic: atomic && stacked,
                     repush: None,
                     withdraw: None,
                 };
+                let (base, atomic) = (pr.base(), pr.atomic);
+                let truth = Truth {
+                    bad,
+                    conflicts: pr.conflicts_with_trunk,
+                };
                 self.prs.insert(number, pr);
-                self.note(|| format!("arrive {}", number.0));
+                self.note(|t| TraceEvent::Arrive {
+                    t,
+                    pr: number.0,
+                    base: base.map(|b| b.0),
+                    atomic,
+                    truth,
+                });
                 self.schedule_repush(number);
                 self.schedule_withdraw(number);
                 self.schedule_arrival();
             }
             Event::CiDone(batch) => self.complete(batch),
             Event::Repush(pr) => {
-                let head = self.mint();
-                self.prs.get_mut(&pr).expect("arrived").head = head;
-                self.note(|| format!("repush {}", pr.0));
+                // A restack: every branch stacked above the changed one is
+                // pushed too.
+                for p in std::iter::once(pr).chain(self.descendants(pr)) {
+                    let head = self.mint();
+                    self.prs.get_mut(&p).expect("arrived").head = head;
+                    self.note(|t| TraceEvent::Repush { t, pr: p.0 });
+                }
                 self.schedule_repush(pr);
             }
             Event::Withdraw(pr) => {
+                self.note(|t| TraceEvent::Withdraw { t, pr: pr.0 });
                 self.leave(pr, Exit::Withdrawn);
-                self.note(|| format!("withdraw {}", pr.0));
             }
         }
     }
 
-    /// Records `pr` leaving now and cancels its churn clocks.
+    /// Records `pr` leaving now and cancels its churn clocks. Unless it
+    /// landed, every queued pull request stacked on it leaves `Blocked` on
+    /// it, recursively. A pull request blocked earlier in this instant may
+    /// leave again: an ejection in the same plan supersedes the block, and
+    /// the block's `blocked` event is taken back out of the trace, so every
+    /// pull request departs once.
     fn leave(&mut self, pr: PrNumber, exit: Exit) {
         let now = self.now;
+        let cascades = exit != Exit::Landed;
         let p = self.prs.get_mut(&pr).expect("arrived");
+        let superseded = matches!(&p.record.left, Some((t, Exit::Blocked { .. })) if *t == now);
+        debug_assert!(
+            p.record.left.is_none() || superseded,
+            "pr {} leaves twice",
+            pr.0
+        );
         p.record.left = Some((now, exit));
+        if superseded && let Some(trace) = &mut self.trace {
+            trace.retain(
+                |e| !matches!(e, TraceEvent::Blocked { t, pr: p, .. } if *t == now && *p == pr.0),
+            );
+        }
         let clocks = [p.repush.take(), p.withdraw.take()];
         for key in clocks.into_iter().flatten() {
             self.events.remove(&key);
+        }
+        if cascades {
+            let children: Vec<PrNumber> = self
+                .prs
+                .iter()
+                .filter(|(_, c)| c.queued() && c.base() == Some(pr))
+                .map(|(&n, _)| n)
+                .collect();
+            for child in children {
+                self.note(|t| TraceEvent::Blocked {
+                    t,
+                    pr: child.0,
+                    on: pr.0,
+                });
+                self.leave(child, Exit::Blocked { on: pr });
+            }
         }
     }
 
@@ -426,6 +541,7 @@ impl World {
         });
         let run = self.runs.len() - 1;
         self.batches.get_mut(&batch).expect("tracked").run = Run::Running { run, done };
+        self.note(|t| TraceEvent::RunBegin { t, batch: batch.0 });
         self.running += 1;
         debug_assert!(self.running <= self.config.runners);
     }
@@ -453,7 +569,8 @@ impl World {
         };
         let flake = self.streams.ci.bernoulli(self.config.p_flake);
         let tree = self.tree(&tip);
-        let ci = if flake || self.broken(&tree) {
+        let broken = self.broken(&tree);
+        let ci = if flake || broken {
             // The world has no check names, so a failure carries none.
             CiStatus::Failed(Failure::new(BTreeSet::new()))
         } else {
@@ -463,24 +580,25 @@ impl World {
         let tree = beyond_trunk.collect();
         let record = &mut self.runs[run];
         record.consumed = self.now - record.started_at;
-        let verdict = if ci == CiStatus::Passed {
-            "passed"
-        } else {
-            "failed"
-        };
+        let passed = ci == CiStatus::Passed;
         record.verdict = Some(ci.clone());
         record.tree = tree;
         let b = self.batches.get_mut(&batch).expect("tracked");
         b.status.state = BatchState::Testing { tip, ci };
         b.run = Run::Done { run };
-        self.note(|| format!("ci {} {verdict}", batch.0));
+        self.note(|t| TraceEvent::RunEnd {
+            t,
+            batch: batch.0,
+            passed,
+            broken,
+            flake,
+        });
         self.running -= 1;
         self.assign_runners();
     }
 
     /// The observation now. A departure the queue did not cause is a
-    /// withdrawal of intent, the only exit the world has besides landing and
-    /// ejection.
+    /// withdrawal: of intent, or because a base left.
     fn snapshot(&self) -> Result<Observation, ForgeError> {
         let prs: Vec<PrSnapshot> = self
             .prs
@@ -492,13 +610,27 @@ impl World {
                 } else {
                     PrStatus::Ready
                 };
-                PrSnapshot::new(p.record.number, p.head.clone(), PrBase::Trunk, status)
+                // A base that left without landing took its descendants
+                // with it, so a base not queued has landed.
+                let base = match p.base() {
+                    Some(b) if self.prs[&b].queued() => PrBase::Pr(b),
+                    _ => PrBase::Trunk,
+                };
+                let snapshot = PrSnapshot::new(p.record.number, p.head.clone(), base, status);
+                if p.atomic {
+                    snapshot.with_stack(StackPolicy::Atomic)
+                } else {
+                    snapshot
+                }
             })
             .collect();
         let batches: Vec<BatchStatus> = self.batches.values().map(|b| b.status.clone()).collect();
         let departed = self.ledger.departures(&prs, &batches, |gone| {
             match &self.prs[&gone.number].record.left {
                 Some((_, Exit::Withdrawn)) => Ok(Departed::Withdrawn(Withdrawal::IntentCleared)),
+                Some((_, Exit::Blocked { on })) => {
+                    Ok(Departed::Withdrawn(Withdrawal::Blocked { on: *on }))
+                }
                 left => Err(ForgeError::Permanent(
                     format!(
                         "pr {} left as {left:?} with no batch landed or ejection to show for it",
@@ -546,9 +678,6 @@ impl Forge for World {
     fn observe(&mut self) -> Result<Observation, ForgeError> {
         let observation = self.snapshot()?;
         self.ledger.observed(&observation)?;
-        for d in &observation.departed {
-            self.note(|| format!("depart {} {}", d.pr.0, d.how));
-        }
         Ok(observation)
     }
 
@@ -567,6 +696,7 @@ impl Forge for World {
         let tip_commit = Commit {
             parent: Some(batch.base.clone()),
             members: batch.prs.clone(),
+            batch: Some(batch.id),
         };
         self.commits.insert(tip.clone(), tip_commit);
         let (min, max) = (self.config.ci_minutes.min, self.config.ci_minutes.max);
@@ -579,6 +709,18 @@ impl Forge for World {
         let run = Run::Waiting { duration };
         self.batches.insert(batch.id, SimBatch { status, run });
         self.ledger.started(batch.id);
+        // This plan's landings ran first, so a base landed in it is trunk.
+        let base = if batch.base == self.trunk {
+            None
+        } else {
+            self.commits[&batch.base].batch.map(|b| b.0)
+        };
+        self.note(|t| TraceEvent::Start {
+            t,
+            batch: batch.id.0,
+            base,
+            members: batch.prs.iter().map(|p| p.0).collect(),
+        });
         self.waiting.push_back(batch.id);
         self.assign_runners();
         Ok(())
@@ -589,16 +731,27 @@ impl Forge for World {
         self.ledger.landing(batch);
         let status = self.batches[&batch].status.clone();
         let refusal = self.refusal(&status);
-        let b = self.batches.get_mut(&batch).expect("known");
         if let Some(reason) = refusal {
+            self.note(|t| TraceEvent::Refused {
+                t,
+                batch: batch.0,
+                reason: reason.to_string(),
+            });
+            let b = self.batches.get_mut(&batch).expect("known");
             b.status.state = BatchState::LandRefused { tip, reason };
             return Ok(());
         }
+        let b = self.batches.get_mut(&batch).expect("known");
         b.status.state = BatchState::Landed { tip: tip.clone() };
         if let Run::Done { run } = b.run {
             self.runs[run].landed = true;
         }
         self.trunk = tip;
+        self.note(|t| TraceEvent::Land {
+            t,
+            batch: batch.0,
+            members: status.members.iter().map(|m| m.pr.0).collect(),
+        });
         for m in &status.members {
             self.leave(m.pr, Exit::Landed);
         }
@@ -611,6 +764,12 @@ impl Forge for World {
         self.ledger.check_retire(batch)?;
         let b = self.batches.remove(&batch).expect("known");
         self.ledger.retired(batch);
+        let cancelled = !matches!(b.run, Run::Done { .. });
+        self.note(|t| TraceEvent::Retire {
+            t,
+            batch: batch.0,
+            cancelled,
+        });
         match b.run {
             Run::Waiting { .. } => self.waiting.retain(|&w| w != batch),
             Run::Running { run, done } => {
@@ -627,8 +786,19 @@ impl Forge for World {
     fn eject(&mut self, pr: PrNumber, reason: &EjectReason) -> Result<(), ForgeError> {
         self.ledger.check_eject(pr)?;
         let justified = self.justified(pr);
-        let reason = reason.clone();
-        self.leave(pr, Exit::Ejected { reason, justified });
+        self.note(|t| TraceEvent::Eject {
+            t,
+            pr: pr.0,
+            reason: reason.to_string(),
+            justified,
+        });
+        self.leave(
+            pr,
+            Exit::Ejected {
+                reason: reason.clone(),
+                justified,
+            },
+        );
         self.ledger.ejected(pr);
         Ok(())
     }

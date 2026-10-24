@@ -5,10 +5,10 @@ use std::error::Error;
 use std::fmt;
 
 use dorfq_scheduler::SchedulerConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A whole simulation: the world, the replications, the policies compared.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimConfig {
     /// Master seed; every replication's streams derive from it.
@@ -19,7 +19,7 @@ pub struct SimConfig {
 }
 
 /// The hidden-truth world every policy runs against.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorldConfig {
     /// Arrivals stop after this many hours.
@@ -44,10 +44,15 @@ pub struct WorldConfig {
     pub repush_per_hour: f64,
     /// Per queued pull request: intent cleared.
     pub withdraw_per_hour: f64,
+    /// An arrival is cut from a recent arrival's branch, and stacks on it
+    /// while that one is queued.
+    pub p_stacked: f64,
+    /// A stacked arrival lands only with its ancestors.
+    pub p_atomic: f64,
 }
 
 /// Bounds of the uniform CI run duration, in minutes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CiMinutes {
     pub min: u64,
@@ -55,7 +60,7 @@ pub struct CiMinutes {
 }
 
 /// One scheduler under comparison, told apart by `name`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Policy {
     /// The report's column header and the trace's label; unique.
     pub name: String,
@@ -181,6 +186,8 @@ impl WorldConfig {
         probability("p_interact", self.p_interact)?;
         probability("p_flake", self.p_flake)?;
         probability("p_conflict", self.p_conflict)?;
+        probability("p_stacked", self.p_stacked)?;
+        probability("p_atomic", self.p_atomic)?;
         rate("arrivals_per_hour", self.arrivals_per_hour)?;
         rate("repush_per_hour", self.repush_per_hour)?;
         rate("withdraw_per_hour", self.withdraw_per_hour)
@@ -204,6 +211,8 @@ p_flake = 0.02
 p_conflict = 0.02
 repush_per_hour = 0.0
 withdraw_per_hour = 0.0
+p_stacked = 0.25
+p_atomic = 0.2
 ";
 
     fn file(world: &str, policies: &str) -> String {
@@ -250,6 +259,7 @@ max_batch = 16
         assert_eq!(config.world.arrivals_per_hour, 0.75);
         assert_eq!(config.world.runners, 2);
         assert_eq!(config.world.ci_minutes, CiMinutes { min: 150, max: 210 });
+        assert_eq!((config.world.p_stacked, config.world.p_atomic), (0.25, 0.2));
         let policies: Vec<_> = config
             .policy
             .iter()
@@ -259,6 +269,13 @@ max_batch = 16
             policies,
             [
                 ("all-at-once", &SchedulerConfig::AllAtOnce {}),
+                (
+                    "github-like",
+                    &SchedulerConfig::Bisect {
+                        lanes: 5,
+                        max_batch: 1
+                    }
+                ),
                 (
                     "bisect",
                     &SchedulerConfig::Bisect {
@@ -286,6 +303,60 @@ max_batch = 16
     }
 
     #[test]
+    fn the_busy_world_parses_with_its_four_policies() {
+        let config = SimConfig::parse(include_str!("../examples/busy.toml")).unwrap();
+        assert_eq!(config.world.arrivals_per_hour, 5.0);
+        assert_eq!(config.world.runners, 6);
+        let names: Vec<&str> = config.policy.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["all-at-once", "github-like", "bisect", "bayes"]);
+        assert_eq!(
+            config.policy[1].scheduler,
+            SchedulerConfig::Bisect {
+                lanes: 5,
+                max_batch: 1
+            }
+        );
+        assert_eq!(
+            config.policy[2].scheduler,
+            SchedulerConfig::Bisect {
+                lanes: 6,
+                max_batch: 1
+            }
+        );
+        let SchedulerConfig::Bayes(bayes) = config.policy[3].scheduler else {
+            panic!("{:?}", config.policy[3]);
+        };
+        assert_eq!((bayes.lanes, bayes.max_batch), (6, 4));
+        assert_eq!(
+            (bayes.p_bad, bayes.p_interact, bayes.p_flake),
+            (
+                config.world.p_bad,
+                config.world.p_interact,
+                config.world.p_flake
+            )
+        );
+    }
+
+    #[test]
+    fn a_parsed_configuration_round_trips_through_its_serialisation() {
+        for text in [
+            include_str!("../examples/sim.toml"),
+            include_str!("../examples/busy.toml"),
+        ] {
+            let config = SimConfig::parse(text).unwrap();
+            let json = serde_json::to_string(&config).unwrap();
+            let back: SimConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, config);
+        }
+        let config = SimConfig::parse(include_str!("../examples/sim.toml")).unwrap();
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            value["policy"][1],
+            serde_json::json!({ "name": "github-like", "kind": "bisect", "lanes": 5, "max_batch": 1 })
+        );
+    }
+
+    #[test]
     fn a_world_without_flakes_bad_pull_requests_or_interactions_is_legal() {
         let world = WORLD
             .replace("p_bad = 0.05", "p_bad = 0.0")
@@ -302,6 +373,8 @@ max_batch = 16
             ("p_interact", "-0.1"),
             ("p_flake", "2.0"),
             ("p_conflict", "-1.0"),
+            ("p_stacked", "1.1"),
+            ("p_atomic", "-0.5"),
             ("runners", "0"),
             ("arrivals_per_hour", "-1.0"),
             ("repush_per_hour", "-1.0"),
@@ -335,8 +408,14 @@ max_batch = 16
     fn unknown_and_missing_fields_are_named() {
         let unknown = file(&format!("{WORLD}speed = 3\n"), POLICIES);
         assert!(rejected(&unknown).contains("speed"));
-        let missing = file(&WORLD.replace("runners = 2\n", ""), POLICIES);
-        assert!(rejected(&missing).contains("runners"));
+        for field in ["runners", "p_stacked", "p_atomic"] {
+            let line = WORLD.lines().find(|l| l.starts_with(&format!("{field} ")));
+            let missing = WORLD.replace(&format!("{}\n", line.unwrap()), "");
+            assert!(
+                rejected(&file(&missing, POLICIES)).contains(field),
+                "{field}"
+            );
+        }
     }
 
     #[test]
