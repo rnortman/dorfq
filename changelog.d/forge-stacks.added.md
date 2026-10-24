@@ -10,4 +10,4 @@
 - Once a base pull request has merged into trunk, by the queue or by hand,
   the GitHub forge moves the pull requests it had queued on it onto trunk; a
   stacked pull request landed in the same batch as its base is moved onto
-  trunk when it lands.
+  trunk as its batch lands, before trunk moves, so GitHub marks it merged.

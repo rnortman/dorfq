@@ -169,8 +169,10 @@ has merged into trunk, by the queue or by hand, the queue moves the pull
 requests it had queued on it onto trunk; it does this only for a stack it
 had queued and only for a merge into trunk, never for a branch whose pull
 request was merged elsewhere or that a labelled pull request targeted before
-it was queued on it — those are told to retarget by hand. Every policy
-batches a stack bases before children.
+it was queued on it — those are told to retarget by hand. A stacked pull
+request landed in the same batch as its base is moved onto trunk just
+before trunk moves, so GitHub marks it merged. Every policy batches a stack
+bases before children.
 
 ### As a GitHub App
 

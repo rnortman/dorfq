@@ -895,15 +895,34 @@ fn failure(method: Method, path: &str, response: &HttpResponse) -> ApiError {
     permanent(message)
 }
 
-/// GitHub's `message` field from an error body, or the body itself.
+/// GitHub's `message` field from an error body followed by the detail of each
+/// of its `errors`, or the body itself.
 fn github_message(response: &HttpResponse) -> String {
     #[derive(Deserialize)]
     struct ErrorJson {
         message: String,
+        #[serde(default)]
+        errors: Vec<serde_json::Value>,
     }
-    match serde_json::from_str::<ErrorJson>(&response.body) {
-        Ok(e) => e.message,
-        Err(_) => response.body.chars().take(200).collect(),
+    let e = match serde_json::from_str::<ErrorJson>(&response.body) {
+        Ok(e) => e,
+        Err(_) => return response.body.chars().take(200).collect(),
+    };
+    let details: Vec<&str> = e
+        .errors
+        .iter()
+        .filter_map(|error| {
+            error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .or_else(|| error.get("code").and_then(|c| c.as_str()))
+                .or_else(|| error.as_str())
+        })
+        .collect();
+    if details.is_empty() {
+        e.message
+    } else {
+        format!("{}: {}", e.message, details.join("; "))
     }
 }
 

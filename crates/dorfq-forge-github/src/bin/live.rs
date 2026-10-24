@@ -408,13 +408,17 @@ impl Repo {
         Ok(())
     }
 
-    /// Whether GitHub reports `pr` merged.
-    fn merged(&mut self, pr: PrNumber) -> Result<bool, String> {
-        Ok(self
-            .client
-            .get_pr(pr)
-            .map_err(at(&format!("reading #{}", pr.0)))?
-            .merged)
+    /// Waits for GitHub to mark `pr` merged.
+    fn wait_until_merged(&mut self, pr: PrNumber) -> Result<(), String> {
+        let what = format!("#{} merged per GitHub", pr.0);
+        poll(&what, || {
+            let merged = self.client.get_pr(pr).map_err(at(&what))?.merged;
+            Ok(if merged {
+                Ok(())
+            } else {
+                Err("not merged".to_owned())
+            })
+        })
     }
 
     /// Posts a successful `check` status on `sha`.
@@ -699,39 +703,30 @@ fn run() -> Result<(), String> {
     // Batch 3 lands E alone; F is moved onto trunk on a later observation.
     let tip3 = tested(&mut forge, &mut repo, 3, &observation.trunk, vec![e.number])?;
     forge.land(BatchId(3)).map_err(at("landing batch 3"))?;
-    let e_open = repo
-        .client
-        .get_pr(e.number)
-        .map_err(at(&format!("reading #{}", e.number.0)))?
-        .open;
     observe_until(&mut forge, "batch 3 landed, F on trunk", |o| {
         batch(o, 3) == Some(&BatchState::Landed { tip: tip3.clone() })
             && snapshot(o, f.number).is_some_and(|p| p.base == PrBase::Trunk)
             && snapshot(o, g.number).is_some_and(|p| p.base == PrBase::Pr(f.number))
     })?;
-    println!(
-        "live: E merged per GitHub: {}; F moved onto trunk by the {} rule",
-        repo.merged(e.number)?,
-        if e_open { "open-base" } else { "closed-base" }
-    );
+    repo.wait_until_merged(e.number)?;
     repo.wait_for_marker(e.number, Marker::Landed)?;
     forge.retire(BatchId(3)).map_err(at("retiring batch 3"))?;
 
-    // Batch 4 lands F and G together; G is moved onto trunk at the landing.
+    // Batch 4 lands F and G together; G is moved onto trunk before trunk
+    // moves, so GitHub marks both merged.
     let observation = observe_until(&mut forge, "F and G ready, F on trunk", |o| {
         ready_on(o, &[(&f, PrBase::Trunk), (&g, PrBase::Pr(f.number))])
     })?;
     let members = vec![f.number, g.number];
     let tip4 = tested(&mut forge, &mut repo, 4, &observation.trunk, members)?;
     forge.land(BatchId(4)).map_err(at("landing batch 4"))?;
-    let what = format!("#{}'s base reads {TRUNK}", g.number.0);
-    poll(&what, || {
-        let base = repo.client.get_pr(g.number).map_err(at(&what))?.base;
-        Ok(if base == TRUNK {
-            Ok(())
-        } else {
-            Err(format!("it reads {base}"))
-        })
+    let base = repo
+        .client
+        .get_pr(g.number)
+        .map_err(at(&format!("reading #{}", g.number.0)))?
+        .base;
+    check(base == TRUNK, || {
+        format!("#{}'s base reads {base} after landing", g.number.0)
     })?;
     observe_until(&mut forge, "batch 4 landed, nothing enqueued", |o| {
         batch(o, 4) == Some(&BatchState::Landed { tip: tip4.clone() }) && o.prs.is_empty()
@@ -739,11 +734,9 @@ fn run() -> Result<(), String> {
     for fixture in [&e, &f, &g] {
         repo.wait_for_marker(fixture.number, Marker::Landed)?;
     }
-    println!(
-        "live: F merged per GitHub: {}; G merged per GitHub: {}",
-        repo.merged(f.number)?,
-        repo.merged(g.number)?
-    );
+    for fixture in [&f, &g] {
+        repo.wait_until_merged(fixture.number)?;
+    }
     forge.retire(BatchId(4)).map_err(at("retiring batch 4"))?;
 
     // 8. Batch 5 of D passes, trunk moves under it, the landing is refused.

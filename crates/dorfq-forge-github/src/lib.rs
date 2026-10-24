@@ -45,8 +45,16 @@
 //!
 //! A labelled member of a batch whose record reads landed is reported on
 //! trunk, whatever its base, and its landing is completed when the batch is
-//! retired. A member of a landed batch that is still open against another
-//! branch is moved onto trunk when its landing is completed.
+//! retired. A stacked member of a batch being landed is moved onto trunk
+//! after rule 2 is checked and before trunk is fast-forwarded, while GitHub
+//! still sees commits between trunk and its head; GitHub then marks it merged
+//! when trunk reaches its head, as it does a member against trunk. A move
+//! GitHub refuses is a line on stderr and the member lands on its old base.
+//! When the batch then does not land — the fast-forward is refused, or a
+//! later call fails and trunk is not at the tip — each moved member is put
+//! back on its base branch; a move back that fails is a line on stderr. A
+//! process that dies between the moves and the fast-forward leaves them on
+//! trunk.
 //!
 //! # Recovery
 //!
@@ -784,8 +792,9 @@ impl GitHubForge {
         Ok(ConflictWith::Pr(members[k - 1].pr))
     }
 
-    /// Rule 2 against the world as it is now, then the fast-forward; the
-    /// refusal, or `None` when trunk is now `tip`.
+    /// Rule 2 against the world as it is now, each stacked member's move onto
+    /// trunk, then the fast-forward; the refusal, or `None` when trunk is now
+    /// `tip`.
     fn fast_forward(
         &mut self,
         status: &BatchStatus,
@@ -803,6 +812,7 @@ impl GitHubForge {
             });
             bases.insert(member.pr, base);
         }
+        let mut stacked = Vec::new();
         for member in &status.members {
             let pr = self.api.get_pr(member.pr)?;
             // A member the latest observation does not report departed while
@@ -814,13 +824,81 @@ impl GitHubForge {
             if !enqueued {
                 return Ok(Some(LandRefusal::MemberGone { pr: member.pr }));
             }
+            if pr.base != self.settings.trunk {
+                stacked.push(member.pr);
+            }
+        }
+        // GitHub refuses a base whose branch already contains the head, so a
+        // stacked member moves onto trunk before trunk reaches its head. A
+        // refused move does not stop the landing: the member's content
+        // reaches trunk whatever its base reads. A batch that does not land
+        // puts each moved member back on its base, so it is not reported on
+        // trunk while its base is unlanded.
+        // TODO(github-unlanded-moves-lost-on-crash)
+        let mut moved = Vec::new();
+        for pr in stacked {
+            match self.api.set_base(pr, &self.settings.trunk) {
+                Ok(()) => moved.push(pr),
+                Err(ApiError::Permanent(error)) => eprintln!(
+                    "dorfq: could not retarget #{} onto {} before landing batch {}: {error}",
+                    pr.0, self.settings.trunk, status.id.0
+                ),
+                Err(error) => {
+                    // The move may have applied with its response lost.
+                    moved.push(pr);
+                    self.move_back(&moved, &bases, status.id);
+                    return Err(error.into());
+                }
+            }
         }
         let trunk_ref = branch(&self.settings.trunk);
-        match self.api.update_ref(&trunk_ref, tip, false)? {
-            RefUpdate::Updated => Ok(None),
-            RefUpdate::NotFastForward => Ok(Some(LandRefusal::TrunkMoved {
-                trunk: self.trunk()?,
-            })),
+        match self.api.update_ref(&trunk_ref, tip, false) {
+            Ok(RefUpdate::Updated) => Ok(None),
+            Ok(RefUpdate::NotFastForward) => {
+                self.move_back(&moved, &bases, status.id);
+                Ok(Some(LandRefusal::TrunkMoved {
+                    trunk: self.trunk()?,
+                }))
+            }
+            Err(error) => {
+                // The update may have applied with its response lost.
+                if !moved.is_empty() {
+                    match self.api.get_ref(&trunk_ref) {
+                        Ok(now) if now.as_ref() == Some(tip) => {}
+                        Ok(_) => self.move_back(&moved, &bases, status.id),
+                        Err(read) => {
+                            for pr in &moved {
+                                eprintln!(
+                                    "dorfq: could not tell whether batch {} landed, so #{} stays on {}: {read}",
+                                    status.id.0, pr.0, self.settings.trunk
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Puts each of `moved` back on its base in `bases`, after its batch did
+    /// not land; a move that fails is a line on stderr.
+    fn move_back(
+        &mut self,
+        moved: &[PrNumber],
+        bases: &BTreeMap<PrNumber, Option<String>>,
+        batch: BatchId,
+    ) {
+        for &pr in moved {
+            let base = bases[&pr]
+                .as_deref()
+                .expect("a moved member's base matched its live base");
+            if let Err(error) = self.api.set_base(pr, base) {
+                eprintln!(
+                    "dorfq: could not move #{} back onto {base} after batch {} did not land: {error}",
+                    pr.0, batch.0
+                );
+            }
         }
     }
 
@@ -831,11 +909,8 @@ impl GitHubForge {
             .ok_or_else(|| permanent(format!("trunk branch {trunk_ref} does not exist")))
     }
 
-    /// A landed member leaves the queue: its label is removed, it is moved
-    /// onto trunk if it is still open on another branch, its landing is
-    /// completed, and it is told it landed. A failed move, refused or
-    /// transient, is a line on stderr: the member has landed whatever GitHub
-    /// shows as its base.
+    /// A landed member leaves the queue: its label is removed, its landing is
+    /// completed, and it is told it landed.
     fn complete_landing(
         &mut self,
         pr: PrNumber,
@@ -843,15 +918,6 @@ impl GitHubForge {
         tip: &Sha,
     ) -> Result<(), ForgeError> {
         self.api.remove_label(pr, &self.settings.label)?;
-        // Nothing retries the move: the next observation departs the member
-        // `Landed` and forgets it, so a failure of either kind is reported
-        // here and the landing goes on.
-        if let Err(error) = self.move_onto_trunk(pr) {
-            eprintln!(
-                "dorfq: could not retarget #{} onto {}: {error}",
-                pr.0, self.settings.trunk
-            );
-        }
         self.completed.insert(pr, batch);
         self.outbox.push_back(Message {
             pr,
@@ -860,16 +926,6 @@ impl GitHubForge {
                 tip: tip.clone(),
             },
         });
-        Ok(())
-    }
-
-    /// Sets `pr`'s base to trunk if it is open against another branch.
-    fn move_onto_trunk(&mut self, pr: PrNumber) -> Result<(), ApiError> {
-        // TODO(github-stack-retargets-unverified)
-        let detail = self.api.get_pr(pr)?;
-        if detail.open && detail.base != self.settings.trunk {
-            self.api.set_base(pr, &self.settings.trunk)?;
-        }
         Ok(())
     }
 }
@@ -990,9 +1046,9 @@ impl Forge for GitHubForge {
     }
 
     /// Records the landing, checks rule 2 against the world as it is now,
-    /// and fast-forwards trunk to the tip; a refusal is recorded and
-    /// returns `Ok`. After the fast-forward each member's label is removed
-    /// and it is told it landed.
+    /// moves each stacked member onto trunk, and fast-forwards trunk to the
+    /// tip; a refusal is recorded and returns `Ok`. After the fast-forward
+    /// each member's label is removed and it is told it landed.
     fn land(&mut self, batch: BatchId) -> Result<(), ForgeError> {
         let landable = self.ledger.check_land(batch)?;
         let (tip, status) = (landable.tip, landable.status.clone());
