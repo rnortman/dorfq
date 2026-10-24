@@ -1,6 +1,12 @@
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
+# The examples are the report site's inputs (`//site`).
+exports_files([
+    "examples/busy.toml",
+    "examples/sim.toml",
+])
+
 WORKSPACE_DEPS = [
     "//crates/dorfq-core:dorfq_core",
     "//crates/dorfq-scheduler:dorfq_scheduler",
@@ -30,7 +36,10 @@ rust_binary(
 rust_test(
     name = "dorfq_sim_test",
     size = "small",
-    compile_data = ["examples/sim.toml"],
+    compile_data = [
+        "examples/busy.toml",
+        "examples/sim.toml",
+    ],
     crate = ":dorfq_sim",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True),

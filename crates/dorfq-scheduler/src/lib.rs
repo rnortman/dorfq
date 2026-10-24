@@ -12,6 +12,18 @@
 //!   expected value against a run's cost, and a pull request ejected only
 //!   when a failed run singles it out.
 //!
+//! All three batch stacked pull requests, every member after its base, and
+//! keep an `Atomic` pull request with its ancestors:
+//!
+//! - `AllAtOnce` batches every batchable stack whole.
+//! - `Bisect` grows batches from landing units (an `Atomic` pull request
+//!   with its ancestors, or one other pull request), splits a failed batch
+//!   only between units, and, when a single `Atomic` unit fails on its own,
+//!   ejects its `Atomic` members and retests the ancestors.
+//! - `Bayes` grows batches from the same units, never treats a child and its
+//!   base as a pair cause (the child's own CI tested them together), and runs
+//!   a stacked suspect's culprit finder with every enqueued ancestor.
+//!
 //! [`SchedulerConfig`] is the configuration both the application and the
 //! simulator parse to choose and build one of them.
 
@@ -26,6 +38,7 @@ mod all_at_once;
 mod bayes;
 mod bisect;
 mod config;
+mod stacks;
 #[cfg(test)]
 mod test_support;
 
@@ -90,21 +103,16 @@ fn is_ready(pr: &PrSnapshot) -> bool {
     matches!(pr.status, PrStatus::Ready)
 }
 
-/// The pull requests a batch may take: of the `Ready` ones `eligible`
-/// accepts, those whose every ancestor is taken too, less every ancestor of
-/// an enqueued `Atomic` pull request that is not taken, repeated until
-/// nothing changes. Ordered so that every base precedes its children, ties
-/// by number.
-pub(crate) fn batchable(
-    observation: &Observation,
-    eligible: impl Fn(&PrSnapshot) -> bool,
-) -> Vec<PrNumber> {
-    let by_number: BTreeMap<PrNumber, &PrSnapshot> =
-        observation.prs.iter().map(|p| (p.number, p)).collect();
+/// The pull requests a batch may take: of the `Ready` ones, those whose
+/// every ancestor is taken too, less every ancestor of an enqueued `Atomic`
+/// pull request that is not taken, repeated until nothing changes. Ordered
+/// so that every base precedes its children, ties by number.
+pub(crate) fn batchable(observation: &Observation) -> Vec<PrNumber> {
+    let base = bases(&observation.prs);
     let mut set: BTreeSet<PrNumber> = observation
         .prs
         .iter()
-        .filter(|p| is_ready(p) && eligible(p))
+        .filter(|p| is_ready(p))
         .map(|p| p.number)
         .collect();
     loop {
@@ -112,14 +120,14 @@ pub(crate) fn batchable(
             .prs
             .iter()
             .filter(|p| p.stack == StackPolicy::Atomic && !set.contains(&p.number))
-            .flat_map(|p| ancestors(&by_number, p))
+            .flat_map(|p| ancestors(&base, p.base))
             .collect();
         let kept: BTreeSet<PrNumber> = set
             .iter()
             .copied()
             .filter(|n| {
                 !held_back.contains(n)
-                    && match by_number[n].base {
+                    && match base[n] {
                         PrBase::Trunk => true,
                         PrBase::Pr(base) => set.contains(&base),
                     }
@@ -135,7 +143,7 @@ pub(crate) fn batchable(
     let mut open: BTreeSet<PrNumber> = set
         .iter()
         .copied()
-        .filter(|n| by_number[n].base == PrBase::Trunk)
+        .filter(|n| base[n] == PrBase::Trunk)
         .collect();
     while let Some(next) = open.pop_first() {
         order.push(next);
@@ -143,23 +151,28 @@ pub(crate) fn batchable(
         open.extend(
             set.iter()
                 .copied()
-                .filter(|n| by_number[n].base == PrBase::Pr(next) && !placed.contains(n)),
+                .filter(|n| base[n] == PrBase::Pr(next) && !placed.contains(n)),
         );
     }
     order
 }
 
-/// `pr`'s ancestors, nearest first. The observation's base relation is
-/// closed and acyclic (rule 8).
-fn ancestors<'a>(
-    by_number: &'a BTreeMap<PrNumber, &'a PrSnapshot>,
-    pr: &PrSnapshot,
-) -> impl Iterator<Item = PrNumber> + 'a {
-    let mut at = pr.base;
+/// The base of each of `prs`, keyed by number.
+pub(crate) fn bases(prs: &[PrSnapshot]) -> BTreeMap<PrNumber, PrBase> {
+    prs.iter().map(|p| (p.number, p.base)).collect()
+}
+
+/// The ancestors of a pull request whose base is `from`, nearest first, by
+/// `base`. The observation's base relation is closed and acyclic (rule 8).
+pub(crate) fn ancestors(
+    base: &BTreeMap<PrNumber, PrBase>,
+    from: PrBase,
+) -> impl Iterator<Item = PrNumber> + '_ {
+    let mut at = from;
     std::iter::from_fn(move || match at {
         PrBase::Trunk => None,
         PrBase::Pr(n) => {
-            at = by_number[&n].base;
+            at = base[&n];
             Some(n)
         }
     })
@@ -239,10 +252,7 @@ mod tests {
     use dorfq_core::{CiStatus, Hold};
 
     fn all(observation: &Observation) -> Vec<u64> {
-        batchable(observation, |_| true)
-            .into_iter()
-            .map(|n| n.0)
-            .collect()
+        batchable(observation).into_iter().map(|n| n.0).collect()
     }
 
     #[test]
@@ -284,13 +294,6 @@ mod tests {
         assert_eq!(all(&observation(prs, vec![])), [1, 2, 3]);
         let prs = vec![ready(1), stacked(2, 1)];
         assert_eq!(all(&observation(prs, vec![])), [1, 2]);
-    }
-
-    #[test]
-    fn batchable_under_trunk_only_eligibility_holds_back_an_atomic_child_s_parent() {
-        let prs = vec![ready(1), atomic(stacked(2, 1)), ready(3), stacked(4, 3)];
-        let trunk_only = batchable(&observation(prs, vec![]), |p| p.base == PrBase::Trunk);
-        assert_eq!(trunk_only, numbers(&[3]));
     }
 
     #[test]

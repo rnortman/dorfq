@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dorfq_core::{
     BatchId, BatchStart, ConflictWith, EjectReason, Ejection, PrNumber, SchedulerError, Sha,
@@ -25,6 +25,8 @@ fn small(p_bad: f64, p_interact: f64, p_flake: f64, p_conflict: f64) -> WorldCon
         p_conflict,
         repush_per_hour: 0.0,
         withdraw_per_hour: 0.0,
+        p_stacked: 0.0,
+        p_atomic: 0.0,
     }
 }
 
@@ -69,7 +71,8 @@ fn replicate_cleanly(config: &WorldConfig, scheduler: &SchedulerConfig, seed: u6
     assert_eq!(world.check_invariants(), Ok(()), "{scheduler:?}");
     let m = world.metrics();
     let ejected = m.ejected_bad + m.ejected_good;
-    assert_eq!(m.arrived, m.landed + ejected + m.withdrawn + m.unfinished);
+    let left = m.landed + ejected + m.withdrawn + m.blocked;
+    assert_eq!(m.arrived, left + m.unfinished);
     assert!(m.arrived > 5, "too few arrivals to say anything: {m:?}");
     world
 }
@@ -262,15 +265,15 @@ fn observations_carry_the_world_clock() {
 fn a_violating_plan_is_the_last_step_of_the_trace() {
     let config = small(0.0, 0.0, 0.0, 0.0);
     let mut world = World::new(config, Streams::for_replication(1, 0)).traced();
-    let mut lines = Vec::new();
-    let outcome = drive(&mut world, &mut Rogue, u64::MAX, Some(&mut lines));
+    let mut events = Vec::new();
+    let outcome = drive(&mut world, &mut Rogue, u64::MAX, Some(&mut events));
     let Err(SimError::Violation { at: 0, message }) = outcome else {
         panic!("expected a violation at t=0, got {outcome:?}");
     };
     assert!(message.contains("pr 999"), "{message}");
-    let last = lines.last().expect("a step line");
+    let last = events.last().expect("a step").to_string();
     assert!(
-        last.starts_with("t=0 ") && last.contains("start 1[999]@1 "),
+        last.starts_with("t=0 ") && last.contains("start 1[999] "),
         "{last}"
     );
 }
@@ -309,28 +312,81 @@ fn an_empty_world_drains_at_once() {
 fn one_seed_and_one_policy_give_identical_metrics_records_and_traces() {
     let config = small(0.1, 0.01, 0.05, 0.05);
     let traced = || {
-        let mut lines = Vec::new();
-        let (world, outcome) = replicate(&config, &bisect(), 7, 0, Some(&mut lines));
+        let mut events = Vec::new();
+        let (world, outcome) = replicate(&config, &bisect(), 7, 0, Some(&mut events));
         assert_eq!(outcome, Ok(()));
         let records = (world.metrics(), world.pr_records(), world.runs().to_vec());
-        (records, lines)
+        (records, events)
     };
     let (first, first_trace) = traced();
     let (second, second_trace) = traced();
     assert_eq!(first, second);
     assert_eq!(first_trace, second_trace);
-    assert!(first_trace.iter().any(|l| l.starts_with("t=0 ")));
-    assert!(first_trace.iter().any(|l| l.starts_with("arrive ")));
-    assert!(first_trace.iter().any(|l| l.starts_with("ci ")));
+    assert!(matches!(first_trace[0], TraceEvent::Step { t: 0, .. }));
+    let arrive = |e: &TraceEvent| matches!(e, TraceEvent::Arrive { .. });
+    assert!(first_trace.iter().any(arrive));
+    let run_end = |e: &TraceEvent| matches!(e, TraceEvent::RunEnd { .. });
+    assert!(first_trace.iter().any(run_end));
 }
 
 #[test]
-fn two_policies_at_one_seed_see_identical_arrivals_and_truths() {
-    let config = small(0.2, 0.01, 0.05, 0.1);
+fn two_policies_at_one_seed_see_identical_arrivals_truths_and_cut_from_targets() {
+    let config = stacking();
     let (floor, _) = replicate(&config, &SchedulerConfig::AllAtOnce {}, 5, 0, None);
     let (bisect, _) = replicate(&config, &bisect(), 5, 0, None);
+    let (bayes, _) = replicate(&config, &bayes(), 5, 0, None);
     assert!(floor.truths().len() > 5);
+    assert!(floor.truths().iter().any(|t| t.4.is_some()));
     assert_eq!(floor.truths(), bisect.truths());
+    assert_eq!(floor.truths(), bayes.truths());
+}
+
+/// [`churning`] with half the arrivals cut from a recent branch and half
+/// of those `Atomic`.
+fn stacking() -> WorldConfig {
+    WorldConfig {
+        p_stacked: 0.5,
+        p_atomic: 0.5,
+        ..churning(0.1, 0.02, 0.05)
+    }
+}
+
+#[test]
+fn every_policy_drains_a_stacking_world_under_churn() {
+    let mut blocked = 0;
+    for scheduler in [SchedulerConfig::AllAtOnce {}, bisect(), bayes()] {
+        // Seeds at which a pull request that arrived stacked landed.
+        let mut landed_stacked = 0;
+        for seed in 1..=4 {
+            let mut events = Vec::new();
+            let (world, outcome) = replicate(&stacking(), &scheduler, seed, 0, Some(&mut events));
+            assert_eq!(outcome, Ok(()), "{scheduler:?} at seed {seed}");
+            assert_eq!(world.check_invariants(), Ok(()), "{scheduler:?}");
+            let m = world.metrics();
+            let left = m.landed + m.ejected_bad + m.ejected_good + m.withdrawn + m.blocked;
+            assert_eq!(m.arrived, left + m.unfinished, "{m:?}");
+            assert_eq!(m.unfinished, 0, "{scheduler:?} at seed {seed}: {m:?}");
+            blocked += m.blocked;
+            let stacked: Vec<u64> = events
+                .iter()
+                .filter_map(|e| match e {
+                    TraceEvent::Arrive {
+                        pr, base: Some(_), ..
+                    } => Some(*pr),
+                    _ => None,
+                })
+                .collect();
+            let landed = world.pr_records().into_iter().any(|r| {
+                stacked.contains(&r.number.0) && matches!(r.left, Some((_, Exit::Landed)))
+            });
+            landed_stacked += usize::from(landed);
+        }
+        assert!(
+            landed_stacked > 0,
+            "{scheduler:?} never landed a stacked pull request"
+        );
+    }
+    assert!(blocked > 0, "no pull request was ever blocked");
 }
 
 #[test]
@@ -345,7 +401,7 @@ fn simulate_reports_every_policy_at_every_replication() {
     assert!(!report.failed(), "{report}");
     for policy in &report.policies {
         assert_eq!(policy.replications.len(), 2);
-        assert!(policy.trace.iter().any(|l| l.starts_with("t=0 ")));
+        assert!(matches!(policy.trace[0], TraceEvent::Step { t: 0, .. }));
     }
     let untraced = simulate(&config, false);
     assert!(untraced.policies.iter().all(|p| p.trace.is_empty()));
@@ -505,5 +561,73 @@ fn every_policy_in_the_example_world_runs_one_replication_cleanly() {
         let (world, outcome) = replicate(&config.world, &policy.scheduler, config.seed, 0, None);
         assert_eq!(outcome, Ok(()), "policy {}", policy.name);
         assert_eq!(world.check_invariants(), Ok(()), "policy {}", policy.name);
+    }
+}
+
+/// Every pull request an event names, by field.
+fn named_prs(event: &serde_json::Value) -> Vec<u64> {
+    let mut prs = Vec::new();
+    for field in ["pr", "on"] {
+        prs.extend(event[field].as_u64());
+    }
+    let members = event["members"].as_array().into_iter().flatten();
+    prs.extend(members.filter_map(serde_json::Value::as_u64));
+    for start in event["start"].as_array().into_iter().flatten() {
+        let ids = start["members"].as_array().into_iter().flatten();
+        prs.extend(ids.filter_map(serde_json::Value::as_u64));
+    }
+    for eject in event["eject"].as_array().into_iter().flatten() {
+        prs.extend(eject["pr"].as_u64());
+    }
+    prs
+}
+
+#[test]
+fn the_json_document_holds_every_policy_and_a_trace_from_time_zero() {
+    let mut config = SimConfig::parse(EXAMPLE).unwrap();
+    config.world = stacking();
+    config.replications = 2;
+    let report = simulate(&config, true);
+    assert!(!report.failed(), "{report}");
+    let document: serde_json::Value =
+        serde_json::from_str(&report.to_json("stacking", &config)).unwrap();
+    assert_eq!(document["schema"], SCHEMA);
+    assert_eq!(document["name"], "stacking");
+    assert_eq!(document["config"]["world"]["p_stacked"], 0.5);
+    let policies = document["policies"].as_array().unwrap();
+    assert_eq!(policies.len(), config.policy.len());
+    for (policy, configured) in policies.iter().zip(&config.policy) {
+        assert_eq!(policy["name"], configured.name.as_str());
+        let replications = policy["replications"].as_array().unwrap();
+        assert_eq!(replications.len(), 2);
+        assert!(replications.iter().all(|r| r["metrics"].is_object()));
+        let trace = policy["trace"].as_array().unwrap();
+        assert_eq!(
+            trace[0],
+            serde_json::json!({
+                "kind": "step", "t": 0, "queued": 0, "in_flight": 0,
+                "land": [], "start": [], "eject": [], "retire": []
+            })
+        );
+        let mut arrived = BTreeSet::new();
+        let mut started = BTreeSet::new();
+        for event in trace {
+            if event["kind"] == "arrive" {
+                arrived.insert(event["pr"].as_u64().unwrap());
+            }
+            for pr in named_prs(event) {
+                assert!(
+                    arrived.contains(&pr),
+                    "{event} names {pr} before it arrived"
+                );
+            }
+            if event["kind"] == "start" {
+                if let Some(base) = event["base"].as_u64() {
+                    assert!(started.contains(&base), "{event}");
+                }
+                started.insert(event["batch"].as_u64().unwrap());
+            }
+        }
+        assert!(started.len() > 1, "{}", configured.name);
     }
 }

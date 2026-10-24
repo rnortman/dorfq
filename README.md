@@ -23,10 +23,11 @@ branches get CI only once the workflow change that covers them is on `main`.
 The contract carries stacks (a pull request based on another, and stacks
 that land only whole), probes (a batch with no members that tests its
 base's tree alone), how each pull request left the queue, the names of the
-checks a batch failed, and the forge's clock. The `all-at-once` stub lands
-stacks; `bisect` and `bayes` do not yet batch a stacked pull request, and
-the GitHub forge does not yet enqueue one: it reports only pull requests
-whose base is trunk.
+checks a batch failed, and the forge's clock. All three schedulers batch
+stacked pull requests, bases before children, and land a stack that must
+land whole only whole; the simulator's world grows stacks to measure them
+on. The GitHub forge does not yet enqueue a stacked pull request: it
+reports only pull requests whose base is trunk.
 
 On the scheduler side there are two real policies beside the stub: `bisect`,
 the conventional pipelined bisect with memory that every number is compared
@@ -37,7 +38,9 @@ event-driven simulator that runs any scheduler against a world of pull
 requests with hidden truths (bad ones, pairs that break only together,
 flaky runs, a fixed number of runners) and reports runner-hours per landed
 pull request, time to land and to reject, wasted runner time and false
-ejections.
+ejections. In the busy example world, a high-velocity team's, `bisect`'s
+pooling does not pay — it does best with no pooling at all — and `bayes`
+is the policy that keeps up; see **Simulator reports**.
 
 ```sh
 make run ARGS="run --config $PWD/crates/dorfq/examples/mock.toml --exit-when-idle"
@@ -52,6 +55,23 @@ make sim ARGS="run --config $PWD/crates/dorfq-sim/examples/sim.toml"
 
 runs the shipped simulator example, a week of arrivals on two runners, and
 prints one column per policy.
+
+## Simulator reports
+
+The report site, published on this repository's GitHub Pages, shows each
+shipped simulator example (`crates/dorfq-sim/examples/`): every policy's headline
+numbers as deltas against the `github-like` column, an approximation of
+GitHub's own merge queue, the full metric table, and a replay of the first
+replication — runners, batches, the queue with its stacks, and trunk —
+switchable between policies over the same arrivals. The Pages workflow
+(`.github/workflows/pages.yml`) builds and deploys it on every push to
+`main`.
+
+`dorfq-sim run --config F --json PATH` writes the document the site reads.
+`make sim-report` builds every example's under `bazel-bin/site/reports/`;
+`make check` builds them too, so an example that fails is a red gate.
+To view the site locally, open `site/index.html` and load a report through
+its file picker.
 
 ## Running against GitHub
 
@@ -212,6 +232,8 @@ invocation.
   - `crates/dorfq-sim/` — the simulator: a seeded world that implements the
     forge side of the contract, the loop that runs a scheduler against it,
     the metrics and the `dorfq-sim` binary.
+- `site/` — the simulator report site: a static page and the Bazel rules
+  that run the examples into its reports.
 - `tools/scrub/` — the secret scanner the commit, push and CI gates run,
   built by Bazel from its published crate with a pinned gitleaks.
 - `tools/allthechanges/` — the changelog and TODO fragment tool, built by

@@ -1,5 +1,5 @@
 {
-  "checksum": "ad2d7bd8dbd0a8660e9d8900081924f4b84b9be00e123af8820b10e8e99ab4d2",
+  "checksum": "573995f6f2f9d9fe0111f7811099befcb6bf8f6ac0604662d286d6f8eee57c56",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -1029,6 +1029,10 @@
           {
             "id": "serde 1.0.229",
             "target": "serde"
+          },
+          {
+            "id": "serde_json 1.0.154",
+            "target": "serde_json"
           },
           {
             "id": "toml 1.1.8+spec-1.1.0",

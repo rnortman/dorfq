@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use dorfq_core::{BatchId, PrNumber, PrSnapshot, Sha};
 
+use crate::{ancestors, bases};
+
 /// The belief an alibi leaves: inference treats a cause at the floor as
 /// false, and decay can raise it again.
 pub(crate) const FLOOR: f64 = 1e-6;
@@ -69,6 +71,8 @@ pub(crate) struct Model {
     pairs: BTreeMap<Cause, f64>,
     /// Failed runs, oldest first.
     evidence: VecDeque<FailedRun>,
+    /// Each queued pull request's queued ancestors, by the latest bases.
+    ancestors: BTreeMap<PrNumber, BTreeSet<PrNumber>>,
 }
 
 impl Model {
@@ -78,6 +82,7 @@ impl Model {
             bad: BTreeMap::new(),
             pairs: BTreeMap::new(),
             evidence: VecDeque::new(),
+            ancestors: BTreeMap::new(),
         }
     }
 
@@ -86,8 +91,14 @@ impl Model {
     /// no longer at the head the model holds leaves every pair; its causes
     /// leave every run if it is in `landed`, and otherwise every run that
     /// exercised one of them leaves with it. `landed` is what reached trunk,
-    /// by the queue or by another hand.
+    /// by the queue or by another hand. The bases of `prs` replace the stack
+    /// relation the model holds.
     pub(crate) fn sync(&mut self, prs: &[PrSnapshot], landed: &BTreeSet<PrNumber>) {
+        let base = bases(prs);
+        self.ancestors = prs
+            .iter()
+            .map(|p| (p.number, ancestors(&base, p.base).collect()))
+            .collect();
         let current: BTreeMap<PrNumber, &Sha> = prs.iter().map(|p| (p.number, &p.head)).collect();
         let gone: Vec<PrNumber> = self
             .bad
@@ -116,8 +127,16 @@ impl Model {
         self.prune();
     }
 
+    /// Whether one of `a`, `b` is a queued ancestor of the other: the
+    /// child's own CI tested the two together, so they are no pair cause.
+    pub(crate) fn related(&self, a: PrNumber, b: PrNumber) -> bool {
+        let under =
+            |x: PrNumber, y: PrNumber| self.ancestors.get(&x).is_some_and(|s| s.contains(&y));
+        under(a, b) || under(b, a)
+    }
+
     /// The causes a run over `tree` exercises: `Bad` of every member the
-    /// model holds at that head, and every pair of them.
+    /// model holds at that head, and every pair of them not in one stack.
     pub(crate) fn exercised(&self, tree: &[(PrNumber, Sha)]) -> BTreeSet<Cause> {
         let known: Vec<PrNumber> = tree
             .iter()
@@ -126,7 +145,7 @@ impl Model {
             .collect();
         let mut causes: BTreeSet<Cause> = known.iter().map(|&pr| Cause::Bad(pr)).collect();
         for (n, &a) in known.iter().enumerate() {
-            for &b in &known[n + 1..] {
+            for &b in known[n + 1..].iter().filter(|&&b| !self.related(a, b)) {
                 causes.insert(Cause::pair(a, b));
             }
         }
@@ -180,13 +199,13 @@ impl Model {
         }
     }
 
-    /// The belief in `cause`: a pair not materialised is at the prior, a
-    /// pull request not queued is not a cause.
+    /// The belief in `cause`: a pair not materialised is at the prior; a
+    /// pull request not queued, and a pair within one stack, are not causes.
     pub(crate) fn belief(&self, cause: Cause) -> f64 {
         match cause {
             Cause::Bad(pr) => self.bad.get(&pr).map_or(0.0, |(_, p)| *p),
             Cause::Pair(i, j) => {
-                if self.bad.contains_key(&i) && self.bad.contains_key(&j) {
+                if self.bad.contains_key(&i) && self.bad.contains_key(&j) && !self.related(i, j) {
                     self.pairs
                         .get(&cause)
                         .copied()
@@ -235,7 +254,8 @@ impl Model {
 mod tests {
     use super::super::test_support::{bad, members, model, pair, priors};
     use super::*;
-    use crate::test_support::{ready_all, repushed};
+    use crate::test_support::{ready, ready_all, repushed, stacked};
+    use dorfq_core::PrBase;
 
     fn batches(model: &Model) -> Vec<u64> {
         model.evidence().iter().map(|run| run.batch.0).collect()
@@ -370,6 +390,47 @@ mod tests {
                 BTreeSet::from([bad(2), bad(3), pair(2, 3)]),
             ]
         );
+    }
+
+    #[test]
+    fn a_pair_within_one_stack_is_never_exercised_materialised_or_believed() {
+        // 3 on 2 on 1, and 4 on trunk.
+        let prs = vec![ready(1), stacked(2, 1), stacked(3, 2), ready(4)];
+        let mut model = Model::new(priors());
+        model.sync(&prs, &none());
+        assert!(model.related(PrNumber(1), PrNumber(3)));
+        assert!(model.related(PrNumber(3), PrNumber(2)));
+        assert!(!model.related(PrNumber(3), PrNumber(4)));
+        assert_eq!(
+            model.exercised(&members(&[1, 2, 3, 4])),
+            BTreeSet::from([
+                bad(1),
+                bad(2),
+                bad(3),
+                bad(4),
+                pair(1, 4),
+                pair(2, 4),
+                pair(3, 4)
+            ])
+        );
+        assert_eq!(model.belief(pair(1, 3)), 0.0);
+        model.failed(BatchId(1), &members(&[1, 2, 3]));
+        assert_eq!(model.belief(pair(1, 2)), 0.0);
+        assert_eq!(
+            model.would_blame(&members(&[1, 2, 3])),
+            BTreeSet::from([bad(1), bad(2), bad(3)])
+        );
+
+        // 1 lands and 2 is re-targeted on trunk: 2 and 3 are still one
+        // stack, and 1 is no longer anything's ancestor.
+        let mut retargeted = stacked(2, 1);
+        retargeted.base = PrBase::Trunk;
+        model.sync(
+            &[retargeted, stacked(3, 2), ready(4)],
+            &BTreeSet::from([PrNumber(1)]),
+        );
+        assert!(!model.related(PrNumber(1), PrNumber(2)));
+        assert!(model.related(PrNumber(2), PrNumber(3)));
     }
 
     #[test]

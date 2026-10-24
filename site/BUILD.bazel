@@ -1,0 +1,32 @@
+# The report site's data: each shipped simulator example run through
+# `dorfq-sim run --json`, plus the index the page reads to list them. The
+# page itself (index.html, app.js, style.css) is static and has no build.
+# TODO(test-site-app-js-untested-against-report-schema): nothing checks that
+# app.js parses or that the fields it reads exist in these documents.
+#
+# These rules are part of `//...`, so the gate runs every example: a
+# replication that fails makes `dorfq-sim` exit 1 and the build red.
+
+EXAMPLES = [
+    "busy",
+    "sim",
+]
+
+[genrule(
+    name = "report_" + example,
+    srcs = ["//crates/dorfq-sim:examples/%s.toml" % example],
+    outs = ["reports/%s.json" % example],
+    cmd = "$(execpath //crates/dorfq-sim) run --config $< --json $@",
+    tools = ["//crates/dorfq-sim"],
+) for example in EXAMPLES]
+
+genrule(
+    name = "report_index",
+    outs = ["reports/index.json"],
+    cmd = "echo '%s' > $@" % json.encode(EXAMPLES),
+)
+
+filegroup(
+    name = "reports",
+    srcs = [":report_index"] + [":report_" + example for example in EXAMPLES],
+)

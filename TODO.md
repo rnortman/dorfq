@@ -132,19 +132,6 @@ design choices, and the webhook-driven forge may change the answer. The
 comments sit above the label removal in `eject` and above the `testing`
 record write in `start_batch`.
 
-### scheduler-stacks
-
-`Bisect` and `Bayes` batch only pull requests based on trunk, and hold back
-every ancestor of an `Atomic` pull request with it, so a stacked pull
-request waits in the queue for as long as it is stacked. Stack-aware
-growth, splitting and culprit finding belong here: a consistent chain as
-one unit, its base-closed prefixes as valid members, and the break where an
-ancestor moved. The `TODO(scheduler-stacks)` comments sit at the pool each
-policy builds with `batchable`, in `crates/dorfq-scheduler/src/bisect.rs`
-and `crates/dorfq-scheduler/src/bayes/policy.rs`. Deferred because how these
-policies batch, split and blame members of a stack is scheduler design that
-has not been done yet.
-
 ### security-label-grants-unreviewed-landing-on-any-later-head
 
 The GitHub forge in `crates/dorfq-forge-github/src/lib.rs` enqueues an open

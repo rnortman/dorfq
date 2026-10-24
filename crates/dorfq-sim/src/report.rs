@@ -1,17 +1,26 @@
-//! The comparison table: metrics as rows, policies as columns.
+//! The comparison table, metrics as rows and policies as columns, and the
+//! JSON document the report site reads.
 
 use std::fmt;
 
+use serde::Serialize;
+
 use crate::SimError;
+use crate::config::SimConfig;
 use crate::metrics::Metrics;
+use crate::trace::TraceEvent;
+
+/// The JSON document's schema number. It changes when a field changes
+/// meaning, not when one is added.
+pub const SCHEMA: u32 = 1;
 
 /// One policy's replications, in replication order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolicyReport {
     pub name: String,
     pub replications: Vec<Result<Metrics, SimError>>,
-    /// The first replication's step and event lines, when traced.
-    pub trace: Vec<String>,
+    /// The first replication's steps and events, when traced.
+    pub trace: Vec<TraceEvent>,
 }
 
 /// Every policy's results, in configuration order.
@@ -23,12 +32,13 @@ pub struct Report {
 /// A metric row: its name, the decimals it prints with, and its value.
 type Row = (&'static str, usize, fn(&Metrics) -> Option<f64>);
 
-const ROWS: [Row; 16] = [
+const ROWS: [Row; 17] = [
     ("arrived", 1, |m| Some(m.arrived as f64)),
     ("landed", 1, |m| Some(m.landed as f64)),
     ("ejected_bad", 1, |m| Some(m.ejected_bad as f64)),
     ("ejected_good", 1, |m| Some(m.ejected_good as f64)),
     ("withdrawn", 1, |m| Some(m.withdrawn as f64)),
+    ("blocked", 1, |m| Some(m.blocked as f64)),
     ("unfinished", 1, |m| Some(m.unfinished as f64)),
     ("runs", 1, |m| Some(m.runs as f64)),
     ("mean_batch_size", 2, |m| m.mean_batch_size),
@@ -42,12 +52,65 @@ const ROWS: [Row; 16] = [
     ("utilisation", 3, |m| m.utilisation),
 ];
 
+/// The JSON document.
+#[derive(Serialize)]
+struct Document<'a> {
+    schema: u32,
+    name: &'a str,
+    config: &'a SimConfig,
+    policies: Vec<PolicyDocument<'a>>,
+}
+
+#[derive(Serialize)]
+struct PolicyDocument<'a> {
+    name: &'a str,
+    replications: Vec<Replication<'a>>,
+    trace: &'a [TraceEvent],
+}
+
+/// A replication's cell: its metrics, or its failure's text.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Replication<'a> {
+    Metrics(&'a Metrics),
+    Error(String),
+}
+
 impl Report {
     /// True when some replication of some policy failed.
     pub fn failed(&self) -> bool {
         self.policies
             .iter()
             .any(|p| p.replications.iter().any(Result::is_err))
+    }
+
+    /// The report as one JSON document: the schema number, `name`, the
+    /// `config` it was run from, and per policy every replication's metrics
+    /// or error and the trace. A metric no replication has is `null`.
+    pub fn to_json(&self, name: &str, config: &SimConfig) -> String {
+        let policies = self
+            .policies
+            .iter()
+            .map(|p| PolicyDocument {
+                name: &p.name,
+                replications: p
+                    .replications
+                    .iter()
+                    .map(|r| match r {
+                        Ok(metrics) => Replication::Metrics(metrics),
+                        Err(error) => Replication::Error(error.to_string()),
+                    })
+                    .collect(),
+                trace: &p.trace,
+            })
+            .collect();
+        let document = Document {
+            schema: SCHEMA,
+            name,
+            config,
+            policies,
+        };
+        serde_json::to_string(&document).expect("the report serialises")
     }
 }
 
@@ -129,11 +192,12 @@ mod tests {
 
     fn metrics(landed: usize, per_landed: Option<f64>) -> Metrics {
         Metrics {
-            arrived: 10,
+            arrived: 11,
             landed,
             ejected_bad: 0,
             ejected_good: 0,
             withdrawn: 0,
+            blocked: 1,
             unfinished: 10 - landed,
             runs: 2,
             mean_batch_size: Some(5.0),
@@ -199,6 +263,21 @@ mod tests {
     }
 
     #[test]
+    fn blocked_follows_withdrawn() {
+        let table = report().to_string();
+        let names: Vec<&str> = table
+            .lines()
+            .map(|l| l.split(' ').next().unwrap())
+            .collect();
+        let withdrawn = names.iter().position(|&n| n == "withdrawn").unwrap();
+        assert_eq!(names[withdrawn + 1], "blocked");
+        assert_eq!(
+            row(&table, "blocked"),
+            ["blocked", "1.0 [1.0–1.0]", "1.0 [1.0–1.0]"]
+        );
+    }
+
+    #[test]
     fn a_metric_no_replication_has_prints_a_dash() {
         let table = report().to_string();
         assert_eq!(row(&table, "land_p50_hours"), ["land_p50_hours", "-", "-"]);
@@ -220,5 +299,36 @@ mod tests {
         let mut report = report();
         report.policies.truncate(1);
         assert!(!report.failed());
+    }
+
+    #[test]
+    fn the_document_carries_schema_name_config_cells_and_traces() {
+        let config = SimConfig::parse(include_str!("../examples/sim.toml")).unwrap();
+        let mut report = report();
+        report.policies[0].trace = vec![TraceEvent::Withdraw { t: 3, pr: 1 }];
+        let document: serde_json::Value =
+            serde_json::from_str(&report.to_json("sim", &config)).unwrap();
+        assert_eq!(document["schema"], SCHEMA);
+        assert_eq!(document["name"], "sim");
+        assert_eq!(document["config"]["seed"], 1);
+        assert_eq!(document["config"]["policy"][0]["kind"], "all-at-once");
+        let floor = &document["policies"][0];
+        assert_eq!(floor["name"], "floor");
+        assert_eq!(floor["replications"][0]["metrics"]["landed"], 4);
+        assert_eq!(
+            floor["replications"][0]["metrics"]["land_p50_hours"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            floor["trace"],
+            serde_json::json!([{ "kind": "withdraw", "t": 3, "pr": 1 }])
+        );
+        let bisect = &document["policies"][1];
+        assert_eq!(
+            bisect["replications"][0],
+            serde_json::json!({ "error": "livelock at t=7" })
+        );
+        assert_eq!(bisect["replications"][1]["metrics"]["landed"], 10);
+        assert_eq!(bisect["trace"], serde_json::json!([]));
     }
 }

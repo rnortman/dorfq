@@ -4,13 +4,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dorfq_core::{
     BatchId, BatchStart, BatchState, BatchStatus, CiStatus, ConflictWith, Departed, EjectReason,
-    Observation, Plan, PrBase, PrNumber, Scheduler, SchedulerError, Sha,
+    Observation, Plan, PrNumber, Scheduler, SchedulerError, Sha,
 };
 
 use super::Bayes;
 use super::infer::{Inference, Unresolved};
 use super::model::Cause;
-use crate::{Ejections, Member, batchable, chain, is_pending};
+use crate::stacks::{Footing, Stacks};
+use crate::{Ejections, Member, chain, is_pending};
 
 /// What this step does with one tracked batch.
 enum Fate {
@@ -231,25 +232,37 @@ impl Bayes {
         Ok(p_node * ev)
     }
 
-    /// Grows a batch on a node from `pool`, in order, while its score rises,
-    /// up to `max_batch`.
+    /// Grows a batch on a node from `units`, in order, while its score
+    /// rises. A unit joins whole, and only when every member's base is
+    /// trunk, an earlier member, or beneath the node in `footing`; a unit
+    /// that would take the batch past `max_batch` is skipped unless the
+    /// batch is empty, so an `Atomic` stack larger than the cap runs alone.
     fn grow(
         &self,
         inference: &Inference,
-        pool: &[Member],
+        footing: &Footing,
+        units: &[Vec<Member>],
         below: &[Member],
         p_node: f64,
         ejected: &BTreeSet<PrNumber>,
     ) -> Result<Option<(Vec<Member>, f64)>, Unresolved> {
         let mut members: Vec<Member> = Vec::new();
+        let mut chosen: BTreeSet<PrNumber> = BTreeSet::new();
         let mut best = f64::NEG_INFINITY;
-        for member in pool.iter().take(self.params.max_batch) {
-            members.push(member.clone());
+        for unit in units {
+            if !members.is_empty() && members.len() + unit.len() > self.params.max_batch {
+                continue;
+            }
+            let Some(with) = footing.extend(&chosen, unit.iter().map(|m| m.0)) else {
+                continue;
+            };
+            members.extend(unit.iter().cloned());
             let score = self.score(inference, &members, below, p_node, ejected)?;
             if score > best {
                 best = score;
+                chosen = with;
             } else {
-                members.pop();
+                members.truncate(members.len() - unit.len());
                 break;
             }
         }
@@ -258,9 +271,18 @@ impl Bayes {
 
     /// The culprit finders: per component, a batch for each of its three
     /// most probable causes, and one of its two most probable `Bad` suspects
-    /// together; only those whose members are all in `pool`.
-    fn finders(&self, inference: &Inference, pool: &[Member]) -> Vec<Vec<Member>> {
+    /// together. A finder runs on trunk, so it holds its suspects' closures:
+    /// each suspect with every enqueued ancestor, bases first. Only finders
+    /// whose members are all batchable and in `pool` are generated.
+    fn finders(&self, inference: &Inference, stacks: &Stacks, pool: &[Member]) -> Vec<Vec<Member>> {
         let available: BTreeMap<PrNumber, &Sha> = pool.iter().map(|(pr, h)| (*pr, h)).collect();
+        let closure = |suspects: &[PrNumber]| -> Option<Vec<PrNumber>> {
+            let mut all: BTreeSet<PrNumber> = BTreeSet::new();
+            for &pr in suspects {
+                all.extend(stacks.closure(pr)?);
+            }
+            Some(stacks.ordered(all))
+        };
         let mut out: Vec<Vec<Member>> = Vec::new();
         for runs in inference.components() {
             let causes: BTreeSet<Cause> = runs
@@ -276,6 +298,9 @@ impl Bayes {
             // searched one pair per finder, in rank order; cross-subset
             // finders would locate the failing pair in logarithmically many
             // runs.
+            // TODO(trunk-broken-probe): every finder runs on trunk; after a
+            // flaky pass landed a bad pull request, every one of them fails
+            // and each singles out an innocent suspect.
             let mut sets: Vec<Vec<PrNumber>> = ranked
                 .iter()
                 .take(3)
@@ -293,13 +318,14 @@ impl Bayes {
                 .take(2)
                 .collect();
             if let [a, b] = bads[..] {
-                sets.push(vec![a.min(b), a.max(b)]);
+                sets.push(vec![a, b]);
             }
             for set in sets {
-                let members: Option<Vec<Member>> = set
-                    .iter()
-                    .map(|pr| available.get(pr).map(|&head| (*pr, head.clone())))
-                    .collect();
+                let members: Option<Vec<Member>> = closure(&set).and_then(|set| {
+                    set.iter()
+                        .map(|pr| available.get(pr).map(|&head| (*pr, head.clone())))
+                        .collect()
+                });
                 if let Some(members) = members
                     && !out.contains(&members)
                 {
@@ -489,28 +515,61 @@ impl Scheduler for Bayes {
             below.extend(members);
         }
 
-        let posterior_bad = |pr| inference.posterior(&self.model, Cause::Bad(pr));
-        // TODO(scheduler-stacks): stacked pull requests, and the ancestors of
-        // an `Atomic` one, wait; a batch grown from this pool could separate
-        // a child from its base.
-        let mut pool: Vec<Member> = batchable(observation, |p| {
-            p.base == PrBase::Trunk && !taken.contains(&p.number)
-        })
-        .into_iter()
-        .map(|n| (n, heads[&n].clone()))
-        .collect();
+        // The members beneath the chain end beyond the observation's trunk:
+        // the standing path, and the batches this plan lands, which are
+        // trunk's by the time the starts run.
+        let beneath: BTreeSet<PrNumber> = below
+            .iter()
+            .map(|m| m.0)
+            .chain(
+                observation
+                    .batches
+                    .iter()
+                    .zip(&fates)
+                    .filter(|(_, fate)| matches!(fate, Fate::Land))
+                    .flat_map(|(batch, _)| batch.members.iter().map(|m| m.pr)),
+            )
+            .collect();
+
+        let stacks = Stacks::new(observation);
+        let member = |n: PrNumber| (n, heads[&n].clone());
+        let pool: Vec<Member> = stacks
+            .order()
+            .iter()
+            .copied()
+            .filter(|n| !taken.contains(n))
+            .map(member)
+            .collect();
         if pool.is_empty() {
             return Ok(plan);
         }
-        pool.sort_by(|a, b| {
-            posterior_bad(a.0)
-                .total_cmp(&posterior_bad(b.0))
-                .then(a.0.cmp(&b.0))
-        });
+        // Whole units with nothing taken, least likely to fail first.
+        // TODO(bayes-atomic-unit-starvation): a large `Atomic` unit sorts
+        // late and can be skipped step after step under a standing backlog.
+        let risk = |unit: &[Member]| {
+            1.0 - unit
+                .iter()
+                .map(|&(pr, _)| 1.0 - inference.posterior(&self.model, Cause::Bad(pr)))
+                .product::<f64>()
+        };
+        let mut units: Vec<Vec<Member>> = stacks
+            .units()
+            .iter()
+            .filter(|unit| unit.iter().all(|n| !taken.contains(n)))
+            .map(|unit| unit.iter().copied().map(member).collect())
+            .collect();
+        units.sort_by(|a, b| risk(a).total_cmp(&risk(b)));
 
         let mut candidates: Vec<Candidate> = Vec::new();
         if let Some((members, score)) = self
-            .grow(&inference, &pool, &below, p_end, &ejected)
+            .grow(
+                &inference,
+                &stacks.on(&beneath),
+                &units,
+                &below,
+                p_end,
+                &ejected,
+            )
             .map_err(SchedulerError::new)?
         {
             candidates.push(Candidate {
@@ -520,7 +579,7 @@ impl Scheduler for Bayes {
                 score,
             });
         }
-        for members in self.finders(&inference, &pool) {
+        for members in self.finders(&inference, &stacks, &pool) {
             let score = self
                 .score(&inference, &members, &[], 1.0, &ejected)
                 .map_err(SchedulerError::new)?;
@@ -562,8 +621,7 @@ impl Scheduler for Bayes {
             if candidate.kind == Kind::Finder {
                 self.finders.insert(id);
             }
-            let mut prs: Vec<PrNumber> = candidate.members.iter().map(|m| m.0).collect();
-            prs.sort_unstable();
+            let prs = stacks.ordered(candidate.members.iter().map(|m| m.0));
             plan.start
                 .push(BatchStart::new(id, candidate.base.clone(), prs));
         }
@@ -578,7 +636,7 @@ mod tests {
     use super::*;
     use crate::BayesConfig;
     use crate::test_support::*;
-    use dorfq_core::{Departure, LandRefusal, Withdrawal};
+    use dorfq_core::{Departure, LandRefusal, PrSnapshot, Withdrawal};
 
     fn params() -> BayesConfig {
         let priors = priors();
@@ -1116,8 +1174,9 @@ mod tests {
             assert_eq!(inference.posterior(&bayes.model, pair(a, b)), tied);
         }
         let pool = members(&[1, 2, 3, 4, 5, 6]);
+        let stacks = Stacks::new(&observation(prs.clone(), vec![]));
         assert_eq!(
-            bayes.finders(&inference, &pool),
+            bayes.finders(&inference, &stacks, &pool),
             vec![members(&[1, 4]), members(&[1, 5]), members(&[1, 6])]
         );
 
@@ -1131,7 +1190,7 @@ mod tests {
         assert!(belief(&bayes, pair(2, 4)) > FLOOR);
         let inference = Inference::of(&bayes.model).unwrap();
         assert_eq!(
-            bayes.finders(&inference, &pool),
+            bayes.finders(&inference, &stacks, &pool),
             vec![members(&[1, 5]), members(&[1, 6]), members(&[2, 4])]
         );
     }
@@ -1526,6 +1585,17 @@ mod tests {
                     testing(3, trunk(), &[2], CiStatus::Passed),
                 ],
             ),
+            observation(
+                vec![ready(1), stacked(2, 1), ready(3), atomic_stacked(4, 3)],
+                vec![testing(4, trunk(), &[1, 2, 3, 4], ci_failed())],
+            ),
+            observation(
+                vec![ready(1), stacked(2, 1), ready(3), atomic_stacked(4, 3)],
+                vec![
+                    testing(5, trunk(), &[1, 2], CiStatus::Pending),
+                    testing(6, trunk(), &[3, 4], ci_failed()),
+                ],
+            ),
         ];
         let (mut a, mut b) = (bayes(), bayes());
         for input in &inputs {
@@ -1535,26 +1605,145 @@ mod tests {
     }
 
     #[test]
-    fn stacked_pull_requests_and_parents_of_atomic_ones_are_never_batched() {
-        let mut bayes = bayes();
-        let prs = vec![
-            ready(1),
-            stacked(2, 1),
-            ready(3),
-            atomic(stacked(4, 3)),
-            ready(5),
-        ];
+    fn stacked_pull_requests_are_batched_and_emitted_base_first() {
+        // 1 on 3, `Atomic` 2 on 1, and 4 on trunk: units {3, 1, 2} and {4}.
+        let prs = vec![stacked(1, 3), atomic_stacked(2, 1), ready(3), ready(4)];
+        let plan = step(&mut bayes(), &observation(prs, vec![]));
+        assert_eq!(plan.start, vec![start(1, trunk(), &[3, 1, 2, 4])]);
+    }
+
+    #[test]
+    fn an_atomic_unit_larger_than_max_batch_runs_alone_and_whole() {
+        let mut bayes = Bayes::new(BayesConfig {
+            max_batch: 2,
+            ..params()
+        });
+        let prs = vec![ready(1), stacked(2, 1), atomic_stacked(3, 2)];
         let plan = step(&mut bayes, &observation(prs, vec![]));
-        let members: BTreeSet<PrNumber> = plan
-            .start
-            .iter()
-            .flat_map(|s| s.prs.iter().copied())
-            .collect();
-        assert!(!members.is_empty(), "{plan:?}");
+        assert_eq!(plan.start, vec![start(1, trunk(), &[1, 2, 3])]);
+    }
+
+    #[test]
+    fn a_child_joins_the_extension_on_a_tree_that_holds_its_base() {
+        // Standing beneath the chain's end.
+        let prs = vec![ready(1), stacked(2, 1)];
+        let pending = testing(1, trunk(), &[1], CiStatus::Pending);
+        let plan = step(&mut bayes(), &observation(prs.clone(), vec![pending]));
+        assert_eq!(plan.start, vec![start(2, tip(1), &[2])]);
+
+        // Landed by this plan.
+        let passed = testing(1, trunk(), &[1], CiStatus::Passed);
+        let plan = step(&mut bayes(), &observation(prs, vec![passed]));
+        assert_eq!(plan.land, ids(&[1]));
+        assert_eq!(plan.start, vec![start(2, tip(1), &[2])]);
+    }
+
+    #[test]
+    fn a_child_whose_base_is_not_beneath_the_chain_end_waits() {
+        // 1 runs as a finder, off the chain: 2 on 1 cannot extend the chain.
+        let mut bayes = bayes();
+        bayes.finders.insert(BatchId(1));
+        let prs = vec![ready(1), stacked(2, 1)];
+        let finder = testing(1, trunk(), &[1], CiStatus::Pending);
+        let plan = step(&mut bayes, &observation(prs, vec![finder]));
+        assert!(plan.start.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn no_pair_within_a_stack_is_counted_in_p_pass() {
+        let mut bayes = bayes();
+        let prs = vec![ready(1), stacked(2, 1), ready(3)];
+        bayes.model.sync(&prs, &BTreeSet::new());
+        let inference = Inference::of(&bayes.model).unwrap();
+        let p = |m: &[u64], b: &[u64]| bayes.p_pass(&inference, &members(m), &members(b));
+        let (good, flake) = (0.95f64, 0.98);
+        assert!((p(&[1, 2], &[]) - flake * good * good).abs() < 1e-12);
+        assert!((p(&[2], &[1]) - flake * good).abs() < 1e-12);
+        assert!((p(&[1, 3], &[]) - flake * good * good * 0.998).abs() < 1e-12);
+    }
+
+    /// `bayes` after the batch {1, 2, 3}, with 2 on 1, failed on trunk.
+    fn failed_stack(bayes: &mut Bayes) -> Vec<PrSnapshot> {
+        let prs = vec![ready(1), stacked(2, 1), ready(3)];
+        let failed = testing(1, trunk(), &[1, 2, 3], ci_failed());
+        step(bayes, &observation(prs.clone(), vec![failed]));
+        prs
+    }
+
+    #[test]
+    fn a_stacked_suspects_finder_is_its_closure() {
+        let mut bayes = bayes();
+        let prs = failed_stack(&mut bayes);
+        let model = &bayes.model;
+        assert_eq!(model.evidence().len(), 1);
+        assert!(!model.evidence()[0].exercised.contains(&pair(1, 2)));
+        let inference = Inference::of(model).unwrap();
+        let stacks = Stacks::new(&observation(prs, vec![]));
+        assert_eq!(
+            bayes.finders(&inference, &stacks, &members(&[1, 2, 3])),
+            vec![members(&[1]), members(&[1, 2]), members(&[3])]
+        );
+        // With 1 in flight, neither finder holding it is generated.
+        assert_eq!(
+            bayes.finders(&inference, &stacks, &members(&[2, 3])),
+            vec![members(&[3])]
+        );
+    }
+
+    #[test]
+    fn a_finder_whose_ancestor_is_in_flight_is_never_started() {
+        // Only one lane, and nothing worth its run: the liveness fallback
+        // starts the best candidate on trunk, which must not be 2 alone.
+        let mut bayes = Bayes::new(BayesConfig {
+            lanes: 2,
+            speculate_above: 100.0,
+            ..params()
+        });
+        let prs = failed_stack(&mut bayes);
+        let running = testing(5, trunk(), &[1], CiStatus::Pending);
+        let plan = step(&mut bayes, &observation(prs, vec![running]));
         assert!(
-            members.is_subset(&numbers(&[1, 5]).into_iter().collect()),
+            plan.start.iter().all(|s| s.prs != numbers(&[2])),
             "{plan:?}"
         );
+    }
+
+    #[test]
+    fn a_passed_closure_finder_under_an_atomic_tip_is_retired_and_alibis_its_members() {
+        let mut bayes = bayes();
+        failed_stack(&mut bayes);
+        bayes.finders.insert(BatchId(9));
+        let prs = vec![ready(1), stacked(2, 1), ready(3), atomic_stacked(4, 2)];
+        let finder = testing(9, trunk(), &[1, 2], CiStatus::Passed);
+        let plan = step(&mut bayes, &observation(prs, vec![finder]));
+        assert!(plan.land.is_empty(), "{plan:?}");
+        assert_eq!(plan.retire, ids(&[9]));
+        assert_eq!(belief(&bayes, bad(1)), FLOOR);
+        assert_eq!(belief(&bayes, bad(2)), FLOOR);
+        assert!(belief(&bayes, bad(3)) > FLOOR);
+    }
+
+    #[test]
+    fn an_ejected_ancestor_and_its_blocked_children_take_only_the_runs_it_was_in() {
+        let mut bayes = bayes();
+        failed_stack(&mut bayes);
+        let other = testing(2, moved(), &[3, 4], ci_failed());
+        let prs = vec![ready(1), stacked(2, 1), ready(3), ready(4)];
+        step(&mut bayes, &observation(prs, vec![other]));
+        assert_eq!(bayes.model.evidence().len(), 2);
+        // 1 is ejected and 2 withdrawn as blocked on it.
+        let mut input = observation(ready_all(&[3, 4]), vec![]);
+        input.departed = vec![
+            Departure::new(PrNumber(1), sha(1), Departed::Ejected),
+            Departure::new(
+                PrNumber(2),
+                sha(2),
+                Departed::Withdrawn(Withdrawal::Blocked { on: PrNumber(1) }),
+            ),
+        ];
+        step(&mut bayes, &input);
+        let runs: Vec<BatchId> = bayes.model.evidence().iter().map(|r| r.batch).collect();
+        assert_eq!(runs, ids(&[2]));
     }
 
     #[test]
@@ -1563,12 +1752,9 @@ mod tests {
         let prs = vec![ready(1), atomic(stacked(2, 1))];
         let passed = testing(1, trunk(), &[1], CiStatus::Passed);
         let plan = step(&mut bayes, &observation(prs, vec![passed]));
-        assert_eq!(
-            plan,
-            Plan {
-                retire: vec![BatchId(1)],
-                ..Plan::default()
-            }
-        );
+        assert_eq!(plan.retire, ids(&[1]));
+        assert!(plan.land.is_empty(), "{plan:?}");
+        // The member is free again, and runs with its `Atomic` child.
+        assert_eq!(plan.start, vec![start(2, trunk(), &[1, 2])]);
     }
 }
