@@ -47,7 +47,7 @@ crate.from_cargo(
 # must not join the workspace hub's feature unification. `repositories` is
 # required, not optional: a crate.spec without it applies to every hub in the
 # module. Pinned by the two files under tools/scrub; `make repin` re-renders
-# both hubs (CARGO_BAZEL_REPIN applies to every hub this extension declares).
+# every hub (CARGO_BAZEL_REPIN applies to every hub this extension declares).
 crate.spec(
     package = "brenn-scrub",
     repositories = ["scrub_crates"],
@@ -63,7 +63,26 @@ crate.from_specs(
     cargo_lockfile = "//tools/scrub:Cargo.lock",
     lockfile = "//tools/scrub:cargo-bazel-lock.json",
 )
-use_repo(crate, "crates", "scrub_crates")
+
+# allthechanges, the changelog and TODO fragment tool, from crates.io, in a hub
+# of its own for the same reason. Pinned by the two files under
+# tools/allthechanges.
+crate.spec(
+    package = "allthechanges",
+    repositories = ["allthechanges_crates"],
+    version = "=0.2.0",
+)
+crate.annotation(
+    crate = "allthechanges",
+    gen_binaries = ["allthechanges"],
+    repositories = ["allthechanges_crates"],
+)
+crate.from_specs(
+    name = "allthechanges_crates",
+    cargo_lockfile = "//tools/allthechanges:Cargo.lock",
+    lockfile = "//tools/allthechanges:cargo-bazel-lock.json",
+)
+use_repo(crate, "allthechanges_crates", "crates", "scrub_crates")
 
 # --- gitleaks -------------------------------------------------------------
 # The release brenn-scrub 0.2.0 pins. brenn-scrub refuses any other gitleaks

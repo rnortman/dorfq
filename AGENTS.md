@@ -13,8 +13,8 @@ The scheduler–forge contract and its rules are documented in
 ## Build: Bazel, and only Bazel
 
 Bazel is the build. The Makefile is a frontend whose every target is a
-spelled-out `bazel` invocation; there is no target that runs `cargo`, and the
-gate never will.
+spelled-out `bazel` invocation (`release` also edits the two version manifests
+with `sed`); there is no target that runs `cargo`, and the gate never will.
 
 - Every toolchain and every tool the gate runs is pinned in `MODULE.bazel` and
   fetched by checksum. The only host prerequisites are bazelisk (as `bazel`),
@@ -25,11 +25,12 @@ gate never will.
   Bazel, pick a different tool, and if that is not possible either, surface it
   as a decision rather than adding a host dependency.
 - `Cargo.toml` + `Cargo.lock` remain the source of truth for crate versions
-  and features; `cargo-bazel-lock.json` is their rendered view. A second crate
-  hub under `tools/scrub/` pins the secret scanner the same way, with its own
-  `Cargo.lock` and `cargo-bazel-lock.json`.
-- `make repin` re-renders both hubs at once. After any manifest change or
-  scanner bump, run it and commit every lock file that changed.
+  and features; `cargo-bazel-lock.json` is their rendered view. Two more crate
+  hubs pin build tools the same way, each with its own `Cargo.lock` and
+  `cargo-bazel-lock.json`: `tools/scrub/` (the secret scanner) and
+  `tools/allthechanges/` (the changelog and TODO fragment tool).
+- `make repin` re-renders all three hubs at once. After any manifest change or
+  tool bump, run it and commit every lock file that changed.
 - `RUST_VERSION` in `MODULE.bazel`, the channel in `rust-toolchain.toml`,
   `rust-version` in `Cargo.toml` and `msrv` in `clippy.toml` are held equal
   by `//tools/pins:pins_test`;
@@ -41,12 +42,15 @@ gate never will.
 
 | Command | What it does |
 |---|---|
-| `make check` | The gate: scrub kit check, build, every test, clippy, rustfmt, buildifier, tree scan |
+| `make check` | The gate: scrub kit check, fragment lint, build, every test, clippy, rustfmt, buildifier, tree scan |
 | `make build` | Build every target |
 | `make test` | Every test, without the lint aspects (the inner loop) |
 | `make run ARGS=...` | Build and run the `dorfq` binary |
 | `make sim ARGS=...` | Build and run the `dorfq-sim` simulator |
-| `make release` | Build the `dorfq` binary optimised |
+| `make optimised` | Build the `dorfq` binary optimised |
+| `make release VERSION=X.Y.Z` | Cut a release: gather the changelog and TODO fragments, bump the crate version, repin |
+| `make todo-gather` | Fold `todo.d/` fragments into `TODO.md`, outside a release |
+| `make changes ARGS=...` | Run allthechanges: `ARGS="query"`, `ARGS="todo query"`, `ARGS="gather --version X.Y.Z --dry-run"` |
 | `make fix` | rustfmt and buildifier the tree in place |
 | `make repin` | Re-render every crate hub's lock files |
 | `make ide` | Write `rust-project.json` for rust-analyzer |
@@ -56,7 +60,8 @@ gate never will.
 
 ## Gates
 
-- A commit scans the staged change for secrets and then runs `make check`.
+- A commit scans the staged change for secrets and then runs `make check`,
+  which also lints every `changelog.d/` and `todo.d/` fragment.
 - A push scans the range being pushed.
 - CI runs `make check` on every push and pull request, with the module
   lockfile in error mode, so a resolution nobody committed is a red build.
@@ -91,22 +96,48 @@ bypassed gate is not recoverable once it has been pushed.
   nondeterministic.
 - Default branch: `main`.
 
+## Changelog
+
+Every user-visible change adds a fragment, `changelog.d/<slug>.<section>.md`,
+where `<section>` is one of `added`, `changed`, `deprecated`, `removed`,
+`fixed`, `security`. A fragment is a Markdown list: its first line starts with
+`- `, continuation lines are indented two spaces. Never edit `CHANGELOG.md`;
+`make release` gathers the fragments into it. `make changes ARGS="query"` lints
+and lists what is pending.
+
 ## TODO system
 
 Two pieces that stay in sync:
 
-- `TODO.md` at the repo root: the master list. Each entry has a slug, a
-  description, and the deferral context.
+- The master list: `TODO.md` at the repo root plus the fragments under
+  `todo.d/` not yet gathered into it. Each entry has a slug, a description,
+  and the deferral context.
 - `TODO(slug)` comments in code, marking the spot where the work happens.
+
+A new entry is a fragment, `todo.d/<slug>.md`: its first line is text, it has
+no ATX heading outside a code fence, and every fence is closed. Never add an
+entry by editing `TODO.md`. `make todo-gather` folds the fragments into
+`TODO.md` at any time, `make release` at release time; between gathers
+`make changes ARGS="todo query"` lists them. Removing a done TODO deletes its
+fragment if it still is one, else its `### <slug>` entry in `TODO.md`, and its
+comment.
 
 Slugs are the join key; adding a TODO requires both halves. Don't use TODOs for
 vague aspirations. Every TODO describes a concrete thing, in a place where
 "done" is obvious.
 
+## Releasing
+
+On a branch, run `make release VERSION=X.Y.Z` on a clean tree and review the
+diff. Commit the gathered `CHANGELOG.md` and `TODO.md`, the deleted
+fragments, both version manifests (`Cargo.toml`, `crates/dorfq/BUILD.bazel`)
+and every lock file that changed. Land it, then tag the landed `main` commit
+`vX.Y.Z` and push the tag.
+
 ## Public tree
 
-Everything tracked here is published. `TODO.md`, `CHANGELOG.md`, commit
-messages and every code comment are public writing: no internal host names,
-no absolute paths into other trees, no references to documents a public reader
-cannot follow. Design documents live outside this repository and are never
+Everything tracked here is published. `TODO.md`, `CHANGELOG.md`, their
+fragments under `todo.d/` and `changelog.d/`, commit messages and every code
+comment are public writing: no internal host names, no absolute paths into
+other trees, no references to documents a public reader cannot follow. Design documents live outside this repository and are never
 cited from code.

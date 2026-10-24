@@ -93,7 +93,7 @@ repository you care about. The steps, all done by the operator:
    it wherever outbound HTTPS is available:
 
    ```sh
-   make release   # then: dorfq run --config <your github.toml>
+   make optimised   # then: dorfq run --config <your github.toml>
    make run ARGS="run --config $PWD/crates/dorfq/examples/github.toml"
    ```
 
@@ -165,13 +165,20 @@ invocation.
     the metrics and the `dorfq-sim` binary.
 - `tools/scrub/` — the secret scanner the commit, push and CI gates run,
   built by Bazel from its published crate with a pinned gitleaks.
+- `tools/allthechanges/` — the changelog and TODO fragment tool, built by
+  Bazel from its published crate.
+- `changelog.d/` and `todo.d/` — the changelog and TODO fragment
+  directories: each change's entry is a file here until a release (or, for
+  TODOs, `make todo-gather`) folds it into `CHANGELOG.md` or `TODO.md`.
 - `tools/pins/` — a test holding the version pins that appear in more than
   one file equal.
 - Lock files: `MODULE.bazel.lock` pins the Bazel module graph;
   `cargo-bazel-lock.json` is the rendered view of `Cargo.lock` for the
   workspace's crates; `tools/scrub/Cargo.lock` and
-  `tools/scrub/cargo-bazel-lock.json` pin the scanner's crates. `make repin`
-  re-renders the crate locks after a manifest change.
+  `tools/scrub/cargo-bazel-lock.json` pin the scanner's crates, and
+  `tools/allthechanges/Cargo.lock` and
+  `tools/allthechanges/cargo-bazel-lock.json` the fragment tool's. `make
+  repin` re-renders the crate locks after a manifest change.
 
 ## License
 
