@@ -25,8 +25,8 @@ that land only whole), probes (a batch with no members that tests its
 base's tree alone), how each pull request left the queue, the names of the
 checks a batch failed, and the forge's clock. All three schedulers batch
 stacked pull requests, bases before children, and land a stack that must
-land whole only whole; the simulator's world grows stacks to measure them
-on. The GitHub forge enqueues stacks and trees of any depth (see **Running
+land whole only whole; in the simulator's world pull requests arrive as
+stacks. The GitHub forge enqueues stacks and trees of any depth (see **Running
 against GitHub**).
 
 On the scheduler side there are two real policies beside the stub: `bisect`,
@@ -36,18 +36,20 @@ infers culprits exactly from the runs that failed and passed, and chooses
 batches by expected value. Both are measured with `dorfq-sim`, a seeded,
 event-driven simulator that runs any scheduler against a world of pull
 requests with hidden truths (bad ones, pairs that break only together,
-flaky runs, a fixed number of runners) and reports runner-hours per landed
-pull request, time to land and to reject, wasted runner time and false
-ejections. The world also charges PR CI, the CI a pull request runs on its
-own, to the same runners: at arrival, after each push, and after the rebase
-that a conflict or, under GitHub's admission, a landed base forces. As the
-GitHub forge does, it lets a pull request into a batch only once its
-current head has passed, so runner cost and time to land include it. In
-the busy example world, a high-velocity team's, `bisect` does not keep up
-at any batch cap and its pooling does not pay — it does as well with no
-pooling at all — while `bayes` is the only policy that comes close to
-keeping up; see
-**Simulator reports**.
+flaky runs) and reports runner-hours per landed pull request, time to land
+and to reject, wasted runner time and false ejections. The capacity knob is
+each policy's `lanes`, the batches it runs at once, held equal across the
+columns of each example. PR CI, the CI a pull request runs on its own, runs
+beside the queue, on capacity the queue does not own: at arrival, after each
+push, and after the rebase a conflict forces. As the GitHub forge does, the
+world lets a pull request into a batch only once its current head has
+passed, so time to land includes it. The queue is billed only for the PR CI
+it causes by landing part of a stack — the run of each direct child of what
+landed, which under GitHub's admission is every pull request of a stack in
+turn. In the busy example world, a high-velocity team's, `bisect` is best
+with no pooling at all and then keeps up, while `bayes` lands the most at
+the lowest cost per landed pull request of the policies that keep their
+good pull requests; see **Simulator reports**.
 
 ```sh
 make run ARGS="run --config $PWD/crates/dorfq/examples/mock.toml --exit-when-idle"
@@ -60,7 +62,7 @@ trunk, three landed in one batch, and one ejected when its batch fails.
 make sim ARGS="run --config $PWD/crates/dorfq-sim/examples/sim.toml"
 ```
 
-runs the shipped simulator example, a week of arrivals on two runners, and
+runs the shipped simulator example, a week of arrivals on two lanes, and
 prints one column per policy.
 
 ## Simulator reports
@@ -69,7 +71,7 @@ The report site, published at <https://rnortman.github.io/dorfq/>, shows <!-- gi
 each shipped simulator example (`crates/dorfq-sim/examples/`): every policy's headline
 numbers as deltas against the `github-like` column, an approximation of
 GitHub's own merge queue, the full metric table, and a replay of the first
-replication — runners, batches, the queue with its stacks, and trunk —
+replication — batch lanes, the queue with its stacks, and trunk —
 switchable between policies over the same arrivals. Each report shows the
 configuration it ran with, its comments explaining every parameter, and a
 playground runs the simulator in the browser, compiled to WebAssembly, on a

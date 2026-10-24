@@ -1,7 +1,7 @@
-//! The hidden-truth world: pull requests, runners, events, and the
+//! The hidden-truth world: pull requests, CI runs, events, and the
 //! [`Forge`] a scheduler acts through.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use dorfq_core::ledger::Ledger;
 use dorfq_core::{
@@ -10,14 +10,14 @@ use dorfq_core::{
     PrSnapshot, PrStatus, Sha, StackPolicy, Timestamp, Withdrawal,
 };
 
-use crate::config::{Admission, WorldConfig};
+use crate::config::{Admission, Minutes, WorldConfig};
 use crate::metrics::{Exit, Metrics, PrCiRecord, PrRecord, RunRecord, RunningSeconds};
 use crate::rng::{SplitMix64, Streams, mix, unit};
 use crate::trace::{Rebase, TraceEvent, Truth};
 
 const HOUR: f64 = crate::HOUR as f64;
 
-/// Work for a runner: a batch's run, or a pull request's own CI on its
+/// What a `CiDone` ends: a batch's run, or a pull request's own CI on its
 /// current head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Job {
@@ -28,7 +28,15 @@ enum Job {
 /// A scheduled happening.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Event {
+    /// A stack arrives on trunk.
     Arrival,
+    /// A stack's second burst of `size` pull requests arrives on top of
+    /// what is left of it below `on`, its first burst's top.
+    Grow {
+        on: PrNumber,
+        size: usize,
+        atomic: bool,
+    },
     CiDone(Job),
     Repush(PrNumber),
     Withdraw(PrNumber),
@@ -59,12 +67,8 @@ struct SimPr {
     bad: bool,
     conflicts_with_trunk: bool,
     key: u64,
-    /// The earlier arrival whose branch it was cut from, whether or not it
-    /// stacked on it.
-    cut_from: Option<PrNumber>,
-    /// Whether it stacked on `cut_from`: that one was in the world at
-    /// arrival.
-    stacked: bool,
+    /// The pull request it is stacked on, set at arrival.
+    base: Option<PrNumber>,
     /// Lands only with its ancestors; only ever set on a stacked arrival.
     atomic: bool,
     repush: Option<EventKey>,
@@ -82,7 +86,7 @@ struct SimPr {
 impl SimPr {
     /// The pull request it stacked on at arrival; never changes.
     fn base(&self) -> Option<PrNumber> {
-        self.cut_from.filter(|_| self.stacked)
+        self.base
     }
 
     /// In the world: arrived and not yet left for good.
@@ -100,10 +104,10 @@ impl SimPr {
     }
 }
 
-/// A run's claim on a runner. A pull request's own run never reaches
-/// `Done`: it is dropped when it ends.
+/// A run, which starts the instant it is requested: `run` indexes its
+/// record and `done` is its scheduled end. A pull request's own run never
+/// reaches `Done`: it is dropped when it ends.
 enum Run {
-    Waiting { duration: u64 },
     Running { run: usize, done: EventKey },
     Done { run: usize },
 }
@@ -135,14 +139,10 @@ pub struct World {
     next_pr: u64,
     events: BTreeMap<EventKey, Event>,
     next_seq: u64,
-    running: usize,
-    waiting: VecDeque<Job>,
     runs: Vec<RunRecord>,
     pr_ci_runs: Vec<PrCiRecord>,
     /// Rules 5, 6 and 8, against the latest observation.
     ledger: Ledger,
-    /// Runner-seconds the runners have been busy.
-    busy: u64,
     /// Events since the last [`World::take_trace`]; `None` untraced.
     trace: Option<Vec<TraceEvent>>,
 }
@@ -150,6 +150,17 @@ pub struct World {
 /// The synthetic commit numbered `n`.
 fn commit(n: u64) -> Sha {
     Sha::parse(&format!("{n:040x}")).expect("40 lowercase hex digits")
+}
+
+/// A size drawn from `weights`, where `weights[k - 1]` is the weight of
+/// size `k`.
+fn draw_size(rng: &mut SplitMix64, weights: &[f64]) -> usize {
+    rng.weighted(weights) + 1
+}
+
+/// A uniform draw of `m` in whole seconds.
+fn seconds(rng: &mut SplitMix64, m: Minutes) -> u64 {
+    rng.uniform(m.min, m.max) * 60
 }
 
 /// An exponential delay in whole seconds at `per_hour`.
@@ -180,12 +191,9 @@ impl World {
             next_pr: 1,
             events: BTreeMap::new(),
             next_seq: 0,
-            running: 0,
-            waiting: VecDeque::new(),
             runs: Vec::new(),
             pr_ci_runs: Vec::new(),
             ledger: Ledger::new(),
-            busy: 0,
             trace: None,
         };
         world.schedule_arrival();
@@ -211,7 +219,6 @@ impl World {
     /// Moves the clock to `t` and fires every event due by then, in
     /// scheduling order.
     pub fn advance_to(&mut self, t: u64) {
-        self.busy += self.running as u64 * (t - self.now);
         self.now = t;
         while let Some(entry) = self.events.first_entry() {
             if entry.key().0 > t {
@@ -240,13 +247,12 @@ impl World {
         self.prs.values().map(|p| p.record.clone()).collect()
     }
 
-    /// Every run that reached a runner, in start order.
+    /// Every batch run, in start order.
     pub fn runs(&self) -> &[RunRecord] {
         &self.runs
     }
 
-    /// Every pull request's own CI run that reached a runner, in start
-    /// order.
+    /// Every pull request's own CI run, billed or not, in start order.
     pub fn pr_ci_runs(&self) -> &[PrCiRecord] {
         &self.pr_ci_runs
     }
@@ -258,24 +264,25 @@ impl World {
             &self.runs,
             &self.pr_ci_runs,
             self.running_elapsed(),
-            self.config.runners,
-            self.now,
         )
     }
 
-    /// Runner-seconds used so far by the runs still running.
+    /// Runner-seconds used so far by the batch runs and billed PR CI runs
+    /// still running.
     fn running_elapsed(&self) -> RunningSeconds {
         let batches = self.batches.values().filter_map(|b| match b.run {
             Run::Running { run, .. } => Some(self.now - self.runs[run].started_at),
-            _ => None,
+            Run::Done { .. } => None,
         });
         let prs = self.prs.values().filter_map(|p| match p.ci {
-            Some(Run::Running { run, .. }) => Some(self.now - self.pr_ci_runs[run].started_at),
+            Some(Run::Running { run, .. }) if self.pr_ci_runs[run].billed => {
+                Some(self.now - self.pr_ci_runs[run].started_at)
+            }
             _ => None,
         });
         RunningSeconds {
             batches: batches.sum(),
-            pr_ci: prs.sum(),
+            billed_pr_ci: prs.sum(),
         }
     }
 
@@ -288,13 +295,13 @@ impl World {
     }
 
     /// Every pull request's arrival time, hidden truth (`bad`, conflicts
-    /// with trunk, key) and the arrival it was cut from, by number.
+    /// with trunk, key) and base, by number.
     #[cfg(test)]
     pub(crate) fn truths(&self) -> Vec<(u64, bool, bool, u64, Option<PrNumber>)> {
         let prs = self.prs.values();
         prs.map(|p| {
             let truth = (p.bad, p.conflicts_with_trunk, p.key);
-            (p.record.arrived_at, truth.0, truth.1, truth.2, p.cut_from)
+            (p.record.arrived_at, truth.0, truth.1, truth.2, p.base)
         })
         .collect()
     }
@@ -336,10 +343,9 @@ impl World {
 
     /// Checks the world's invariants: nothing bad landed, no two landed pull
     /// requests interact, a landed pull request's base landed at or before
-    /// it, trunk's tree is exactly the landed set, the runner time batch
-    /// and PR CI runs consumed is the time runners were busy, no more runs
-    /// of either kind hold runners than there are, and every present pull
-    /// request's place agrees with its admission (see `check_places`).
+    /// it, trunk's tree is exactly the landed set, every running run's end
+    /// is scheduled, and every present pull request's place agrees with its
+    /// admission (see `check_places`).
     pub fn check_invariants(&self) -> Result<(), String> {
         self.check_places()?;
         let landed: Vec<PrNumber> = self
@@ -370,26 +376,14 @@ impl World {
         if trunk_tree != landed {
             return Err("trunk's tree is not the landed set".to_owned());
         }
-        let batches = self.batches.values();
-        let busy = batches.filter(|b| matches!(b.run, Run::Running { .. }));
-        let prs = self.prs.values();
-        let pr_ci = prs.filter(|p| matches!(p.ci, Some(Run::Running { .. })));
-        let (busy, pr_ci) = (busy.count(), pr_ci.count());
-        if busy + pr_ci != self.running || self.running > self.config.runners {
-            return Err(format!(
-                "{busy} batches and {pr_ci} PR CI runs running, {} runners held of {}",
-                self.running, self.config.runners
-            ));
-        }
-        let consumed: u64 = self.runs.iter().map(|r| r.consumed).sum::<u64>()
-            + self.pr_ci_runs.iter().map(|r| r.consumed).sum::<u64>();
-        let running = self.running_elapsed();
-        let elapsed = running.batches + running.pr_ci;
-        if consumed + elapsed != self.busy {
-            return Err(format!(
-                "runs consumed {consumed}s and running runs {elapsed}s, runners were busy {}s",
-                self.busy
-            ));
+        let batches = self.batches.values().map(|b| &b.run);
+        let prs = self.prs.values().filter_map(|p| p.ci.as_ref());
+        for run in batches.chain(prs) {
+            if let Run::Running { done, .. } = run
+                && !matches!(self.events.get(done), Some(Event::CiDone(_)))
+            {
+                return Err(format!("a running run's end at {done:?} is not scheduled"));
+            }
         }
         Ok(())
     }
@@ -452,7 +446,8 @@ impl World {
         if self.config.arrivals_per_hour <= 0.0 {
             return;
         }
-        let delay = delay(&mut self.streams.arrivals, self.config.arrivals_per_hour);
+        let per_hour = self.config.arrivals_per_hour / self.config.mean_pull_requests_per_stack();
+        let delay = delay(&mut self.streams.arrivals, per_hour);
         if let Some(at) = self.now.checked_add(delay)
             && at < self.config.hours * crate::HOUR
         {
@@ -495,69 +490,37 @@ impl World {
     fn fire(&mut self, event: Event) {
         match event {
             Event::Arrival => {
-                let number = PrNumber(self.next_pr);
-                self.next_pr += 1;
-                let bad = self.streams.truth.bernoulli(self.config.p_bad);
-                let conflicts = self.streams.truth.bernoulli(self.config.p_conflict);
-                let key = self.streams.truth.next_u64();
                 // Every draw is taken whatever the queue holds, so the draws
                 // are the same under every policy.
-                let cut = self.streams.stacks.bernoulli(self.config.p_stacked);
-                // The k-th most recent arrival, with probability 2^-k; the
-                // exponential is at most 53 from a 53-bit draw.
-                let back = 1 + self.streams.stacks.exponential(std::f64::consts::LN_2) as u64;
-                let atomic = self.streams.stacks.bernoulli(self.config.p_atomic);
-                let cut_from = (cut && back < number.0).then(|| PrNumber(number.0 - back));
-                let stacked = cut_from.is_some_and(|b| self.prs[&b].present());
-                let head = self.mint();
-                let record = PrRecord {
-                    number,
-                    arrived_at: self.now,
-                    left: None,
-                    rebases: 0,
-                };
-                let pr = SimPr {
-                    record,
-                    head,
-                    bad,
-                    // A branch cut from another cannot conflict with it, and
-                    // whatever of it is on trunk is that branch's content.
-                    conflicts_with_trunk: conflicts && cut_from.is_none(),
-                    key,
-                    cut_from,
-                    stacked,
-                    atomic: atomic && stacked,
-                    repush: None,
-                    withdraw: None,
-                    own: SplitMix64::new(key),
-                    ci: None,
-                    out: None,
-                };
-                let (base, atomic) = (pr.base(), pr.atomic);
-                let truth = Truth {
-                    bad,
-                    conflicts: pr.conflicts_with_trunk,
-                };
-                self.prs.insert(number, pr);
-                self.note(|t| TraceEvent::Arrive {
-                    t,
-                    pr: number.0,
-                    base: base.map(|b| b.0),
-                    atomic,
-                    truth,
-                });
-                self.request_pr_ci(number);
-                match (self.admission, base) {
-                    (Admission::Github, _) => self.set_out(number, Some(Out::Checking)),
-                    (Admission::Label, Some(b)) if !self.prs[&b].enqueued() => {
-                        self.out_with_base(number);
-                    }
-                    (Admission::Label, _) => self.admit(number),
+                let stacks = &mut self.streams.stacks;
+                let size = draw_size(stacks, &self.config.stack_sizes);
+                let atomic = stacks.bernoulli(self.config.p_atomic);
+                let grows = stacks.bernoulli(self.config.p_stack_grows);
+                let growth = draw_size(stacks, &self.config.stack_growth_sizes);
+                let after = seconds(stacks, self.config.stack_growth_minutes);
+                let top = self.burst(None, size, atomic, true);
+                let at = self.now + after;
+                if grows && at < self.config.hours * crate::HOUR {
+                    let on = top;
+                    self.schedule(
+                        at,
+                        Event::Grow {
+                            on,
+                            size: growth,
+                            atomic,
+                        },
+                    );
                 }
-                self.assign_runners();
-                self.schedule_repush(number);
-                self.schedule_withdraw(number);
                 self.schedule_arrival();
+            }
+            Event::Grow { on, size, atomic } => {
+                let mut at = Some(on);
+                while let Some(n) = at
+                    && !self.prs[&n].present()
+                {
+                    at = self.prs[&n].base();
+                }
+                self.burst(at, size, atomic, false);
             }
             Event::CiDone(Job::Batch(batch)) => self.complete(batch),
             Event::CiDone(Job::PrCi(pr)) => self.complete_pr_ci(pr),
@@ -568,7 +531,7 @@ impl World {
                     Some(Out::Rebasing { .. } | Out::WithBase { .. })
                 );
                 if !rebasing {
-                    let pushed = self.push(pr);
+                    let pushed = self.push(pr, false);
                     if self.admission == Admission::Github {
                         for p in pushed {
                             let was_in = self.prs[&p].enqueued();
@@ -578,23 +541,25 @@ impl World {
                             }
                         }
                     }
-                    self.assign_runners();
                 }
                 self.schedule_repush(pr);
             }
             Event::Rebase(pr) => {
                 let p = self.prs.get_mut(&pr).expect("arrived");
-                debug_assert!(matches!(p.out, Some(Out::Rebasing { .. })));
+                let Some(Out::Rebasing { why, .. }) = p.out else {
+                    unreachable!("a pushed rebase is rebasing");
+                };
                 p.conflicts_with_trunk = false;
                 p.record.rebases += 1;
-                let pushed = self.push(pr);
+                // A landed base's rebase is the queue's split of the stack:
+                // the rebased pull request's own run is billed to it.
+                let pushed = self.push(pr, why == Rebase::BaseLanded);
                 for p in pushed {
                     match self.admission {
                         Admission::Label => self.admit(p),
                         Admission::Github => self.set_out(p, Some(Out::Checking)),
                     }
                 }
-                self.assign_runners();
             }
             Event::Withdraw(pr) => {
                 self.note(|t| TraceEvent::Withdraw { t, pr: pr.0 });
@@ -604,17 +569,93 @@ impl World {
     }
 
     /// Gives `pr` and every present pull request stacked on it a new head,
-    /// each with its own CI requested, and returns them, `pr` first. The
-    /// caller assigns runners.
-    fn push(&mut self, pr: PrNumber) -> Vec<PrNumber> {
+    /// each with its own CI requested, and returns them, `pr` first. `pr`'s
+    /// run is `billed` as given; its descendants' never are.
+    fn push(&mut self, pr: PrNumber, billed: bool) -> Vec<PrNumber> {
         let pushed: Vec<PrNumber> = std::iter::once(pr).chain(self.descendants(pr)).collect();
         for &p in &pushed {
             let head = self.mint();
             self.prs.get_mut(&p).expect("arrived").head = head;
             self.note(|t| TraceEvent::Repush { t, pr: p.0 });
-            self.request_pr_ci(p);
+            self.request_pr_ci(p, billed && p == pr);
         }
         pushed
+    }
+
+    /// Creates `size` pull requests at once, each stacked on the one before
+    /// it and the first on `base`, and returns the last. Every one above a
+    /// root is `atomic` when the stack is; only the first can conflict with
+    /// trunk, and only when `root_may_conflict` (the rest were cut from the
+    /// stack's branch and are its content).
+    fn burst(
+        &mut self,
+        base: Option<PrNumber>,
+        size: usize,
+        atomic: bool,
+        root_may_conflict: bool,
+    ) -> PrNumber {
+        let mut base = base;
+        let mut may_conflict = root_may_conflict;
+        for _ in 0..size {
+            base = Some(self.arrive(base, atomic, may_conflict));
+            may_conflict = false;
+        }
+        base.expect("a burst brings at least one pull request")
+    }
+
+    /// One pull request arrives on `base`, with its truth drawn, its own CI
+    /// requested, its place under the admission and its churn clocks.
+    fn arrive(&mut self, base: Option<PrNumber>, atomic: bool, may_conflict: bool) -> PrNumber {
+        let number = PrNumber(self.next_pr);
+        self.next_pr += 1;
+        let bad = self.streams.truth.bernoulli(self.config.p_bad);
+        let conflicts = self.streams.truth.bernoulli(self.config.p_conflict);
+        let key = self.streams.truth.next_u64();
+        let head = self.mint();
+        let record = PrRecord {
+            number,
+            arrived_at: self.now,
+            left: None,
+            rebases: 0,
+        };
+        let atomic = atomic && base.is_some();
+        let pr = SimPr {
+            record,
+            head,
+            bad,
+            conflicts_with_trunk: conflicts && may_conflict,
+            key,
+            base,
+            atomic,
+            repush: None,
+            withdraw: None,
+            own: SplitMix64::new(key),
+            ci: None,
+            out: None,
+        };
+        let truth = Truth {
+            bad,
+            conflicts: pr.conflicts_with_trunk,
+        };
+        self.prs.insert(number, pr);
+        self.note(|t| TraceEvent::Arrive {
+            t,
+            pr: number.0,
+            base: base.map(|b| b.0),
+            atomic,
+            truth,
+        });
+        self.request_pr_ci(number, false);
+        match (self.admission, base) {
+            (Admission::Github, _) => self.set_out(number, Some(Out::Checking)),
+            (Admission::Label, Some(b)) if !self.prs[&b].enqueued() => {
+                self.out_with_base(number);
+            }
+            (Admission::Label, _) => self.admit(number),
+        }
+        self.schedule_repush(number);
+        self.schedule_withdraw(number);
+        number
     }
 
     fn set_out(&mut self, pr: PrNumber, out: Option<Out>) {
@@ -648,17 +689,8 @@ impl World {
     /// `pr`'s author starts rebasing it for `why`; the push is drawn from
     /// its own clock.
     fn begin_rebase(&mut self, pr: PrNumber, why: Rebase) {
-        let (min, max) = (
-            self.config.rebase_minutes.min,
-            self.config.rebase_minutes.max,
-        );
-        let delay = self
-            .prs
-            .get_mut(&pr)
-            .expect("arrived")
-            .own
-            .uniform(min, max)
-            * 60;
+        let minutes = self.config.rebase_minutes;
+        let delay = seconds(&mut self.prs.get_mut(&pr).expect("arrived").own, minutes);
         let push = self.schedule(self.now + delay, Event::Rebase(pr));
         self.set_out(pr, Some(Out::Rebasing { why, push }));
         self.note(|t| TraceEvent::Rebase { t, pr: pr.0, why });
@@ -742,63 +774,13 @@ impl World {
             .any(|&i| self.prs[&i].bad || tree.iter().any(|&j| self.interacts(i, j)))
     }
 
-    fn start_run(&mut self, batch: BatchId, duration: u64) {
-        let members = self.batches[&batch].status.members.len();
-        let done = self.schedule(self.now + duration, Event::CiDone(Job::Batch(batch)));
-        self.runs.push(RunRecord {
-            batch,
-            members,
-            started_at: self.now,
-            consumed: 0,
-            verdict: None,
-            tree: Vec::new(),
-            landed: false,
-        });
-        let run = self.runs.len() - 1;
-        self.batches.get_mut(&batch).expect("tracked").run = Run::Running { run, done };
-        self.note(|t| TraceEvent::RunBegin { t, batch: batch.0 });
-        self.running += 1;
-        debug_assert!(self.running <= self.config.runners);
-    }
-
-    /// Cancels `pr`'s own CI run, waiting or running, and requests one for
-    /// its current head, drawing the duration from its own clock. The
-    /// caller assigns runners.
-    fn request_pr_ci(&mut self, pr: PrNumber) {
+    /// Cancels `pr`'s own CI run if it has one and starts one on its
+    /// current head, `billed` to the queue or not, drawing the duration
+    /// from its own clock.
+    fn request_pr_ci(&mut self, pr: PrNumber, billed: bool) {
         self.cancel_pr_ci(pr);
-        let (min, max) = (self.config.pr_ci_minutes.min, self.config.pr_ci_minutes.max);
-        let p = self.prs.get_mut(&pr).expect("arrived");
-        let duration = p.own.uniform(min, max) * 60;
-        p.ci = Some(Run::Waiting { duration });
-        self.waiting.push_back(Job::PrCi(pr));
-        self.note(|t| TraceEvent::PrCi { t, pr: pr.0 });
-    }
-
-    /// Drops `pr`'s own CI run if it has one: off the runner queue, or cut
-    /// short with its elapsed time charged. The caller assigns runners.
-    fn cancel_pr_ci(&mut self, pr: PrNumber) {
-        let Some(run) = self.prs.get_mut(&pr).expect("arrived").ci.take() else {
-            return;
-        };
-        match run {
-            Run::Waiting { .. } => self.waiting.retain(|&j| j != Job::PrCi(pr)),
-            Run::Running { run, done } => {
-                self.events.remove(&done);
-                let record = &mut self.pr_ci_runs[run];
-                record.consumed = self.now - record.started_at;
-                record.cancelled = true;
-                self.running -= 1;
-            }
-            Run::Done { .. } => unreachable!("a pull request's run is dropped when it ends"),
-        }
-        self.note(|t| TraceEvent::PrCiEnd {
-            t,
-            pr: pr.0,
-            cancelled: true,
-        });
-    }
-
-    fn start_pr_ci(&mut self, pr: PrNumber, duration: u64) {
+        let minutes = self.config.pr_ci_minutes;
+        let duration = seconds(&mut self.prs.get_mut(&pr).expect("arrived").own, minutes);
         let done = self.schedule(self.now + duration, Event::CiDone(Job::PrCi(pr)));
         let p = self.prs.get_mut(&pr).expect("arrived");
         self.pr_ci_runs.push(PrCiRecord {
@@ -807,16 +789,39 @@ impl World {
             started_at: self.now,
             consumed: 0,
             cancelled: false,
+            billed,
         });
         let run = self.pr_ci_runs.len() - 1;
         p.ci = Some(Run::Running { run, done });
-        self.note(|t| TraceEvent::PrCiBegin { t, pr: pr.0 });
-        self.running += 1;
-        debug_assert!(self.running <= self.config.runners);
+        self.note(|t| TraceEvent::PrCi {
+            t,
+            pr: pr.0,
+            billed,
+        });
+    }
+
+    /// Cuts `pr`'s own CI run short if it has one, its elapsed time
+    /// charged.
+    fn cancel_pr_ci(&mut self, pr: PrNumber) {
+        let Some(run) = self.prs.get_mut(&pr).expect("arrived").ci.take() else {
+            return;
+        };
+        let Run::Running { run, done } = run else {
+            unreachable!("a pull request's run is dropped when it ends");
+        };
+        self.events.remove(&done);
+        let record = &mut self.pr_ci_runs[run];
+        record.consumed = self.now - record.started_at;
+        record.cancelled = true;
+        self.note(|t| TraceEvent::PrCiEnd {
+            t,
+            pr: pr.0,
+            cancelled: true,
+        });
     }
 
     /// Ends `pr`'s own CI run: it passed. Whether the pull request is still
-    /// in the world does not matter; the run was paid for. Under `github` a
+    /// in the world does not matter: the forge ran it to its end. Under `github` a
     /// pull request checking goes on: out for a rebase if it conflicts,
     /// waiting if its base is in the world, else into the queue.
     fn complete_pr_ci(&mut self, pr: PrNumber) {
@@ -831,7 +836,6 @@ impl World {
             pr: pr.0,
             cancelled: false,
         });
-        self.running -= 1;
         let p = &self.prs[&pr];
         if p.present() && p.out == Some(Out::Checking) {
             if p.conflicts_with_trunk {
@@ -845,30 +849,6 @@ impl World {
                 });
             } else {
                 self.admit(pr);
-            }
-        }
-        self.assign_runners();
-    }
-
-    /// Gives every free runner to the head of the runner queue.
-    fn assign_runners(&mut self) {
-        while self.running < self.config.runners {
-            let Some(next) = self.waiting.pop_front() else {
-                break;
-            };
-            match next {
-                Job::Batch(batch) => {
-                    let Run::Waiting { duration } = self.batches[&batch].run else {
-                        unreachable!("a queued batch is waiting");
-                    };
-                    self.start_run(batch, duration);
-                }
-                Job::PrCi(pr) => {
-                    let Some(Run::Waiting { duration }) = self.prs[&pr].ci else {
-                        unreachable!("a queued PR CI run is waiting");
-                    };
-                    self.start_pr_ci(pr, duration);
-                }
             }
         }
     }
@@ -907,8 +887,6 @@ impl World {
             broken,
             flake,
         });
-        self.running -= 1;
-        self.assign_runners();
     }
 
     /// The observation now: the enqueued pull requests. One conflicting
@@ -1024,14 +1002,26 @@ impl Forge for World {
             batch: Some(batch.id),
         };
         self.commits.insert(tip.clone(), tip_commit);
-        let (min, max) = (self.config.ci_minutes.min, self.config.ci_minutes.max);
-        let duration = self.streams.ci.uniform(min, max) * 60;
+        let duration = seconds(&mut self.streams.ci, self.config.ci_minutes);
         let state = BatchState::Testing {
             tip,
             ci: CiStatus::Pending,
         };
         let status = BatchStatus::new(batch.id, batch.base.clone(), members, state);
-        let run = Run::Waiting { duration };
+        let done = self.schedule(self.now + duration, Event::CiDone(Job::Batch(batch.id)));
+        self.runs.push(RunRecord {
+            batch: batch.id,
+            members: batch.prs.len(),
+            started_at: self.now,
+            consumed: 0,
+            verdict: None,
+            tree: Vec::new(),
+            landed: false,
+        });
+        let run = Run::Running {
+            run: self.runs.len() - 1,
+            done,
+        };
         self.batches.insert(batch.id, SimBatch { status, run });
         self.ledger.started(batch.id);
         // This plan's landings ran first, so a base landed in it is trunk.
@@ -1046,8 +1036,6 @@ impl Forge for World {
             base,
             members: batch.prs.iter().map(|p| p.0).collect(),
         });
-        self.waiting.push_back(Job::Batch(batch.id));
-        self.assign_runners();
         Ok(())
     }
 
@@ -1080,16 +1068,27 @@ impl Forge for World {
         for m in &status.members {
             self.leave(m.pr, Exit::Landed);
         }
-        if self.admission == Admission::Github {
-            let landed: BTreeSet<PrNumber> = status.members.iter().map(|m| m.pr).collect();
-            let children: Vec<PrNumber> = self
-                .prs
-                .iter()
-                .filter(|(_, c)| c.present() && c.base().is_some_and(|b| landed.contains(&b)))
-                .map(|(&n, _)| n)
-                .collect();
-            for child in children {
-                self.begin_rebase(child, Rebase::BaseLanded);
+        let landed: BTreeSet<PrNumber> = status.members.iter().map(|m| m.pr).collect();
+        let children: Vec<PrNumber> = self
+            .prs
+            .iter()
+            .filter(|(_, c)| c.present() && c.base().is_some_and(|b| landed.contains(&b)))
+            .map(|(&n, _)| n)
+            .collect();
+        for child in children {
+            match (self.config.pr_ci_on_base_landed, self.admission) {
+                // The author rebases the rest of the stack; the child's run
+                // is billed at the push.
+                (true, Admission::Github) => self.begin_rebase(child, Rebase::BaseLanded),
+                // Its branch already holds what landed: retargeted onto
+                // trunk, it runs its own CI again on its current head.
+                (true, Admission::Label) => self.request_pr_ci(child, true),
+                // Retargeted onto trunk with its head passed, it enters; one
+                // still checking enters when its run passes.
+                (false, Admission::Github) if self.prs[&child].out == Some(Out::Stacked) => {
+                    self.admit(child);
+                }
+                (false, _) => {}
             }
         }
         self.ledger.landed(batch);
@@ -1101,21 +1100,15 @@ impl Forge for World {
         self.ledger.check_retire(batch)?;
         let b = self.batches.remove(&batch).expect("known");
         self.ledger.retired(batch);
-        let cancelled = !matches!(b.run, Run::Done { .. });
+        let cancelled = matches!(b.run, Run::Running { .. });
         self.note(|t| TraceEvent::Retire {
             t,
             batch: batch.0,
             cancelled,
         });
-        match b.run {
-            Run::Waiting { .. } => self.waiting.retain(|&w| w != Job::Batch(batch)),
-            Run::Running { run, done } => {
-                self.events.remove(&done);
-                self.runs[run].consumed = self.now - self.runs[run].started_at;
-                self.running -= 1;
-                self.assign_runners();
-            }
-            Run::Done { .. } => {}
+        if let Run::Running { run, done } = b.run {
+            self.events.remove(&done);
+            self.runs[run].consumed = self.now - self.runs[run].started_at;
         }
         Ok(())
     }

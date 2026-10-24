@@ -36,6 +36,29 @@ impl SplitMix64 {
         let span = max - min + 1;
         min + (self.unit() * span as f64) as u64
     }
+
+    /// An index into `weights` drawn in proportion to its weight. `weights`
+    /// has a positive sum and no negative entry.
+    pub fn weighted(&mut self, weights: &[f64]) -> usize {
+        pick(self.unit() * weights.iter().sum::<f64>(), weights)
+    }
+}
+
+/// The first index at which `weights`' cumulative sum exceeds `target`.
+/// Rounding can leave `target` at the sum, which picks the last positive
+/// weight.
+fn pick(target: f64, weights: &[f64]) -> usize {
+    let mut cumulative = 0.0;
+    for (k, w) in weights.iter().enumerate() {
+        cumulative += w;
+        if target < cumulative {
+            return k;
+        }
+    }
+    weights
+        .iter()
+        .rposition(|w| *w > 0.0)
+        .expect("a positive weight")
 }
 
 /// SplitMix64's output function.
@@ -129,6 +152,30 @@ mod tests {
         assert!(draws.iter().all(|d| (5..=8).contains(d)));
         assert!(draws.contains(&5) && draws.contains(&8));
         assert_eq!(g.uniform(9, 9), 9);
+    }
+
+    #[test]
+    fn weighted_draws_in_proportion_and_never_a_zero_weight() {
+        let mut g = SplitMix64::new(5);
+        let weights = [0.5, 0.0, 0.3, 0.2, 0.0];
+        let n = 100_000;
+        let mut counts = [0usize; 5];
+        for _ in 0..n {
+            counts[g.weighted(&weights)] += 1;
+        }
+        assert_eq!((counts[1], counts[4]), (0, 0));
+        for k in [0, 2, 3] {
+            let share = counts[k] as f64 / n as f64;
+            assert!((share / weights[k] - 1.0).abs() < 0.03, "{k}: {share}");
+        }
+    }
+
+    #[test]
+    fn a_target_at_the_sum_picks_the_last_positive_weight() {
+        let weights = [0.25, 0.75, 0.0];
+        assert_eq!(pick(1.0, &weights), 1);
+        assert_eq!(pick(0.0, &weights), 0);
+        assert_eq!(pick(0.25, &weights), 1);
     }
 
     fn first_eight(g: &SplitMix64) -> Vec<u64> {

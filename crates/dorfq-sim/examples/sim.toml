@@ -1,4 +1,4 @@
-# A week of arrivals on two runners, then a day to drain, four
+# A week of arrivals on two lanes, then a day to drain, four
 # replications. Run it with:
 #   make sim ARGS="run --config $PWD/crates/dorfq-sim/examples/sim.toml"
 
@@ -8,19 +8,22 @@ replications = 4           # independent runs per policy, each from its own seed
 [world]
 hours = 168                # arrivals stop after this many hours
 drain_hours = 24           # then the run drains, and stops at hours + drain_hours at the latest
-arrivals_per_hour = 0.75   # mean rate of new pull requests; arrivals are a Poisson process
-runners = 2                # concurrent CI runs, batch and PR CI alike; further runs wait for a runner, first come first served
+arrivals_per_hour = 0.75   # mean rate of new pull requests; stacks arrive as a Poisson process at this rate over the mean number of pull requests a stack brings
 ci_minutes = { min = 150, max = 210 }   # uniform duration of a batch's CI run
-pr_ci_minutes = { min = 40, max = 60 }   # uniform duration of a pull request's own CI run, a lighter check than the batch run; a pull request is batchable only once it has passed on its current head, and setting it equal to the batch run needs more runners
+pr_ci_minutes = { min = 40, max = 60 }   # uniform duration of a pull request's own CI run, a lighter check than the batch run; it starts when requested and needs no lane; a pull request is batchable only once it has passed on its current head
 rebase_minutes = { min = 15, max = 120 }   # uniform delay from a rebase becoming necessary (a conflict with trunk, or under github admission a landed base) to the author's push of it
+pr_ci_on_base_landed = true   # the repository re-runs a pull request's own CI when the pull request it was based on lands; the queue is billed for the direct children's runs
 p_bad = 0.05               # a pull request breaks on its own against trunk
 p_interact = 0.002         # a pair of pull requests whose queue time overlapped break only together
 p_flake = 0.02             # a run fails for no reason in the tree
-p_conflict = 0.02          # a pull request arrives with a textual conflict against trunk
+p_conflict = 0.02          # a stack arrives with its root conflicting against trunk
 repush_per_hour = 0.0      # per open pull request, the rate at which its author pushes a new head; its intent to land is kept
 withdraw_per_hour = 0.0    # per open pull request, the rate at which its author takes it out of the queue for good
-p_stacked = 0.25           # an arrival is cut from a recent arrival's branch; it stacks on it only while that one is still open
-p_atomic = 0.2             # a stacked arrival lands only with its ancestors
+stack_sizes = [16, 16, 15, 13, 11, 9, 7, 5, 3, 2, 2, 1]   # relative weights of a stack arriving with 1, 2, … 12 pull requests: median 4, mean about 4.2, heavier at the low end
+p_stack_grows = 0.3           # a stack later gets a second burst of pull requests on top
+stack_growth_sizes = [3, 2, 1]   # relative weights of that burst bringing 1, 2 or 3 pull requests: a few more, mean about 1.7
+stack_growth_minutes = { min = 30, max = 480 }   # uniform delay from a stack's arrival to that second burst
+p_atomic = 0.2                # a stack lands only whole
 
 # What pooling costs with no failure response at all.
 [[policy]]
@@ -29,15 +32,16 @@ admission = "label"          # dorfq's: in the queue from arrival, held until it
 kind = "all-at-once"         # the scheduler: one batch of everything ready, and on failure eject every member
 
 # GitHub's merge queue, approximately: each pull request built on top of
-# the ones ahead of it, up to five builds in flight; a failed one is removed
-# once everything ahead of it passed, and the rest rebuilt. Admission is
-# GitHub's: a stacked pull request waits for its base to land, is rebased
-# and re-checked, then enters.
+# the ones ahead of it, as many builds in flight as the columns it is
+# compared against; a failed one is removed once everything ahead of it
+# passed, and the rest rebuilt. Admission is GitHub's: a stacked pull
+# request waits for its base to land, is rebased and re-checked, then
+# enters.
 [[policy]]
 name = "github-like"         # the column's name in the table and on the page
 admission = "github"         # the queue sees a pull request only on trunk, once its own CI passed
 kind = "bisect"              # the scheduler: pipelined batches, a failed one split in halves until the culprit is alone
-lanes = 5                    # most batches in flight at once
+lanes = 2                    # most batches in flight at once
 max_batch = 1                # most pull requests one batch may hold
 
 # The conventional pipelined bisect with memory, pooling up to eight.

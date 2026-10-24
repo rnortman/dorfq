@@ -26,35 +26,51 @@ pub struct WorldConfig {
     pub hours: u64,
     /// The run then drains, and stops at `hours + drain_hours` at the latest.
     pub drain_hours: u64,
-    /// Poisson arrival rate.
+    /// Mean rate of new pull requests. Stacks arrive as a Poisson process
+    /// at this rate divided by the mean number of pull requests a stack
+    /// brings, growth included.
     pub arrivals_per_hour: f64,
-    /// Concurrent CI runs; further runs wait for a runner.
-    pub runners: usize,
     /// Uniform duration of a batch's CI run.
     pub ci_minutes: Minutes,
     /// Uniform duration of a pull request's own CI run, which must pass on
-    /// its current head before a batch may take it; `{ min = 0, max = 0 }`
-    /// costs no runner time, but the run still waits its turn for a runner.
+    /// its current head before a batch may take it. Every run starts the
+    /// instant it is requested; `{ min = 0, max = 0 }` passes at once.
     pub pr_ci_minutes: Minutes,
     /// Uniform delay from a rebase becoming necessary — a conflict, or under
     /// `github` admission a landed base — to the author's push of it.
     pub rebase_minutes: Minutes,
+    /// Whether a landed base makes the pull requests stacked on it run
+    /// their own CI again — under `github` admission through the author's
+    /// rebase of the rest of the stack, under `label` on the direct
+    /// children's current heads. The direct children's runs are billed to
+    /// the queue. Off, a landed base changes nothing for its stack.
+    pub pr_ci_on_base_landed: bool,
     /// A pull request breaks on its own against trunk.
     pub p_bad: f64,
     /// A pair of pull requests whose queue time overlapped break only together.
     pub p_interact: f64,
     /// A run fails for no reason in the tree.
     pub p_flake: f64,
-    /// A pull request arrives with a textual conflict against trunk.
+    /// A stack arrives with its root conflicting against trunk; no other
+    /// pull request can, being cut from the stack's branch.
     pub p_conflict: f64,
     /// Per queued pull request: head changes, intent kept.
     pub repush_per_hour: f64,
     /// Per queued pull request: intent cleared.
     pub withdraw_per_hour: f64,
-    /// An arrival is cut from a recent arrival's branch, and stacks on it
-    /// while that one is queued.
-    pub p_stacked: f64,
-    /// A stacked arrival lands only with its ancestors.
+    /// Relative weights of a stack arriving with 1, 2, … pull requests:
+    /// `stack_sizes[k - 1]` is the weight of size `k`. Non-empty, every
+    /// weight finite and at least 0, their sum positive.
+    pub stack_sizes: Vec<f64>,
+    /// A stack later gets a second burst of pull requests on top of it.
+    pub p_stack_grows: f64,
+    /// Relative weights of that burst bringing 1, 2, … pull requests, as
+    /// `stack_sizes`.
+    pub stack_growth_sizes: Vec<f64>,
+    /// Uniform delay from a stack's arrival to that second burst.
+    pub stack_growth_minutes: Minutes,
+    /// A stack lands only whole: every pull request above its root is
+    /// `Atomic`.
     pub p_atomic: f64,
 }
 
@@ -130,6 +146,47 @@ fn probability(field: &str, p: f64) -> Result<(), SimConfigError> {
     }
 }
 
+/// Checks a table of relative weights: non-empty, every weight finite and
+/// at least 0, their sum positive, and `Σ k·w_k` finite so its mean is.
+fn weights(field: &str, table: &[f64]) -> Result<(), SimConfigError> {
+    if table.is_empty() {
+        return Err(invalid(format!("world.{field}"), "must not be empty"));
+    }
+    if !table.iter().all(|w| w.is_finite() && *w >= 0.0) {
+        return Err(invalid(
+            format!("world.{field}"),
+            "must hold weights that are finite and at least 0",
+        ));
+    }
+    if table.iter().sum::<f64>() <= 0.0 {
+        return Err(invalid(
+            format!("world.{field}"),
+            "must have a positive sum",
+        ));
+    }
+    if !weighted_sum(table).is_finite() {
+        return Err(invalid(
+            format!("world.{field}"),
+            "must have a finite sum of each size times its weight",
+        ));
+    }
+    Ok(())
+}
+
+/// `Σ k·w_k` over a table of weights for sizes 1, 2, ….
+fn weighted_sum(table: &[f64]) -> f64 {
+    table
+        .iter()
+        .zip(1u32..)
+        .map(|(w, k)| f64::from(k) * w)
+        .sum()
+}
+
+/// The mean size `Σ k·w_k / Σ w_k` of a table of weights for sizes 1, 2, ….
+fn mean_size(table: &[f64]) -> f64 {
+    weighted_sum(table) / table.iter().sum::<f64>()
+}
+
 fn rate(field: &str, r: f64) -> Result<(), SimConfigError> {
     if r.is_finite() && r >= 0.0 {
         Ok(())
@@ -197,17 +254,24 @@ impl SimConfig {
 }
 
 impl WorldConfig {
+    /// The mean number of pull requests a stack brings: its first burst
+    /// plus, with probability `p_stack_grows`, its growth.
+    pub fn mean_pull_requests_per_stack(&self) -> f64 {
+        mean_size(&self.stack_sizes) + self.p_stack_grows * mean_size(&self.stack_growth_sizes)
+    }
+
     /// Checks every range.
     pub fn validate(&self) -> Result<(), SimConfigError> {
-        if self.runners == 0 {
-            return Err(invalid("world.runners", "must be at least 1"));
-        }
         let longest_run = minutes("ci_minutes", self.ci_minutes)?;
         let longest_pr_ci = minutes("pr_ci_minutes", self.pr_ci_minutes)?;
         let longest_rebase = minutes("rebase_minutes", self.rebase_minutes)?;
+        let longest_growth = minutes("stack_growth_minutes", self.stack_growth_minutes)?;
         // The clock is u64 seconds: the deadline plus the longest delay must
         // stay below its end, so no delay and no deadline overflows it.
-        let longest = longest_run.max(longest_pr_ci).max(longest_rebase);
+        let longest = longest_run
+            .max(longest_pr_ci)
+            .max(longest_rebase)
+            .max(longest_growth);
         let deadline =
             (u128::from(self.hours) + u128::from(self.drain_hours)) * u128::from(crate::HOUR);
         if deadline + longest >= u128::from(u64::MAX) {
@@ -220,7 +284,9 @@ impl WorldConfig {
         probability("p_interact", self.p_interact)?;
         probability("p_flake", self.p_flake)?;
         probability("p_conflict", self.p_conflict)?;
-        probability("p_stacked", self.p_stacked)?;
+        weights("stack_sizes", &self.stack_sizes)?;
+        probability("p_stack_grows", self.p_stack_grows)?;
+        weights("stack_growth_sizes", &self.stack_growth_sizes)?;
         probability("p_atomic", self.p_atomic)?;
         rate("arrivals_per_hour", self.arrivals_per_hour)?;
         rate("repush_per_hour", self.repush_per_hour)?;
@@ -237,17 +303,20 @@ pub(crate) mod tests {
 hours = 48
 drain_hours = 24
 arrivals_per_hour = 4.0
-runners = 2
 ci_minutes = { min = 150, max = 210 }
 pr_ci_minutes = { min = 40, max = 60 }
 rebase_minutes = { min = 15, max = 120 }
+pr_ci_on_base_landed = true
 p_bad = 0.05
 p_interact = 0.002
 p_flake = 0.02
 p_conflict = 0.02
 repush_per_hour = 0.0
 withdraw_per_hour = 0.0
-p_stacked = 0.25
+stack_sizes = [3.0, 2.0, 1.0]
+p_stack_grows = 0.3
+stack_growth_sizes = [1.0]
+stack_growth_minutes = { min = 30, max = 480 }
 p_atomic = 0.2
 ";
 
@@ -295,11 +364,23 @@ max_batch = 16
         assert_eq!(config.world.hours, 168);
         assert_eq!(config.world.drain_hours, 24);
         assert_eq!(config.world.arrivals_per_hour, 0.75);
-        assert_eq!(config.world.runners, 2);
+        assert!(config.world.pr_ci_on_base_landed);
         assert_eq!(config.world.ci_minutes, Minutes { min: 150, max: 210 });
         assert_eq!(config.world.pr_ci_minutes, Minutes { min: 40, max: 60 });
         assert_eq!(config.world.rebase_minutes, Minutes { min: 15, max: 120 });
-        assert_eq!((config.world.p_stacked, config.world.p_atomic), (0.25, 0.2));
+        let sizes = [
+            16.0, 16.0, 15.0, 13.0, 11.0, 9.0, 7.0, 5.0, 3.0, 2.0, 2.0, 1.0,
+        ];
+        assert_eq!(config.world.stack_sizes, sizes);
+        assert_eq!(config.world.p_stack_grows, 0.3);
+        assert_eq!(config.world.stack_growth_sizes, [3.0, 2.0, 1.0]);
+        assert_eq!(
+            config.world.stack_growth_minutes,
+            Minutes { min: 30, max: 480 }
+        );
+        assert_eq!(config.world.p_atomic, 0.2);
+        let mean = config.world.mean_pull_requests_per_stack();
+        assert!((mean - 4.74).abs() < 1e-9, "{mean}");
         let policies: Vec<_> = config
             .policy
             .iter()
@@ -322,7 +403,7 @@ max_batch = 16
                 (
                     "github-like",
                     &SchedulerConfig::Bisect {
-                        lanes: 5,
+                        lanes: 2,
                         max_batch: 1
                     }
                 ),
@@ -356,7 +437,9 @@ max_batch = 16
     fn the_busy_world_parses_with_its_four_policies() {
         let config = SimConfig::parse(include_str!("../examples/busy.toml")).unwrap();
         assert_eq!(config.world.arrivals_per_hour, 5.0);
-        assert_eq!(config.world.runners, 6);
+        assert!(config.world.pr_ci_on_base_landed);
+        assert_eq!(config.world.stack_sizes.len(), 12);
+        assert_eq!(config.world.stack_growth_sizes, [3.0, 2.0, 1.0]);
         assert_eq!(config.world.pr_ci_minutes, Minutes { min: 15, max: 25 });
         assert_eq!(config.world.rebase_minutes, Minutes { min: 15, max: 120 });
         let admissions: Vec<Admission> = config.policy.iter().map(|p| p.admission).collect();
@@ -374,7 +457,7 @@ max_batch = 16
         assert_eq!(
             config.policy[1].scheduler,
             SchedulerConfig::Bisect {
-                lanes: 5,
+                lanes: 6,
                 max_batch: 1
             }
         );
@@ -416,9 +499,31 @@ max_batch = 16
             value["policy"][1],
             serde_json::json!({
                 "name": "github-like", "admission": "github",
-                "kind": "bisect", "lanes": 5, "max_batch": 1
+                "kind": "bisect", "lanes": 2, "max_batch": 1
             })
         );
+    }
+
+    /// `lanes` is the capacity knob, so a comparison across an example's
+    /// columns holds it equal.
+    #[test]
+    fn every_policy_with_lanes_in_an_example_has_the_same_lanes() {
+        for (name, text) in [
+            ("sim.toml", include_str!("../examples/sim.toml")),
+            ("busy.toml", include_str!("../examples/busy.toml")),
+        ] {
+            let config = SimConfig::parse(text).unwrap();
+            let lanes: BTreeSet<usize> = config
+                .policy
+                .iter()
+                .filter_map(|p| match &p.scheduler {
+                    SchedulerConfig::Bisect { lanes, .. } => Some(*lanes),
+                    SchedulerConfig::Bayes(bayes) => Some(bayes.lanes),
+                    SchedulerConfig::AllAtOnce {} => None,
+                })
+                .collect();
+            assert_eq!(lanes.len(), 1, "{name}: {lanes:?}");
+        }
     }
 
     /// The report page shows an example's text as its parameters, so each
@@ -444,6 +549,21 @@ max_batch = 16
     }
 
     #[test]
+    fn the_mean_stack_counts_its_growth_at_its_probability() {
+        let mut world = SimConfig::parse(&file(WORLD, POLICIES)).unwrap().world;
+        world.stack_sizes = vec![1.0];
+        world.p_stack_grows = 0.0;
+        for growth in [vec![1.0], vec![0.0, 0.0, 5.0]] {
+            world.stack_growth_sizes = growth;
+            assert_eq!(world.mean_pull_requests_per_stack(), 1.0);
+        }
+        world.stack_sizes = vec![1.0, 1.0];
+        world.stack_growth_sizes = vec![0.0, 1.0];
+        world.p_stack_grows = 0.5;
+        assert_eq!(world.mean_pull_requests_per_stack(), 2.5);
+    }
+
+    #[test]
     fn a_world_without_flakes_bad_pull_requests_or_interactions_is_legal() {
         let world = WORLD
             .replace("p_bad = 0.05", "p_bad = 0.0")
@@ -460,18 +580,35 @@ max_batch = 16
             ("p_interact", "-0.1"),
             ("p_flake", "2.0"),
             ("p_conflict", "-1.0"),
-            ("p_stacked", "1.1"),
+            ("p_stack_grows", "1.1"),
             ("p_atomic", "-0.5"),
-            ("runners", "0"),
             ("arrivals_per_hour", "-1.0"),
             ("repush_per_hour", "-1.0"),
             ("withdraw_per_hour", "inf"),
             ("ci_minutes", "{ min = 3, max = 2 }"),
             ("pr_ci_minutes", "{ min = 3, max = 2 }"),
             ("rebase_minutes", "{ min = 3, max = 2 }"),
+            ("stack_growth_minutes", "{ min = 3, max = 2 }"),
         ] {
             let message = rejected(&with(field, value));
             assert!(message.contains(&format!("world.{field}")), "{message}");
+        }
+        for field in ["stack_sizes", "stack_growth_sizes"] {
+            for value in [
+                "[]",
+                "[1.0, -0.5]",
+                "[1.0, inf]",
+                "[1.0, nan]",
+                "[0.0, 0.0]",
+                "[1e308, 1e308]",
+                "[0.0, 1e308]",
+            ] {
+                let message = rejected(&with(field, value));
+                assert!(
+                    message.contains(&format!("world.{field} ")),
+                    "{field} = {value}: {message}"
+                );
+            }
         }
         let zero = file(WORLD, POLICIES).replace("replications = 4", "replications = 0");
         assert!(rejected(&zero).contains("replications"));
@@ -500,7 +637,12 @@ max_batch = 16
         ));
         assert!(rebase.contains("world.rebase_minutes"), "{rebase}");
         // Each fits on its own, but not after the deadline.
-        for field in ["pr_ci_minutes", "rebase_minutes"] {
+        let growth = rejected(&with(
+            "stack_growth_minutes",
+            "{ min = 0, max = 18446744073709551615 }",
+        ));
+        assert!(growth.contains("world.stack_growth_minutes"), "{growth}");
+        for field in ["pr_ci_minutes", "rebase_minutes", "stack_growth_minutes"] {
             let late = rejected(&with(field, "{ min = 0, max = 307445734561825860 }"));
             assert!(late.contains("world.hours"), "{field}: {late}");
         }
@@ -510,13 +652,19 @@ max_batch = 16
 
     #[test]
     fn unknown_and_missing_fields_are_named() {
-        let unknown = file(&format!("{WORLD}speed = 3\n"), POLICIES);
-        assert!(rejected(&unknown).contains("speed"));
+        for unknown in ["speed = 3", "runners = 2", "p_stacked = 0.25"] {
+            let name = unknown.split(' ').next().unwrap();
+            let text = file(&format!("{WORLD}{unknown}\n"), POLICIES);
+            assert!(rejected(&text).contains(name), "{name}");
+        }
         for field in [
-            "runners",
             "pr_ci_minutes",
             "rebase_minutes",
-            "p_stacked",
+            "pr_ci_on_base_landed",
+            "stack_sizes",
+            "p_stack_grows",
+            "stack_growth_sizes",
+            "stack_growth_minutes",
             "p_atomic",
         ] {
             let line = WORLD.lines().find(|l| l.starts_with(&format!("{field} ")));

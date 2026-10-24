@@ -58,7 +58,7 @@
       </div>
       <input type="range" id="scrubber" min="0" max="0" value="0" step="1" aria-label="time">
       <div class="counters" id="counters"></div>
-      <div class="stage">
+      <div class="stage" id="stage">
         <div class="canvas-wrap">
           <canvas id="canvas"></canvas>
           <div class="tooltip" id="tooltip" hidden></div>
@@ -70,13 +70,10 @@
       </div>
       <p class="legend">
         <span class="sw running"></span>running
-        <span class="sw waiting"></span>waiting for a runner
         <span class="sw passed"></span>passed
         <span class="sw failed"></span>failed
         <span class="sw flake"></span>failed on a flake
         <span class="sw cancelled"></span>cancelled
-        <span class="sw prci"></span>a pull request's own CI run
-        <span class="sw prci-waiting"></span>its run waiting for a runner
         &nbsp;·&nbsp; chips: <span class="chip-k idle">7</span> queued
         <span class="chip-k held">7</span> held until its own CI passes
         <span class="chip-k outside">7</span> outside the queue (PR CI, rebasing, out with base, waiting for base)
