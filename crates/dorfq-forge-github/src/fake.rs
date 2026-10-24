@@ -55,6 +55,12 @@ pub struct State {
     /// A ref moved to a sha just before the next update of that ref, as a
     /// push racing the forge would.
     pub interpose: Option<(String, Sha)>,
+    /// A ref whose next update applies and then fails `Transient`, as a
+    /// response lost in transit would.
+    pub lose_update: Option<String>,
+    /// A pull request whose next base change applies and then fails
+    /// `Transient`, as a response lost in transit would.
+    pub lose_set_base: Option<u64>,
     /// Pull requests every listing returns a second time, at the given head,
     /// as a page boundary shifting under a paginated read does.
     pub listed_again: Vec<(u64, Sha)>,
@@ -327,6 +333,12 @@ impl GitHubApi for FakeGitHub {
             return Ok(RefUpdate::NotFastForward);
         }
         state.refs.insert(name.to_owned(), sha.clone());
+        if state.lose_update.as_deref() == Some(name) {
+            state.lose_update = None;
+            return Err(ApiError::Transient(
+                format!("update_ref {name}: response lost").into(),
+            ));
+        }
         Ok(RefUpdate::Updated)
     }
 
@@ -458,6 +470,12 @@ impl GitHubApi for FakeGitHub {
             .ok_or_else(|| permanent(format!("set_base {}: no such pull request", number.0)))?;
         pr.base = base.to_owned();
         pr.mergeable = None;
+        if state.lose_set_base == Some(number.0) {
+            state.lose_set_base = None;
+            return Err(ApiError::Transient(
+                format!("set_base {}: response lost", number.0).into(),
+            ));
+        }
         Ok(())
     }
 

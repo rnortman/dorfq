@@ -524,23 +524,60 @@ fn set_base_patches_the_pull_request() {
 
 #[test]
 fn set_base_maps_a_refusal() {
+    let no_commits = "There are no new commits between base branch 'main' and head branch 'g'";
     let cases = [
         (
-            status(422, json!({ "message": "Validation Failed" })),
+            status(
+                422,
+                json!({
+                    "message": "Validation Failed",
+                    "errors": [{
+                        "message": no_commits,
+                        "resource": "PullRequest",
+                        "field": "base",
+                        "code": "invalid",
+                    }],
+                }),
+            ),
             false,
+            Some(format!("HTTP 422: Validation Failed: {no_commits}")),
+        ),
+        (
+            status(
+                422,
+                json!({ "message": "Validation Failed", "errors": [{ "code": "invalid" }] }),
+            ),
+            false,
+            Some("HTTP 422: Validation Failed: invalid".to_owned()),
+        ),
+        (
+            status(
+                422,
+                json!({
+                    "message": "Validation Failed",
+                    "errors": ["base is wrong", { "field": "base" }, { "code": "invalid" }],
+                }),
+            ),
+            false,
+            Some("HTTP 422: Validation Failed: base is wrong; invalid".to_owned()),
         ),
         (
             status(403, json!({ "message": "Resource not accessible" })),
             false,
+            Some("HTTP 403: Resource not accessible".to_owned()),
         ),
-        (status(502, Value::Null), true),
+        (status(502, Value::Null), true, None),
     ];
-    for (canned, transient) in cases {
+    for (canned, transient, text) in cases {
         let code = canned.status;
         let (mut api, _) = client(vec![route("PATCH", "/pulls/7", canned)]);
         let error = api.set_base(PrNumber(7), "main").unwrap_err();
         assert_eq!(is_transient(&error), transient, "HTTP {code}: {error}");
-        assert!(error.to_string().contains("PATCH /pulls/7"), "{error}");
+        let error = error.to_string();
+        assert!(error.contains("PATCH /pulls/7"), "{error}");
+        if let Some(text) = text {
+            assert!(error.ends_with(&text), "{error}");
+        }
     }
 }
 

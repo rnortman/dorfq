@@ -2196,6 +2196,21 @@ fn a_child_whose_base_moved_waits_on_it_until_rebased() {
     assert_eq!(statuses(&mut forge), [PrStatus::Ready, PrStatus::Ready]);
 }
 
+/// Asserts that, among the calls from index `since` on, `pr` was moved onto
+/// trunk before trunk's ref was updated.
+fn moved_before_the_fast_forward(fake: &FakeGitHub, pr: u64, since: usize) {
+    let calls = fake.state().calls[since..].to_vec();
+    let moved = calls
+        .iter()
+        .position(|c| *c == format!("set_base {pr} main"))
+        .unwrap_or_else(|| panic!("#{pr} never moved: {calls:?}"));
+    let fast_forward = calls
+        .iter()
+        .position(|c| c.starts_with("update_ref refs/heads/main "))
+        .unwrap_or_else(|| panic!("trunk never updated: {calls:?}"));
+    assert!(moved < fast_forward, "{calls:?}");
+}
+
 #[test]
 fn a_stack_in_one_batch_builds_tests_and_lands() {
     let fake = FakeGitHub::new();
@@ -2221,87 +2236,235 @@ fn a_stack_in_one_batch_builds_tests_and_lands() {
     assert!(fake.pr(1).labels.is_empty());
     assert!(fake.pr(2).labels.is_empty());
     assert_eq!(fake.calls_to(&["set_base"]), ["set_base 2 main"]);
+    moved_before_the_fast_forward(&fake, 2, 0);
     assert_eq!(fake.pr(2).base, "main");
     assert_eq!(sink.lines(), landed_lines(&tip, &[1, 2]));
 }
 
 #[test]
-fn a_child_closed_before_its_landing_is_completed_is_not_retargeted() {
-    for close in [false, true] {
-        let fake = FakeGitHub::new();
-        queued(&fake, 1);
-        stacked(&fake, 2, 1);
-        let (mut forge, sink) = observed(&fake);
-        forge
-            .start_batch(&start(1, &fake.trunk(), &[1, 2]))
-            .unwrap();
-        let tip = fake.get(&batch_ref(1)).expect("published");
-        passed(&fake, &tip);
-        forge.observe().unwrap();
-        fake.fail_on("create_commit", "state: landed", Failure::Transient);
-        assert!(forge.land(BatchId(1)).is_err());
-        let observation = forge.observe().unwrap();
-        assert_eq!(
-            bases_of(&observation),
-            [(1, PrBase::Trunk), (2, PrBase::Trunk)]
-        );
-        sink.0.borrow_mut().clear();
-        if close {
-            fake.pr(2).open = false;
-        }
+fn a_failed_retarget_at_landing_leaves_the_member_landed() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    stacked(&fake, 2, 1);
+    stacked(&fake, 3, 2);
+    let (mut forge, sink, tip) = landed_with_the_bases_move_failed(&fake, &[1, 2, 3]);
 
-        forge.retire(BatchId(1)).unwrap();
-
-        let expected: &[&str] = if close { &[] } else { &["set_base 2 main"] };
-        assert_eq!(fake.calls_to(&["set_base"]), expected, "close: {close}");
-        forge.observe().unwrap();
-        assert_eq!(sink.lines(), landed_lines(&tip, &[1, 2]), "close: {close}");
-    }
+    assert_eq!(
+        record_of(&fake, 1).state,
+        RecordState::Landed { tip: tip.clone() }
+    );
+    assert_eq!(fake.pr(3).base, "main", "the next member moved");
+    moved_before_the_fast_forward(&fake, 3, 0);
+    assert!(fake.pr(3).labels.is_empty());
+    let observation = forge.observe().unwrap();
+    assert_eq!(
+        observation.batches[0].state,
+        BatchState::Landed { tip: tip.clone() }
+    );
+    assert!(observation.prs.is_empty(), "{:?}", observation.prs);
+    assert!(
+        observation
+            .departed
+            .iter()
+            .all(|d| d.how == Departed::Landed { batch: BatchId(1) }),
+        "{:?}",
+        observation.departed
+    );
+    forge.retire(BatchId(1)).unwrap();
+    assert_eq!(fake.get(&batch_ref(1)), None);
+    let mut expected: Vec<String> = [1, 2, 3]
+        .map(|n| format!("message to pr {n}: testing in batch 1"))
+        .into();
+    expected.extend(landed_lines(&tip, &[1, 2, 3]));
+    assert_eq!(sink.lines(), expected);
 }
 
 #[test]
-fn a_failed_retarget_at_landing_leaves_the_member_landed() {
-    for kind in [Failure::Permanent, Failure::Transient] {
-        let fake = FakeGitHub::new();
-        queued(&fake, 1);
-        stacked(&fake, 2, 1);
-        stacked(&fake, 3, 2);
-        let (mut forge, sink, tip) = landed_with_the_bases_move_failed(&fake, &[1, 2, 3], kind);
+fn a_transient_retarget_at_landing_fails_the_landing_and_the_next_lands() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    stacked(&fake, 2, 1);
+    stacked(&fake, 3, 2);
+    let (mut forge, sink) = observed(&fake);
+    let base = fake.trunk();
+    forge.start_batch(&start(1, &base, &[1, 2, 3])).unwrap();
+    let tip = fake.get(&batch_ref(1)).expect("published");
+    passed(&fake, &tip);
+    forge.observe().unwrap();
+    sink.0.borrow_mut().clear();
+    fake.fail_on("set_base", "3", Failure::Transient);
 
-        assert_eq!(
-            record_of(&fake, 1).state,
-            RecordState::Landed { tip: tip.clone() },
-            "{kind:?}"
-        );
-        assert_eq!(fake.pr(3).base, "main", "{kind:?}: the next member moved");
-        assert!(fake.pr(3).labels.is_empty(), "{kind:?}");
-        let observation = forge.observe().unwrap();
-        assert_eq!(
-            observation.batches[0].state,
-            BatchState::Landed { tip: tip.clone() },
-            "{kind:?}"
-        );
-        assert!(
-            observation.prs.is_empty(),
-            "{kind:?}: {:?}",
-            observation.prs
-        );
-        assert!(
-            observation
-                .departed
-                .iter()
-                .all(|d| d.how == Departed::Landed { batch: BatchId(1) }),
-            "{kind:?}: {:?}",
-            observation.departed
-        );
-        forge.retire(BatchId(1)).unwrap();
-        assert_eq!(fake.get(&batch_ref(1)), None, "{kind:?}");
-        let mut expected: Vec<String> = [1, 2, 3]
-            .map(|n| format!("message to pr {n}: testing in batch 1"))
-            .into();
-        expected.extend(landed_lines(&tip, &[1, 2, 3]));
-        assert_eq!(sink.lines(), expected, "{kind:?}");
-    }
+    let error = forge.land(BatchId(1)).unwrap_err();
+    assert!(matches!(error, ForgeError::Transient(_)), "{error}");
+    assert_eq!(fake.trunk(), base);
+    assert_eq!(
+        record_of(&fake, 1).state,
+        RecordState::Landing { tip: tip.clone() }
+    );
+    assert!(
+        fake.calls_to(&["update_ref"])
+            .iter()
+            .all(|c| !c.starts_with("update_ref refs/heads/main "))
+    );
+    assert_eq!(fake.pr(2).base, "pr-1", "moved back");
+    assert_eq!(fake.pr(3).base, "pr-2");
+    let observation = forge.observe().unwrap();
+    assert_eq!(
+        bases_of(&observation),
+        [(1, PrBase::Trunk), (2, on(1)), (3, on(2))]
+    );
+    assert_eq!(
+        observation.batches[0].state,
+        BatchState::Testing {
+            tip: tip.clone(),
+            ci: CiStatus::Passed
+        }
+    );
+
+    forge.land(BatchId(1)).unwrap();
+
+    assert_eq!(fake.trunk(), tip);
+    assert_eq!(
+        fake.calls_to(&["set_base"]),
+        [
+            "set_base 2 main",
+            "set_base 3 main",
+            "set_base 2 pr-1",
+            "set_base 3 pr-2",
+            "set_base 2 main",
+            "set_base 3 main"
+        ]
+    );
+    let observation = forge.observe().unwrap();
+    assert!(observation.prs.is_empty(), "{:?}", observation.prs);
+    assert_eq!(
+        observation.departed,
+        [1, 2, 3].map(|n| Departure::new(
+            PrNumber(n),
+            fake.pr(n).head.clone(),
+            Departed::Landed { batch: BatchId(1) }
+        ))
+    );
+    assert_eq!(sink.lines(), landed_lines(&tip, &[1, 2, 3]));
+}
+
+#[test]
+fn a_refused_fast_forward_after_the_moves_puts_the_stack_back() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    stacked(&fake, 2, 1);
+    let (mut forge, sink) = observed(&fake);
+    forge
+        .start_batch(&start(1, &fake.trunk(), &[1, 2]))
+        .unwrap();
+    let tip = fake.get(&batch_ref(1)).expect("published");
+    passed(&fake, &tip);
+    forge.observe().unwrap();
+    sink.0.borrow_mut().clear();
+    let moved = fake.commit(&[fake.trunk()]);
+    fake.state().interpose = Some((branch("main"), moved.clone()));
+
+    forge.land(BatchId(1)).unwrap();
+
+    let reason = LandRefusal::TrunkMoved { trunk: moved };
+    assert_eq!(
+        record_of(&fake, 1).state,
+        RecordState::Refused {
+            tip: tip.clone(),
+            reason: reason.clone()
+        }
+    );
+    assert_eq!(
+        fake.calls_to(&["set_base"]),
+        ["set_base 2 main", "set_base 2 pr-1"]
+    );
+    moved_before_the_fast_forward(&fake, 2, 0);
+    assert_eq!(fake.pr(2).base, "pr-1");
+    assert_eq!(fake.pr(1).labels, ["queue"]);
+    assert_eq!(fake.pr(2).labels, ["queue"]);
+    let observation = forge.observe().unwrap();
+    assert_eq!(bases_of(&observation), [(1, PrBase::Trunk), (2, on(1))]);
+    assert_eq!(
+        observation.batches[0].state,
+        BatchState::LandRefused { tip, reason }
+    );
+}
+
+/// A forge that has observed the stack 2 on 1 tested in batch 1, passed.
+fn a_stack_ready_to_land(fake: &FakeGitHub) -> (GitHubForge, Sha) {
+    queued(fake, 1);
+    stacked(fake, 2, 1);
+    let (mut forge, _) = observed(fake);
+    forge
+        .start_batch(&start(1, &fake.trunk(), &[1, 2]))
+        .unwrap();
+    let tip = fake.get(&batch_ref(1)).expect("published");
+    passed(fake, &tip);
+    forge.observe().unwrap();
+    (forge, tip)
+}
+
+#[test]
+fn a_child_moved_back_after_a_failed_fast_forward_waits_on_its_base_moving() {
+    let fake = FakeGitHub::new();
+    let (mut forge, _) = a_stack_ready_to_land(&fake);
+    let base = fake.trunk();
+    fake.fail_on("update_ref", "refs/heads/main ", Failure::Transient);
+
+    let error = forge.land(BatchId(1)).unwrap_err();
+
+    assert!(matches!(error, ForgeError::Transient(_)), "{error}");
+    assert_eq!(fake.trunk(), base);
+    assert_eq!(fake.pr(2).base, "pr-1", "moved back");
+    let head = fake.pr(1).head.clone();
+    let pushed = fake.commit(&[head]);
+    passed(&fake, &pushed);
+    fake.push(1, &pushed);
+    let observation = forge.observe().unwrap();
+    assert_eq!(bases_of(&observation), [(1, PrBase::Trunk), (2, on(1))]);
+    assert_eq!(
+        observation.prs[1].status,
+        waiting(&[
+            Hold::MergeabilityUnknown,
+            Hold::AncestorMoved { pr: PrNumber(1) }
+        ])
+    );
+}
+
+#[test]
+fn a_move_whose_response_is_lost_is_put_back() {
+    let fake = FakeGitHub::new();
+    let (mut forge, _) = a_stack_ready_to_land(&fake);
+    let base = fake.trunk();
+    fake.state().lose_set_base = Some(2);
+
+    let error = forge.land(BatchId(1)).unwrap_err();
+
+    assert!(matches!(error, ForgeError::Transient(_)), "{error}");
+    assert_eq!(fake.trunk(), base);
+    assert_eq!(
+        fake.calls_to(&["set_base"]),
+        ["set_base 2 main", "set_base 2 pr-1"]
+    );
+    assert_eq!(fake.pr(2).base, "pr-1", "moved back");
+    let observation = forge.observe().unwrap();
+    assert_eq!(bases_of(&observation), [(1, PrBase::Trunk), (2, on(1))]);
+}
+
+#[test]
+fn a_fast_forward_whose_response_is_lost_leaves_the_moves_in_place() {
+    let fake = FakeGitHub::new();
+    let (mut forge, tip) = a_stack_ready_to_land(&fake);
+    fake.state().lose_update = Some(branch("main"));
+
+    let error = forge.land(BatchId(1)).unwrap_err();
+
+    assert!(matches!(error, ForgeError::Transient(_)), "{error}");
+    assert_eq!(fake.trunk(), tip);
+    assert_eq!(fake.calls_to(&["set_base"]), ["set_base 2 main"]);
+    assert_eq!(fake.pr(2).base, "main");
+    let observation = forge.observe().unwrap();
+    assert_eq!(observation.batches[0].state, BatchState::Landed { tip });
 }
 
 #[test]
@@ -2330,6 +2493,7 @@ fn land_refuses_a_child_whose_base_changed_since_the_observation() {
             panic!("{how}: not refused: {:?}", record_of(&fake, 1).state);
         };
         assert_eq!(reason, LandRefusal::MemberGone { pr: PrNumber(2) }, "{how}");
+        assert!(fake.calls_to(&["set_base"]).is_empty(), "{how}");
     }
 }
 
@@ -2725,13 +2889,12 @@ fn a_child_whose_bases_branch_was_rewound_onto_trunk_is_not_moved() {
 }
 
 /// Batch 1 of `members`, among them 1 and 2 (stacked on 1), built, passed,
-/// observed and landed, with `set_base` for 2 failing `kind` at landing; the
+/// observed and landed, with GitHub refusing to move 2 onto trunk; the
 /// forge, its sink and the tip. Pull requests the caller opened beforehand
 /// are observed too.
 fn landed_with_the_bases_move_failed(
     fake: &FakeGitHub,
     members: &[u64],
-    kind: Failure,
 ) -> (GitHubForge, Buffer, Sha) {
     let (mut forge, sink) = observed(fake);
     forge
@@ -2740,7 +2903,7 @@ fn landed_with_the_bases_move_failed(
     let tip = fake.get(&batch_ref(1)).expect("published");
     passed(fake, &tip);
     forge.observe().unwrap();
-    fake.fail_on("set_base", "2", kind);
+    fake.fail_on("set_base", "2", Failure::Permanent);
     forge.land(BatchId(1)).unwrap();
     assert_eq!(fake.trunk(), tip);
     assert_eq!(fake.pr(2).base, "pr-1");
@@ -2750,16 +2913,12 @@ fn landed_with_the_bases_move_failed(
 
 #[test]
 fn a_child_outside_the_batch_whose_bases_move_failed_is_moved_onto_trunk() {
-    for (how, kind) in [
-        ("permanent", Failure::Permanent),
-        ("transient", Failure::Transient),
-        ("re-pushed", Failure::Permanent),
-    ] {
+    for how in ["permanent", "re-pushed"] {
         let fake = FakeGitHub::new();
         queued(&fake, 1);
         stacked(&fake, 2, 1);
         stacked(&fake, 3, 2);
-        let (mut forge, sink, tip) = landed_with_the_bases_move_failed(&fake, &[1, 2], kind);
+        let (mut forge, sink, tip) = landed_with_the_bases_move_failed(&fake, &[1, 2]);
         let landed_heads = [1, 2].map(|n| fake.pr(n).head.clone());
         if how == "re-pushed" {
             let next = fake.commit(std::slice::from_ref(&landed_heads[1]));
@@ -2834,8 +2993,7 @@ fn a_child_never_queued_on_a_landed_base_whose_move_failed_is_told_to_retarget()
         if how == "restart" {
             stacked(&fake, 3, 2);
         }
-        let (landed, sink, _) =
-            landed_with_the_bases_move_failed(&fake, &[1, 2], Failure::Permanent);
+        let (landed, sink, _) = landed_with_the_bases_move_failed(&fake, &[1, 2]);
         let (mut forge, sink) = if how == "restart" {
             forge(&fake)
         } else {
@@ -2872,8 +3030,8 @@ fn a_child_never_queued_on_a_landed_base_whose_move_failed_is_told_to_retarget()
 }
 
 /// Batch 1 of 1 and 2 on trunk and 3 stacked on 1, passed and observed, its
-/// landing cut short at 2's label with every retarget refused; the forge
-/// that landed it, its sink, and the tip.
+/// landing cut short at 2's label after GitHub refused to move 3 onto trunk;
+/// the forge that landed it, its sink, and the tip.
 fn landing_cut_short_at_a_trunk_member() -> (FakeGitHub, GitHubForge, Buffer, Sha) {
     let fake = FakeGitHub::new();
     queued(&fake, 2);
@@ -2887,11 +3045,10 @@ fn landing_cut_short_at_a_trunk_member() -> (FakeGitHub, GitHubForge, Buffer, Sh
     forge.observe().unwrap();
     sink.0.borrow_mut().clear();
     fake.fail_on("remove_label", "2", Failure::Transient);
-    for _ in 0..3 {
-        fake.fail("set_base", Failure::Permanent);
-    }
+    fake.fail_on("set_base", "3", Failure::Permanent);
     assert!(forge.land(BatchId(1)).is_err());
     assert_eq!(fake.trunk(), tip);
+    assert_eq!(fake.calls_to(&["set_base"]), ["set_base 3 main"]);
     (fake, forge, sink, tip)
 }
 
@@ -2926,18 +3083,15 @@ fn a_landed_member_still_labelled_is_reported_on_trunk_and_completed_at_retire()
             )]
         };
         assert_eq!(observation.departed, departed, "restart: {restart}");
-        assert!(
-            fake.calls_to(&["set_base"]).is_empty(),
-            "restart: {restart}"
-        );
 
         forge.retire(BatchId(1)).unwrap();
         assert!(fake.pr(2).labels.is_empty(), "restart: {restart}");
         assert!(fake.pr(3).labels.is_empty(), "restart: {restart}");
+        assert_eq!(fake.pr(3).base, "pr-1", "restart: {restart}");
         assert_eq!(
             fake.calls_to(&["set_base"]),
             ["set_base 3 main"],
-            "restart: {restart}"
+            "restart: {restart}: the one move is the refused one at landing"
         );
         let observation = forge.observe().unwrap();
         assert_eq!(
@@ -2986,9 +3140,17 @@ fn a_child_landed_after_its_base_is_moved_onto_trunk_and_lands_as_usual() {
     passed(&fake, &second);
     forge.observe().unwrap();
     sink.0.borrow_mut().clear();
+    let calls_before = fake.state().calls.len();
     forge.land(BatchId(2)).unwrap();
 
     assert_eq!(fake.trunk(), second);
+    let calls = fake.state().calls[calls_before..].to_vec();
+    let moves: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.starts_with("set_base "))
+        .collect();
+    assert_eq!(moves, ["set_base 3 main"]);
+    moved_before_the_fast_forward(&fake, 3, calls_before);
     assert_eq!(sink.lines(), landed_lines(&second, &[2, 3]));
     assert!(
         !sink.lines().iter().any(|l| l.contains("blocked")),
@@ -3089,7 +3251,7 @@ fn a_child_the_listing_left_out_on_a_landed_base_waits_for_the_listing() {
     queued(&fake, 1);
     stacked(&fake, 2, 1);
     stacked(&fake, 3, 2);
-    let (mut forge, _, _) = landed_with_the_bases_move_failed(&fake, &[1, 2], Failure::Permanent);
+    let (mut forge, _, _) = landed_with_the_bases_move_failed(&fake, &[1, 2]);
     fake.state().unlisted.insert(3);
     let writes_before = fake.writes().len();
 
