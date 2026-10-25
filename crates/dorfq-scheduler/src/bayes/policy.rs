@@ -51,6 +51,9 @@ pub(super) fn landing_members<'a>(
 /// For each cause some run singles out, the last such run in `runs`: the
 /// cause's posterior is at least `eject_above` and every other cause of the
 /// run is below `others_below`.
+// TODO(bayes-atomic-unit-resolution): the members of an `Atomic` unit share
+// every run, so when the unit's runs fail their `Bad` causes keep equal
+// posteriors and none is ever singled out.
 fn singled_out<'a>(
     runs: impl Iterator<Item = (Option<BatchId>, &'a BTreeSet<Cause>)>,
     posterior: impl Fn(Cause) -> f64,
@@ -73,6 +76,8 @@ fn singled_out<'a>(
 }
 
 /// The pull request ejected for a singled-out cause.
+// TODO(bayes-pair-eject-timing): a pair singled out while both are queued
+// ejects the newer at once, before either is broken against trunk.
 fn culprit(cause: Cause) -> PrNumber {
     match cause {
         Cause::Bad(pr) => pr,

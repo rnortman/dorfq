@@ -5,12 +5,12 @@ fn config(p_interact: f64, p_flake: f64) -> WorldConfig {
     WorldConfig {
         hours: 1,
         drain_hours: 1,
+        stall_hours: 1,
         arrivals_per_hour: 0.0,
         ci_minutes: Minutes { min: 10, max: 10 },
         pr_ci_minutes: Minutes { min: 0, max: 0 },
         rebase_minutes: Minutes { min: 0, max: 0 },
         pr_ci_on_base_landed: true,
-        p_bad: 0.0,
         p_interact,
         p_flake,
         p_conflict: 0.0,
@@ -77,15 +77,34 @@ fn world(p_interact: f64, p_flake: f64) -> World {
 
 /// A pull request arriving now with the given truth; its own CI passes
 /// now when it is instant.
-fn add(w: &mut World, bad: bool, conflicts: bool, key: u64) -> u64 {
+fn add(w: &mut World, conflicts: bool, key: u64) -> u64 {
     w.fire(Event::Arrival);
     let number = *w.prs.last_key_value().expect("arrived").0;
     let pr = w.prs.get_mut(&number).expect("arrived");
-    pr.bad = bad;
     pr.conflicts_with_trunk = conflicts;
     pr.key = key;
     settle(w);
     number.0
+}
+
+/// Breaks `pr` against trunk now, as a landing that conflicts with it
+/// would.
+fn break_now(w: &mut World, pr: u64) {
+    let now = w.now();
+    w.prs.get_mut(&PrNumber(pr)).expect("arrived").broke_at = Some(now);
+}
+
+/// Lands `prs` alone on trunk in one plan, its run cut to an instant.
+fn land_now(w: &mut World, id: u64, prs: &[u64]) {
+    let trunk = w.observe().unwrap().trunk;
+    start(w, id, &trunk, prs).unwrap();
+    let Run::Running { done, .. } = w.batches[&BatchId(id)].run else {
+        panic!("batch {id} runs");
+    };
+    w.events.remove(&done);
+    w.complete(BatchId(id));
+    w.observe().unwrap();
+    w.land(BatchId(id)).unwrap();
 }
 
 /// Fires every event due now.
@@ -156,8 +175,8 @@ fn violation_of(result: Result<(), ForgeError>) -> String {
     }
 }
 
-/// Keys `(a, b, c)` such that only `a` and `b` interact at `p = 0.5`.
-fn only_first_two_interact() -> (u64, u64, u64) {
+/// Keys `(a, b, c)` such that only `a` and `b` conflict at `p = 0.5`.
+fn only_first_two_conflict() -> (u64, u64, u64) {
     let inter = |x, y| unit(mix(x, y)) < 0.5;
     let b = (2..).find(|&b| inter(1, b)).unwrap();
     let c = (2..).find(|&c| !inter(1, c) && !inter(b, c)).unwrap();
@@ -185,8 +204,9 @@ fn an_arrival_appears_on_trunk_with_its_drawn_mergeability() {
 #[test]
 fn a_run_fails_for_a_bad_member_and_passes_without_one() {
     let mut w = world(0.0, 0.0);
-    let good = add(&mut w, false, false, 1);
-    let bad = add(&mut w, true, false, 2);
+    let good = add(&mut w, false, 1);
+    let bad = add(&mut w, false, 2);
+    break_now(&mut w, bad);
     assert_eq!(verdict_of(&mut w, 1, &[good]), CiStatus::Passed);
     assert!(matches!(
         verdict_of(&mut w, 2, &[good, bad]),
@@ -206,12 +226,12 @@ fn a_run_fails_for_a_bad_member_and_passes_without_one() {
 }
 
 #[test]
-fn a_run_fails_for_an_interacting_own_member_pair() {
-    let (a, b, c) = only_first_two_interact();
+fn a_run_fails_for_a_conflicting_own_member_pair() {
+    let (a, b, c) = only_first_two_conflict();
     let mut w = world(0.5, 0.0);
-    let pa = add(&mut w, false, false, a);
-    let pb = add(&mut w, false, false, b);
-    let pc = add(&mut w, false, false, c);
+    let pa = add(&mut w, false, a);
+    let pb = add(&mut w, false, b);
+    let pc = add(&mut w, false, c);
     assert_eq!(verdict_of(&mut w, 1, &[pa, pc]), CiStatus::Passed);
     assert!(matches!(
         verdict_of(&mut w, 2, &[pa, pb]),
@@ -220,33 +240,76 @@ fn a_run_fails_for_an_interacting_own_member_pair() {
 }
 
 #[test]
-fn a_run_fails_for_a_member_interacting_with_a_landed_pull_request() {
+fn a_landing_breaks_a_present_conflicting_pull_request() {
     let mut w = world(1.0, 0.0);
-    let first = add(&mut w, false, false, 1);
-    let second = add(&mut w, false, false, 2);
+    let first = add(&mut w, false, 1);
+    let second = add(&mut w, false, 2);
     assert_eq!(verdict_of(&mut w, 1, &[first]), CiStatus::Passed);
+    w.take_trace();
     w.land(BatchId(1)).unwrap();
+    let landed_at = w.now();
+    assert_eq!(lines(&mut w), ["land 1 [1]", "broken 2 by 1"]);
+    assert_eq!(w.prs[&PrNumber(second)].broke_at, Some(landed_at));
+    assert_eq!(w.bad_since(PrNumber(second)), Some(landed_at));
     assert!(matches!(
         verdict_of(&mut w, 2, &[second]),
         CiStatus::Failed(_)
     ));
+    w.observe().unwrap();
+    let reason = EjectReason::BatchFailed { batch: BatchId(2) };
+    w.eject(PrNumber(second), &reason).unwrap();
+    let left = w.prs[&PrNumber(second)].record.left.clone();
+    let justified = Exit::Ejected {
+        reason,
+        bad_since: Some(landed_at),
+    };
+    assert_eq!(left, Some((w.now(), justified)));
+    assert_eq!(w.check_invariants(), Ok(()));
 }
 
 #[test]
-fn a_pair_whose_queue_times_did_not_overlap_does_not_fail_a_run() {
+fn a_pull_request_arriving_after_its_conflicting_partner_landed_is_not_broken_by_it() {
     let mut w = world(1.0, 0.0);
-    let first = add(&mut w, false, false, 1);
+    let first = add(&mut w, false, 1);
     assert_eq!(verdict_of(&mut w, 1, &[first]), CiStatus::Passed);
     w.land(BatchId(1)).unwrap();
-    let later = add(&mut w, false, false, 2);
+    let later = add(&mut w, false, 2);
+    assert_eq!(w.bad_since(PrNumber(later)), None);
     assert_eq!(verdict_of(&mut w, 2, &[later]), CiStatus::Passed);
+    w.observe().unwrap();
+    w.land(BatchId(2)).unwrap();
+    assert!(w.prs[&PrNumber(later)].landed());
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_landing_during_a_run_leaves_its_verdict_and_the_batch_is_refused() {
+    let mut w = world(1.0, 0.0);
+    let first = add(&mut w, false, 1);
+    let second = add(&mut w, false, 2);
+    let trunk = w.observe().unwrap().trunk;
+    start(&mut w, 2, &trunk, &[second]).unwrap();
+    land_now(&mut w, 1, &[first]);
+    // Broken while batch 2 runs: its verdict is its tree's at its start.
+    assert!(w.bad_since(PrNumber(second)).is_some());
+    finish(&mut w);
+    assert_eq!(ci(&mut w, 2), CiStatus::Passed);
+    w.land(BatchId(2)).unwrap();
+    let o = w.observe().unwrap();
+    assert!(matches!(
+        state(&o, 2),
+        BatchState::LandRefused {
+            reason: LandRefusal::TrunkMoved { .. },
+            ..
+        }
+    ));
     assert_eq!(w.check_invariants(), Ok(()));
 }
 
 #[test]
 fn a_flake_fails_a_clean_run() {
     let mut w = world(0.0, 1.0);
-    let good = add(&mut w, false, false, 1);
+    let good = add(&mut w, false, 1);
     assert!(matches!(
         verdict_of(&mut w, 1, &[good]),
         CiStatus::Failed(_)
@@ -255,14 +318,20 @@ fn a_flake_fails_a_clean_run() {
 
 #[test]
 fn a_child_fails_with_its_parents_tree() {
-    let (a, b, c) = only_first_two_interact();
+    let (a, b, c) = only_first_two_conflict();
     for parent in [vec![(true, a)], vec![(false, a), (false, b)]] {
         let mut w = world(0.5, 0.0);
         let members: Vec<u64> = parent
             .iter()
-            .map(|&(bad, key)| add(&mut w, bad, false, key))
+            .map(|&(bad, key)| {
+                let pr = add(&mut w, false, key);
+                if bad {
+                    break_now(&mut w, pr);
+                }
+                pr
+            })
             .collect();
-        let child = add(&mut w, false, false, c);
+        let child = add(&mut w, false, c);
         let o = w.observe().unwrap();
         start(&mut w, 1, &o.trunk, &members).unwrap();
         let unobserved = tip(&w.snapshot().unwrap(), 1);
@@ -280,11 +349,11 @@ fn a_child_fails_with_its_parents_tree() {
 
 #[test]
 fn a_probe_runs_on_its_base_tree_alone() {
-    let (a, b, c) = only_first_two_interact();
+    let (a, b, c) = only_first_two_conflict();
     let mut w = world(0.5, 0.0);
-    let pa = add(&mut w, false, false, a);
-    let pb = add(&mut w, false, false, b);
-    let pc = add(&mut w, false, false, c);
+    let pa = add(&mut w, false, a);
+    let pb = add(&mut w, false, b);
+    let pc = add(&mut w, false, c);
     let o = w.observe().unwrap();
     start(&mut w, 1, &o.trunk, &[pa, pb]).unwrap();
     start(&mut w, 2, &o.trunk, &[pa, pc]).unwrap();
@@ -310,7 +379,7 @@ fn a_probe_runs_on_its_base_tree_alone() {
 #[test]
 fn a_passed_probe_cannot_land() {
     let mut w = world(0.0, 0.0);
-    add(&mut w, false, false, 1);
+    add(&mut w, false, 1);
     assert_eq!(verdict_of(&mut w, 1, &[]), CiStatus::Passed);
     assert!(violation_of(w.land(BatchId(1))).contains("is a probe"));
     w.retire(BatchId(1)).unwrap();
@@ -320,7 +389,7 @@ fn a_passed_probe_cannot_land() {
 #[test]
 fn retiring_a_running_batch_charges_its_elapsed_time() {
     let mut w = world(0.0, 0.0);
-    let (p, q) = (add(&mut w, false, false, 1), add(&mut w, false, false, 2));
+    let (p, q) = (add(&mut w, false, 1), add(&mut w, false, 2));
     let trunk = w.observe().unwrap().trunk;
     start(&mut w, 1, &trunk, &[p]).unwrap();
     start(&mut w, 2, &trunk, &[q]).unwrap();
@@ -331,7 +400,7 @@ fn retiring_a_running_batch_charges_its_elapsed_time() {
     let consumed: Vec<u64> = w.runs().iter().map(|r| r.consumed).collect();
     assert_eq!(consumed, [240, 240]);
     assert_eq!(w.next_event(), None);
-    let m = w.metrics();
+    let m = w.metrics(End::drained(w.now()));
     assert_eq!(m.runner_hours, 480.0 / 3600.0);
     assert_eq!(m.wasted_fraction, Some(1.0));
     assert_eq!(m.cancelled_runs, 2);
@@ -341,7 +410,7 @@ fn retiring_a_running_batch_charges_its_elapsed_time() {
 #[test]
 fn land_refuses_trunk_moved_and_member_gone_and_lands_a_chain_in_order() {
     let mut w = world(0.0, 0.0);
-    let prs: Vec<u64> = (0..4).map(|k| add(&mut w, false, false, k)).collect();
+    let prs: Vec<u64> = (0..4).map(|k| add(&mut w, false, k)).collect();
     let o = w.observe().unwrap();
     start(&mut w, 1, &o.trunk, &[prs[0]]).unwrap();
     start(&mut w, 2, &o.trunk, &[prs[1]]).unwrap();
@@ -381,7 +450,9 @@ fn land_refuses_trunk_moved_and_member_gone_and_lands_a_chain_in_order() {
 #[test]
 fn departed_matches_each_exit_and_each_exit_is_traced() {
     let mut w = world(0.0, 0.0);
-    let prs: Vec<u64> = (0..3).map(|k| add(&mut w, false, false, k)).collect();
+    let prs: Vec<u64> = (0..4).map(|k| add(&mut w, false, k)).collect();
+    stack(&mut w, prs[3], prs[1], false);
+    break_now(&mut w, prs[1]);
     let o = w.observe().unwrap();
     assert!(o.departed.is_empty());
     let heads: Vec<Sha> = o.prs.iter().map(|p| p.head.clone()).collect();
@@ -394,10 +465,11 @@ fn departed_matches_each_exit_and_each_exit_is_traced() {
     w.fire(Event::Withdraw(PrNumber(prs[2])));
     let trace = lines(&mut w);
     assert_eq!(
-        trace[trace.len() - 3..],
+        trace[trace.len() - 4..],
         [
             "land 1 [1]",
-            "eject 2 unjustified: batch 1 failed",
+            "eject 2 justified: batch 1 failed",
+            "blocked 4 on 2 bad",
             "withdraw 3"
         ]
     );
@@ -406,8 +478,11 @@ fn departed_matches_each_exit_and_each_exit_is_traced() {
         Departed::Landed { batch: BatchId(1) },
         Departed::Ejected,
         Departed::Withdrawn(Withdrawal::IntentCleared),
+        Departed::Withdrawn(Withdrawal::Blocked {
+            on: PrNumber(prs[1]),
+        }),
     ];
-    let expected: Vec<dorfq_core::Departure> = (0..3)
+    let expected: Vec<dorfq_core::Departure> = (0..4)
         .map(|i| dorfq_core::Departure::new(PrNumber(prs[i]), heads[i].clone(), how[i].clone()))
         .collect();
     assert_eq!(o.departed, expected);
@@ -418,8 +493,8 @@ fn departed_matches_each_exit_and_each_exit_is_traced() {
 #[test]
 fn a_pull_request_conflicting_with_trunk_cannot_join_a_batch() {
     let mut w = world(0.0, 0.0);
-    let p = add(&mut w, false, false, 1);
-    let q = add(&mut w, false, true, 2);
+    let p = add(&mut w, false, 1);
+    let q = add(&mut w, true, 2);
     let o = w.observe().unwrap();
     assert_eq!(o.prs[0].status, PrStatus::Ready);
     let message = violation_of(start(&mut w, 1, &o.trunk, &[p, q]));
@@ -430,7 +505,7 @@ fn a_pull_request_conflicting_with_trunk_cannot_join_a_batch() {
 #[test]
 fn every_violation_is_permanent_and_named() {
     let mut w = world(0.0, 0.0);
-    let (p, q) = (add(&mut w, false, false, 1), add(&mut w, false, false, 2));
+    let (p, q) = (add(&mut w, false, 1), add(&mut w, false, 2));
     let o = w.observe().unwrap();
     let trunk = o.trunk.clone();
     start(&mut w, 1, &trunk, &[p]).unwrap();
@@ -472,7 +547,7 @@ fn every_violation_is_permanent_and_named() {
 #[test]
 fn observations_are_sorted() {
     let mut w = world(0.0, 0.0);
-    let prs: Vec<u64> = (0..3).map(|k| add(&mut w, false, false, k)).collect();
+    let prs: Vec<u64> = (0..3).map(|k| add(&mut w, false, k)).collect();
     let trunk = w.observe().unwrap().trunk;
     start(&mut w, 9, &trunk, &[prs[2]]).unwrap();
     start(&mut w, 4, &trunk, &[prs[0]]).unwrap();
@@ -482,18 +557,56 @@ fn observations_are_sorted() {
 }
 
 #[test]
-fn an_ejection_is_justified_only_by_the_truth() {
-    let mut w = world(0.0, 0.0);
-    let good = add(&mut w, false, false, 1);
-    let bad = add(&mut w, true, false, 2);
+fn an_ejection_is_justified_only_by_badness_against_trunk() {
+    // 1 and 2 conflict, both queued; 3 is broken. A queued partner does
+    // not justify ejecting 1; being broken justifies ejecting 3.
+    let (a, b, c) = only_first_two_conflict();
+    let mut w = world(0.5, 0.0);
+    let good = add(&mut w, false, a);
+    add(&mut w, false, b);
+    w.advance_to(60);
+    let bad = add(&mut w, false, c);
+    break_now(&mut w, bad);
     w.observe().unwrap();
-    let reason = EjectReason::Conflicts {
-        with: ConflictWith::Trunk,
-    };
+    w.take_trace();
+    let reason = EjectReason::BatchFailed { batch: BatchId(1) };
     w.eject(PrNumber(good), &reason).unwrap();
     w.eject(PrNumber(bad), &reason).unwrap();
-    let m = w.metrics();
+    let exits: Vec<Option<(u64, Exit)>> = [good, bad]
+        .iter()
+        .map(|&n| w.prs[&PrNumber(n)].record.left.clone())
+        .collect();
+    let ejected = |bad_since| {
+        let reason = reason.clone();
+        Some((60, Exit::Ejected { reason, bad_since }))
+    };
+    assert_eq!(exits, [ejected(None), ejected(Some(60))]);
+    assert_eq!(
+        lines(&mut w)[..],
+        [
+            "eject 1 unjustified: batch 1 failed",
+            "eject 3 justified: batch 1 failed"
+        ][..]
+    );
+    let m = w.metrics(End::drained(w.now()));
     assert_eq!((m.ejected_good, m.ejected_bad), (1, 1));
+}
+
+#[test]
+fn a_child_of_a_bad_base_is_bad_from_its_base_s_breakage() {
+    let mut w = world(0.0, 0.0);
+    tree(&mut w);
+    w.advance_to(60);
+    break_now(&mut w, 1);
+    w.advance_to(120);
+    break_now(&mut w, 3);
+    // 3 on 2 on 1: bad since 1 broke, the earlier; 5 on trunk is good.
+    let since: Vec<Option<u64>> = (1..=5).map(|n| w.bad_since(PrNumber(n))).collect();
+    assert_eq!(since, [Some(60), Some(60), Some(60), Some(60), None]);
+    // A base that left no longer makes its children bad.
+    w.prs.get_mut(&PrNumber(1)).unwrap().record.left = Some((120, Exit::Landed));
+    let since: Vec<Option<u64>> = (2..=4).map(|n| w.bad_since(PrNumber(n))).collect();
+    assert_eq!(since, [None, Some(120), None]);
 }
 
 #[test]
@@ -502,7 +615,7 @@ fn churn_repushes_and_withdraws_on_their_clocks() {
     cfg.repush_per_hour = 1.0;
     cfg.withdraw_per_hour = 0.5;
     let mut w = World::new(cfg, Admission::Label, Streams::for_replication(1, 0)).traced();
-    let p = add(&mut w, false, false, 1);
+    let p = add(&mut w, false, 1);
     let head = w.prs[&PrNumber(p)].head.clone();
     finish(&mut w);
     let trace = lines(&mut w);
@@ -521,7 +634,7 @@ fn a_churn_delay_past_the_end_of_the_clock_schedules_nothing() {
     cfg.repush_per_hour = 1e-30;
     cfg.withdraw_per_hour = 1e-30;
     let mut w = World::new(cfg, Admission::Label, Streams::for_replication(1, 0));
-    add(&mut w, false, false, 1);
+    add(&mut w, false, 1);
     assert_eq!(w.next_event(), None);
 }
 
@@ -529,7 +642,7 @@ fn a_churn_delay_past_the_end_of_the_clock_schedules_nothing() {
 fn arrivals_and_truths_do_not_depend_on_what_the_scheduler_does() {
     let mut cfg = config(0.0, 0.0);
     cfg.arrivals_per_hour = 20.0;
-    cfg.p_bad = 0.5;
+    cfg.p_conflict = 0.5;
     let truths = |busy: bool| {
         let mut w = World::new(
             cfg.clone(),
@@ -544,7 +657,7 @@ fn arrivals_and_truths_do_not_depend_on_what_the_scheduler_does() {
             }
         }
         let prs = w.prs.values();
-        prs.map(|p| (p.record.arrived_at, p.bad, p.key))
+        prs.map(|p| (p.record.arrived_at, p.conflicts_with_trunk, p.key))
             .collect::<Vec<_>>()
     };
     let idle = truths(false);
@@ -562,7 +675,7 @@ fn stack(w: &mut World, pr: u64, base: u64, atomic: bool) {
 /// Pull requests 1 to 5: 2 on 1, 3 (`Atomic`) on 2, 4 on 1, 5 on trunk.
 fn tree(w: &mut World) {
     for key in 1..=5 {
-        add(w, false, false, key);
+        add(w, false, key);
     }
     stack(w, 2, 1, false);
     stack(w, 3, 2, true);
@@ -699,14 +812,14 @@ fn a_stack_grows_on_what_is_left_of_it_and_draws_the_same_whatever_is_left() {
     assert_eq!(kept.len(), 5);
     assert_eq!(observed(&o), [1, 2, 3, 4, 5]);
     // The growth is on the burst's top, the rest on it; only 1 conflicts.
-    let growth: Vec<Option<PrNumber>> = kept[3..].iter().map(|t| t.4).collect();
+    let growth: Vec<Option<PrNumber>> = kept[3..].iter().map(|t| t.3).collect();
     assert_eq!(growth, [Some(PrNumber(3)), Some(PrNumber(4))]);
     assert!(kept.iter().all(|t| t.0 == kept[0].0 || t.0 == 60 * 60));
-    assert!(kept[0].2 && kept[1..].iter().all(|t| !t.2));
+    assert!(kept[0].1 && kept[1..].iter().all(|t| !t.1));
     let o_kept = o;
     // With the top gone it is on the next member down.
     let (top_gone, o) = grown(&[3]);
-    assert_eq!(top_gone[3].4, Some(PrNumber(2)));
+    assert_eq!(top_gone[3].3, Some(PrNumber(2)));
     assert_eq!(
         (o.prs[2].number, o.prs[2].base, o.prs[2].stack),
         (PrNumber(4), PrBase::Pr(PrNumber(2)), StackPolicy::Atomic)
@@ -714,7 +827,7 @@ fn a_stack_grows_on_what_is_left_of_it_and_draws_the_same_whatever_is_left() {
     // With the whole stack gone it is a stack of its own on trunk, its
     // root splittable and, never conflicting, ready once checked.
     let (all_gone, o) = grown(&[1]);
-    assert_eq!(all_gone[3].4, None);
+    assert_eq!(all_gone[3].3, None);
     assert_eq!(observed(&o), [4, 5]);
     assert_eq!(
         (o.prs[0].base, o.prs[0].stack, &o.prs[0].status),
@@ -725,8 +838,8 @@ fn a_stack_grows_on_what_is_left_of_it_and_draws_the_same_whatever_is_left() {
         (PrBase::Pr(PrNumber(4)), StackPolicy::Atomic)
     );
     // Every draw is the same; only the bases differ.
-    let truth = |t: &[(u64, bool, bool, u64, Option<PrNumber>)]| -> Vec<_> {
-        t.iter().map(|&(a, b, c, k, _)| (a, b, c, k)).collect()
+    let truth = |t: &[(u64, bool, u64, Option<PrNumber>)]| -> Vec<_> {
+        t.iter().map(|&(a, c, k, _)| (a, c, k)).collect()
     };
     assert_eq!(truth(&kept), truth(&top_gone));
     assert_eq!(truth(&kept), truth(&all_gone));
@@ -835,8 +948,9 @@ fn a_base_leaving_blocks_its_descendants_recursively() {
         ]
     );
     assert_eq!(bases(&o), [(5, PrBase::Trunk, StackPolicy::Splittable)]);
-    let m = w.metrics();
-    assert_eq!((m.withdrawn, m.blocked, m.unfinished), (1, 3, 1));
+    let m = w.metrics(End::drained(w.now()));
+    // The three that left with 1 count under its withdrawal.
+    assert_eq!((m.withdrawn, m.left_with_base, m.unfinished), (4, 3, 1));
 }
 
 #[test]
@@ -876,8 +990,126 @@ fn an_ejection_in_the_plan_that_blocked_a_pull_request_supersedes_the_block() {
     let o = w.observe().unwrap();
     let how: Vec<(u64, Departed)> = o.departed.iter().map(|d| (d.pr.0, d.how.clone())).collect();
     assert_eq!(how, [(2, Departed::Ejected), (3, Departed::Ejected)]);
-    let m = w.metrics();
-    assert_eq!((m.ejected_good, m.blocked), (2, 0));
+    let m = w.metrics(End::drained(w.now()));
+    assert_eq!((m.ejected_good, m.left_with_base), (2, 0));
+}
+
+fn ejected_by_batch_1(w: &mut World, prs: &[u64]) {
+    w.observe().unwrap();
+    let reason = EjectReason::BatchFailed { batch: BatchId(1) };
+    for &pr in prs {
+        w.eject(PrNumber(pr), &reason).unwrap();
+    }
+}
+
+fn exit_of(w: &World, pr: u64) -> Exit {
+    w.prs[&PrNumber(pr)].record.left.clone().expect("left").1
+}
+
+fn blocked_on(on: u64, bad_since: Option<u64>) -> Exit {
+    Exit::Blocked {
+        on: PrNumber(on),
+        bad_since,
+    }
+}
+
+#[test]
+fn a_base_ejected_wrongly_takes_each_descendant_down_with_its_own_badness() {
+    let mut w = world(0.0, 0.0);
+    tree(&mut w);
+    w.advance_to(60);
+    break_now(&mut w, 2);
+    w.take_trace();
+    ejected_by_batch_1(&mut w, &[1]);
+    assert_eq!(
+        lines(&mut w),
+        [
+            "eject 1 unjustified: batch 1 failed",
+            "blocked 2 on 1 bad",
+            "blocked 3 on 2 bad",
+            "blocked 4 on 1"
+        ]
+    );
+    // 3 carries 2's breakage; 4, beside it, is clean.
+    assert_eq!(exit_of(&w, 2), blocked_on(1, Some(60)));
+    assert_eq!(exit_of(&w, 3), blocked_on(2, Some(60)));
+    assert_eq!(exit_of(&w, 4), blocked_on(1, None));
+    let m = w.metrics(End::drained(w.now()));
+    assert_eq!(
+        (
+            m.ejected_bad,
+            m.ejected_good,
+            m.left_with_base,
+            m.unfinished
+        ),
+        (2, 2, 3, 1)
+    );
+}
+
+#[test]
+fn a_bad_base_ejected_takes_its_descendants_down_bad_from_its_breakage() {
+    let mut w = world(0.0, 0.0);
+    tree(&mut w);
+    w.advance_to(60);
+    break_now(&mut w, 1);
+    w.advance_to(3660);
+    ejected_by_batch_1(&mut w, &[1]);
+    for (pr, on) in [(2, 1), (3, 2), (4, 1)] {
+        assert_eq!(exit_of(&w, pr), blocked_on(on, Some(60)), "pr {pr}");
+    }
+    let m = w.metrics(End::drained(w.now()));
+    assert_eq!((m.ejected_bad, m.ejected_good), (4, 0));
+    // An hour from 1's breakage to the ejection, for all four.
+    assert_eq!(
+        (m.detect_p50_hours, m.detect_p95_hours),
+        (Some(1.0), Some(1.0))
+    );
+}
+
+#[test]
+fn an_ejection_superseding_a_block_keeps_the_badness_from_before_the_base_left() {
+    let mut w = world(0.0, 0.0);
+    tree(&mut w);
+    break_now(&mut w, 1);
+    w.take_trace();
+    ejected_by_batch_1(&mut w, &[1, 2]);
+    // 2's block is taken back; 3 stays blocked on 2.
+    assert_eq!(
+        lines(&mut w),
+        [
+            "eject 1 justified: batch 1 failed",
+            "blocked 3 on 2 bad",
+            "blocked 4 on 1 bad",
+            "eject 2 justified: batch 1 failed"
+        ]
+    );
+    assert!(matches!(
+        exit_of(&w, 2),
+        Exit::Ejected {
+            bad_since: Some(0),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn ever_bad_is_set_at_the_breaking_landing_down_the_stack_and_at_arrival_on_a_bad_base() {
+    let (a, b, c) = only_first_two_conflict();
+    let mut w = world(0.5, 0.0);
+    let first = add(&mut w, false, a);
+    let second = add(&mut w, false, b);
+    let third = add(&mut w, false, c);
+    stack(&mut w, third, second, false);
+    land_now(&mut w, 1, &[first]);
+    let fourth = w.arrive(Some(PrNumber(second)), false, false).0;
+    let fifth = w.arrive(None, false, false).0;
+    settle(&mut w);
+    let ever: Vec<bool> = [first, second, third, fourth, fifth]
+        .iter()
+        .map(|&n| w.prs[&PrNumber(n)].record.ever_bad)
+        .collect();
+    assert_eq!(ever, [false, true, true, true, false]);
+    assert_eq!(w.metrics(End::drained(w.now())).ever_bad, 3);
 }
 
 #[test]
@@ -902,17 +1134,15 @@ fn a_repush_restacks_every_descendant() {
 }
 
 #[test]
-fn a_pull_request_never_interacts_with_its_ancestors() {
+fn a_pull_request_never_conflicts_with_its_ancestors() {
     let mut w = world(1.0, 0.0);
     tree(&mut w);
-    // Queue times overlap only once the clock has moved past the arrivals.
-    w.advance_to(1);
     let pairs = |w: &World| -> Vec<(u64, u64)> {
         let numbers: Vec<PrNumber> = w.prs.keys().copied().collect();
         let mut pairs = Vec::new();
         for (k, &i) in numbers.iter().enumerate() {
             for &j in &numbers[k + 1..] {
-                if w.interacts(i, j) {
+                if w.conflicts(i, j) {
                     pairs.push((i.0, j.0));
                 }
             }
@@ -923,6 +1153,44 @@ fn a_pull_request_never_interacts_with_its_ancestors() {
     // related, nor is anything with 5 on trunk.
     assert_eq!(pairs(&w), [(1, 5), (2, 4), (2, 5), (3, 4), (3, 5), (4, 5)]);
     assert_eq!(verdict_of(&mut w, 1, &[1, 2, 3]), CiStatus::Passed);
+}
+
+#[test]
+fn two_landed_pull_requests_that_conflict_break_the_invariant_unless_landed_apart() {
+    let mut w = world(1.0, 0.0);
+    let first = add(&mut w, false, 1);
+    let second = add(&mut w, false, 2);
+    assert_eq!(verdict_of(&mut w, 1, &[first]), CiStatus::Passed);
+    w.land(BatchId(1)).unwrap();
+    assert_eq!(w.check_invariants(), Ok(()));
+    // 2 was in the world when 1 landed: landing it too breaks the rule.
+    let landed = Some((w.now(), Exit::Landed));
+    w.prs.get_mut(&PrNumber(second)).unwrap().record.left = landed;
+    let message = w.check_invariants().unwrap_err();
+    assert!(
+        message.contains("prs 1 and 2 landed but conflict"),
+        "{message}"
+    );
+    // A fix pushed at or after 1's landing makes 2 fresh against it.
+    w.prs.get_mut(&PrNumber(second)).unwrap().last_fix_push = Some(w.now());
+    assert_eq!(w.landed_apart(PrNumber(first), PrNumber(second)), Ok(()));
+}
+
+#[test]
+fn a_landing_of_a_bad_or_conflicting_member_breaks_check_landed() {
+    let mut w = world(1.0, 0.0);
+    let (p, q) = (add(&mut w, false, 1), add(&mut w, false, 2));
+    let member =
+        |w: &World, n: u64| BatchMember::new(PrNumber(n), w.prs[&PrNumber(n)].head.clone());
+    assert_eq!(w.check_landed(&[member(&w, p)]), Ok(()));
+    let message = w.check_landed(&[member(&w, p), member(&w, q)]).unwrap_err();
+    assert!(
+        message.contains("prs 1 and 2 landed but conflict"),
+        "{message}"
+    );
+    break_now(&mut w, p);
+    let message = w.check_landed(&[member(&w, p)]).unwrap_err();
+    assert!(message.contains("pr 1 landed but is bad"), "{message}");
 }
 
 #[test]
@@ -938,17 +1206,16 @@ fn a_landed_pull_request_whose_base_did_not_land_breaks_the_invariant() {
 fn a_world_without_stacks_draws_what_it_drew_before_stacks() {
     let mut cfg = config(0.0, 0.0);
     cfg.arrivals_per_hour = 20.0;
-    cfg.p_bad = 0.5;
     cfg.p_conflict = 0.5;
     let mut w = World::new(cfg, Admission::Label, Streams::for_replication(3, 1));
     finish(&mut w);
     let expected = [
-        (67, false, true, 9386675400015353148, None),
-        (167, false, true, 9595752625188343565, None),
-        (215, true, true, 11222048117854481362, None),
-        (263, false, false, 1566661914958349798, None),
-        (487, false, false, 9259621691918785673, None),
-        (567, true, true, 1945186956785583718, None),
+        (67, false, 5323391624043147608, None),
+        (167, false, 16137047164741765704, None),
+        (215, true, 9595752625188343565, None),
+        (263, true, 6229663207608200478, None),
+        (487, false, 16846760811485287801, None),
+        (567, false, 1566661914958349798, None),
     ];
     assert_eq!(w.truths()[..6], expected);
 }
@@ -957,7 +1224,7 @@ fn a_world_without_stacks_draws_what_it_drew_before_stacks() {
 fn a_start_names_the_batch_it_runs_on_unless_that_is_trunk() {
     let mut w = world(0.0, 0.0);
     for key in 1..=4 {
-        add(&mut w, false, false, key);
+        add(&mut w, false, key);
     }
     let trunk = w.observe().unwrap().trunk;
     start(&mut w, 1, &trunk, &[1]).unwrap();
@@ -985,7 +1252,7 @@ fn a_start_names_the_batch_it_runs_on_unless_that_is_trunk() {
 fn retirements_refusals_and_ejections_are_traced() {
     let mut w = world(0.0, 0.0);
     for key in 1..=3 {
-        add(&mut w, false, key == 3, key);
+        add(&mut w, key == 3, key);
     }
     let trunk = w.observe().unwrap().trunk;
     w.take_trace();
@@ -1023,7 +1290,6 @@ fn retirements_refusals_and_ejections_are_traced() {
 #[test]
 fn an_arrival_carries_its_hidden_truth_and_its_stack() {
     let mut cfg = config(0.0, 0.0);
-    cfg.p_bad = 1.0;
     cfg.p_conflict = 1.0;
     cfg.stack_sizes = always(8);
     cfg.p_atomic = 0.5;
@@ -1040,10 +1306,7 @@ fn an_arrival_carries_its_hidden_truth_and_its_stack() {
             pr: p.record.number.0,
             base: p.base().map(|b| b.0),
             atomic: p.atomic,
-            truth: Truth {
-                bad: true,
-                conflicts: p.conflicts_with_trunk,
-            },
+            conflicts: p.conflicts_with_trunk,
         };
         assert_eq!(event, &expected);
     }
@@ -1052,10 +1315,7 @@ fn an_arrival_carries_its_hidden_truth_and_its_stack() {
         arrivals[0],
         TraceEvent::Arrive {
             base: None,
-            truth: Truth {
-                conflicts: true,
-                ..
-            },
+            conflicts: true,
             ..
         }
     ));
@@ -1063,10 +1323,7 @@ fn an_arrival_carries_its_hidden_truth_and_its_stack() {
         e,
         TraceEvent::Arrive {
             base: Some(_),
-            truth: Truth {
-                conflicts: false,
-                ..
-            },
+            conflicts: false,
             ..
         }
     )));
@@ -1096,8 +1353,8 @@ fn an_arrivals_own_ci_starts_at_once_and_is_not_billed() {
     let mut cfg = config(0.0, 0.0);
     cfg.pr_ci_minutes = Minutes { min: 5, max: 25 };
     let mut w = World::new(cfg, Admission::Label, Streams::for_replication(1, 0)).traced();
-    let first = add(&mut w, false, false, 1);
-    let second = add(&mut w, false, false, 2);
+    let first = add(&mut w, false, 1);
+    let second = add(&mut w, false, 2);
     assert_eq!(
         lines(&mut w),
         [
@@ -1126,7 +1383,7 @@ fn an_arrivals_own_ci_starts_at_once_and_is_not_billed() {
     assert_eq!(w.check_invariants(), Ok(()));
     finish(&mut w);
     assert_eq!(w.check_invariants(), Ok(()));
-    let m = w.metrics();
+    let m = w.metrics(End::drained(w.now()));
     assert_eq!((m.billed_pr_ci_runs, m.billed_pr_ci_hours), (0, 0.0));
     assert_eq!(m.runner_hours, 600.0 / HOUR);
 }
@@ -1134,8 +1391,8 @@ fn an_arrivals_own_ci_starts_at_once_and_is_not_billed() {
 #[test]
 fn a_pull_request_is_held_until_its_own_ci_passes() {
     let mut w = pr_ci_world(20);
-    let p = add(&mut w, false, false, 1);
-    let q = add(&mut w, false, false, 2);
+    let p = add(&mut w, false, 1);
+    let q = add(&mut w, false, 2);
     stack(&mut w, q, p, false);
     let o = w.observe().unwrap();
     assert_eq!(
@@ -1161,7 +1418,7 @@ fn a_pull_request_is_held_until_its_own_ci_passes() {
 #[test]
 fn a_repush_cancels_the_old_heads_run_and_holds_the_new_head() {
     let mut w = pr_ci_world(20);
-    let p = add(&mut w, false, false, 1);
+    let p = add(&mut w, false, 1);
     w.advance_to(1200);
     let o = w.observe().unwrap();
     assert_eq!(status(&o, p), PrStatus::Ready);
@@ -1199,14 +1456,14 @@ fn a_repush_cancels_the_old_heads_run_and_holds_the_new_head() {
     assert_eq!(w.check_invariants(), Ok(()));
     let consumed: Vec<u64> = w.pr_ci_runs().iter().map(|r| r.consumed).collect();
     assert_eq!(consumed, [1200, 300, 1200]);
-    assert_eq!(w.metrics().billed_pr_ci_runs, 0);
+    assert_eq!(w.metrics(End::drained(w.now())).billed_pr_ci_runs, 0);
 }
 
 #[test]
 fn a_pull_request_that_leaves_still_runs_its_run_to_the_end() {
     let mut w = pr_ci_world(20);
-    add(&mut w, false, false, 1);
-    add(&mut w, false, false, 2);
+    add(&mut w, false, 1);
+    add(&mut w, false, 2);
     w.take_trace();
     w.fire(Event::Withdraw(PrNumber(1)));
     w.fire(Event::Withdraw(PrNumber(2)));
@@ -1222,7 +1479,7 @@ fn a_pull_request_that_leaves_still_runs_its_run_to_the_end() {
     );
     let consumed: Vec<u64> = w.pr_ci_runs().iter().map(|r| r.consumed).collect();
     assert_eq!(consumed, [1200, 1200]);
-    assert_eq!(w.metrics().runner_hours, 0.0);
+    assert_eq!(w.metrics(End::drained(w.now())).runner_hours, 0.0);
     assert_eq!(w.check_invariants(), Ok(()));
 }
 
@@ -1294,7 +1551,7 @@ fn checked_lines(w: &mut World) -> Vec<String> {
 #[test]
 fn under_label_a_conflict_ejection_is_a_rebase_and_a_return() {
     let mut w = admitting(Admission::Label, 30, 20);
-    let p = add(&mut w, false, true, 1);
+    let p = add(&mut w, true, 1);
     let o = w.observe().unwrap();
     assert_eq!(status(&o, p), PrStatus::Conflicting(ConflictWith::Trunk));
     let first = o.prs[0].head.clone();
@@ -1324,7 +1581,7 @@ fn under_label_a_conflict_ejection_is_a_rebase_and_a_return() {
             "pr-ci 1 passed",
         ]
     );
-    let m = w.metrics();
+    let m = w.metrics(End::drained(w.now()));
     assert_eq!(
         (
             m.rebases,
@@ -1344,7 +1601,7 @@ fn under_label_a_conflict_ejection_is_a_rebase_and_a_return() {
 #[test]
 fn under_label_an_instant_rebase_returns_at_the_next_observation() {
     let mut w = admitting(Admission::Label, 0, 0);
-    let p = add(&mut w, false, true, 1);
+    let p = add(&mut w, true, 1);
     let first = w.observe().unwrap().prs[0].head.clone();
     w.eject(PrNumber(p), &conflict()).unwrap();
     // The plan's own instant: absent, ejected.
@@ -1361,8 +1618,8 @@ fn under_label_an_instant_rebase_returns_at_the_next_observation() {
 #[test]
 fn under_label_a_rebasing_base_takes_its_stack_out_and_brings_it_back() {
     let mut w = admitting(Admission::Label, 30, 20);
-    let base = add(&mut w, false, true, 1);
-    let child = add(&mut w, false, false, 2);
+    let base = add(&mut w, true, 1);
+    let child = add(&mut w, false, 2);
     stack(&mut w, child, base, false);
     w.observe().unwrap();
     w.eject(PrNumber(base), &conflict()).unwrap();
@@ -1398,7 +1655,7 @@ fn under_label_a_rebasing_base_takes_its_stack_out_and_brings_it_back() {
     );
     assert!(heads(&w).iter().zip(&before).all(|(a, b)| a != b));
     assert!(o.prs.iter().all(|p| p.status == pending()));
-    assert_eq!(w.metrics().rebases, 1);
+    assert_eq!(w.metrics(End::drained(w.now())).rebases, 1);
     let trace = checked_lines(&mut w);
     let from = trace.iter().position(|l| l.starts_with("eject")).unwrap();
     assert_eq!(
@@ -1423,8 +1680,8 @@ fn under_label_a_rebasing_base_takes_its_stack_out_and_brings_it_back() {
 #[test]
 fn an_ejection_in_the_plan_that_took_a_pull_request_out_with_its_base_supersedes_it() {
     let mut w = admitting(Admission::Label, 0, 20);
-    let base = add(&mut w, false, true, 1);
-    let child = add(&mut w, false, false, 2);
+    let base = add(&mut w, true, 1);
+    let child = add(&mut w, false, 2);
     stack(&mut w, child, base, false);
     w.observe().unwrap();
     w.take_trace();
@@ -1444,13 +1701,16 @@ fn an_ejection_in_the_plan_that_took_a_pull_request_out_with_its_base_supersedes
             "eject 2 unjustified: batch 1 failed",
         ]
     );
-    assert_eq!((w.out(), w.metrics().ejected_good), (1, 1));
+    assert_eq!(
+        (w.out(), w.metrics(End::drained(w.now())).ejected_good),
+        (1, 1)
+    );
 }
 
 #[test]
 fn a_withdrawal_during_a_rebase_is_final_and_cancels_the_push() {
     let mut w = admitting(Admission::Label, 0, 20);
-    let p = add(&mut w, false, true, 1);
+    let p = add(&mut w, true, 1);
     w.observe().unwrap();
     w.eject(PrNumber(p), &conflict()).unwrap();
     // Its author is mid-rebase: a churn push mints no head.
@@ -1460,7 +1720,7 @@ fn a_withdrawal_during_a_rebase_is_final_and_cancels_the_push() {
     w.fire(Event::Withdraw(PrNumber(p)));
     assert!(!w.events.values().any(|e| matches!(e, Event::Rebase(_))));
     finish(&mut w);
-    let m = w.metrics();
+    let m = w.metrics(End::drained(w.now()));
     assert_eq!((m.withdrawn, m.rebases, w.out()), (1, 0, 0));
     assert_eq!(
         checked_lines(&mut w)[2..],
@@ -1476,8 +1736,8 @@ fn a_withdrawal_during_a_rebase_is_final_and_cancels_the_push() {
 fn under_label_a_landed_base_changes_nothing_for_its_child() {
     let mut w = admitting(Admission::Label, 0, 20);
     w.config.pr_ci_on_base_landed = false;
-    let base = add(&mut w, false, false, 1);
-    let child = add(&mut w, false, false, 2);
+    let base = add(&mut w, false, 1);
+    let child = add(&mut w, false, 2);
     stack(&mut w, child, base, false);
     assert_eq!(verdict_of(&mut w, 1, &[base]), CiStatus::Passed);
     w.land(BatchId(1)).unwrap();
@@ -1485,7 +1745,7 @@ fn under_label_a_landed_base_changes_nothing_for_its_child() {
     let o = w.observe().unwrap();
     assert_eq!(bases(&o)[0].1, PrBase::Trunk);
     assert_eq!(status(&o, child), PrStatus::Ready);
-    let m = w.metrics();
+    let m = w.metrics(End::drained(w.now()));
     assert_eq!((m.rebases, m.billed_pr_ci_runs, w.out()), (0, 0, 0));
     assert_eq!(w.pr_ci_runs().len(), 2);
 }
@@ -1494,7 +1754,7 @@ fn under_label_a_landed_base_changes_nothing_for_its_child() {
 fn under_github_a_stack_enters_one_landing_at_a_time() {
     let mut w = admitting(Admission::Github, 30, 20);
     for key in 1..=3 {
-        add(&mut w, false, false, key);
+        add(&mut w, false, key);
     }
     stack(&mut w, 2, 1, false);
     stack(&mut w, 3, 2, false);
@@ -1577,7 +1837,7 @@ fn under_github_a_stack_enters_one_landing_at_a_time() {
         .filter(|l| l.ends_with(" billed"))
         .collect();
     assert_eq!(billed_requests, ["pr-ci 3 billed"]);
-    let m = w.metrics();
+    let m = w.metrics(End::drained(w.now()));
     assert_eq!((m.landed, m.rebases, m.billed_pr_ci_runs), (3, 2, 2));
     assert_eq!(m.billed_pr_ci_hours, 1.0);
     assert_eq!(m.runner_hours, 1.5);
@@ -1587,7 +1847,7 @@ fn under_github_a_stack_enters_one_landing_at_a_time() {
 #[test]
 fn under_github_a_conflict_is_rebased_before_the_queue_sees_it() {
     let mut w = admitting(Admission::Github, 30, 20);
-    let p = add(&mut w, false, true, 1);
+    let p = add(&mut w, true, 1);
     for t in [30, 50] {
         w.advance_to(t * 60);
         assert!(observed(&w.observe().unwrap()).is_empty(), "at {t} min");
@@ -1599,7 +1859,7 @@ fn under_github_a_conflict_is_rebased_before_the_queue_sees_it() {
         checked_lines(&mut w),
         ["arrive 1", "rebase 1 conflict", "repush 1", "admit 1"]
     );
-    let m = w.metrics();
+    let m = w.metrics(End::drained(w.now()));
     assert_eq!((m.rebases, m.billed_pr_ci_runs, m.ejected_bad), (1, 0, 0));
     assert_eq!(w.pr_ci_runs().len(), 2);
 }
@@ -1607,7 +1867,7 @@ fn under_github_a_conflict_is_rebased_before_the_queue_sees_it() {
 #[test]
 fn under_github_a_push_takes_an_enqueued_pull_request_out_until_it_passes() {
     let mut w = admitting(Admission::Github, 30, 20);
-    let p = add(&mut w, false, false, 1);
+    let p = add(&mut w, false, 1);
     w.advance_to(30 * 60);
     assert_eq!(observed(&w.observe().unwrap()), [p]);
     w.fire(Event::Repush(PrNumber(p)));
@@ -1628,8 +1888,8 @@ fn under_github_a_push_takes_an_enqueued_pull_request_out_until_it_passes() {
 #[test]
 fn under_github_a_base_that_leaves_blocks_a_child_the_queue_never_saw() {
     let mut w = admitting(Admission::Github, 30, 20);
-    let base = add(&mut w, false, false, 1);
-    let child = add(&mut w, false, false, 2);
+    let base = add(&mut w, false, 1);
+    let child = add(&mut w, false, 2);
     stack(&mut w, child, base, false);
     w.advance_to(30 * 60);
     assert_eq!(observed(&w.observe().unwrap()), [base]);
@@ -1640,8 +1900,8 @@ fn under_github_a_base_that_leaves_blocks_a_child_the_queue_never_saw() {
     .unwrap();
     let o = w.observe().unwrap();
     assert_eq!(departures(&o), [(base, Departed::Ejected)]);
-    let m = w.metrics();
-    assert_eq!((m.ejected_good, m.blocked, w.out()), (1, 1, 0));
+    let m = w.metrics(End::drained(w.now()));
+    assert_eq!((m.ejected_good, m.left_with_base, w.out()), (2, 1, 0));
     assert_eq!(
         checked_lines(&mut w)[3..],
         [
@@ -1655,7 +1915,7 @@ fn under_github_a_base_that_leaves_blocks_a_child_the_queue_never_saw() {
 #[test]
 fn batch_runs_and_pr_ci_runs_all_start_when_requested() {
     let mut w = pr_ci_world(20);
-    let prs: Vec<u64> = (1..=4).map(|k| add(&mut w, false, false, k)).collect();
+    let prs: Vec<u64> = (1..=4).map(|k| add(&mut w, false, k)).collect();
     w.advance_to(20 * 60);
     let trunk = w.observe().unwrap().trunk;
     w.take_trace();
@@ -1686,8 +1946,8 @@ fn batch_runs_and_pr_ci_runs_all_start_when_requested() {
 /// enqueued, under `github` it waits for 1.
 fn base_and_child(admission: Admission) -> World {
     let mut w = admitting(admission, 30, 20);
-    add(&mut w, false, false, 1);
-    add(&mut w, false, false, 2);
+    add(&mut w, false, 1);
+    add(&mut w, false, 2);
     stack(&mut w, 2, 1, false);
     w.advance_to(30 * 60);
     w
@@ -1696,7 +1956,7 @@ fn base_and_child(admission: Admission) -> World {
 #[test]
 fn under_label_a_landed_base_bills_its_childs_re_run_on_the_same_head() {
     let mut w = base_and_child(Admission::Label);
-    add(&mut w, false, false, 3);
+    add(&mut w, false, 3);
     stack(&mut w, 3, 2, false);
     w.advance_to(60 * 60);
     let o = w.observe().unwrap();
@@ -1719,7 +1979,7 @@ fn under_label_a_landed_base_bills_its_childs_re_run_on_the_same_head() {
     assert!(violation_of(start(&mut w, 2, &o.trunk, &[2])).contains("not ready"));
     w.advance_to(100 * 60);
     assert_eq!(status(&w.observe().unwrap(), 2), PrStatus::Ready);
-    let m = w.metrics();
+    let m = w.metrics(End::drained(w.now()));
     assert_eq!((m.billed_pr_ci_runs, m.billed_pr_ci_hours), (1, 0.5));
     assert_eq!(m.runner_hours, (10.0 + 30.0) / 60.0);
     assert_eq!(w.check_invariants(), Ok(()));
@@ -1755,7 +2015,7 @@ fn under_label_a_child_landing_during_its_billed_run_still_pays_for_all_of_it() 
     );
     let last = w.pr_ci_runs().last().unwrap();
     assert_eq!((last.pr.0, last.consumed, last.billed), (2, 30 * 60, true));
-    let m = w.metrics();
+    let m = w.metrics(End::drained(w.now()));
     assert_eq!(
         (m.landed, m.billed_pr_ci_runs, m.billed_pr_ci_hours),
         (2, 1, 0.5)
@@ -1779,7 +2039,7 @@ fn a_re_push_during_a_billed_run_cancels_it_and_it_stays_billed() {
         .map(|r| (r.consumed, r.cancelled, r.billed))
         .collect();
     assert_eq!(runs, [(600, true, true), (1800, false, false)]);
-    let m = w.metrics();
+    let m = w.metrics(End::drained(w.now()));
     assert_eq!((m.billed_pr_ci_runs, m.runner_hours), (1, 20.0 / 60.0));
     assert_eq!(w.check_invariants(), Ok(()));
 }
@@ -1788,7 +2048,7 @@ fn a_re_push_during_a_billed_run_cancels_it_and_it_stays_billed() {
 fn under_github_with_no_re_run_a_landed_base_admits_its_children_as_they_are() {
     let mut w = base_and_child(Admission::Github);
     w.config.pr_ci_on_base_landed = false;
-    add(&mut w, false, false, 3);
+    add(&mut w, false, 3);
     stack(&mut w, 3, 1, false);
     let o = w.observe().unwrap();
     assert_eq!(observed(&o), [1]);
@@ -1816,8 +2076,347 @@ fn under_github_with_no_re_run_a_landed_base_admits_its_children_as_they_are() {
             "admit 3",
         ]
     );
-    let m = w.metrics();
+    let m = w.metrics(End::drained(w.now()));
     assert_eq!((m.rebases, m.billed_pr_ci_runs), (0, 0));
     assert_eq!(w.pr_ci_runs().len(), 3);
     assert_eq!(w.check_invariants(), Ok(()));
+}
+
+/// The pending fix pushes of `pr` in the event queue.
+fn fixes(w: &World, pr: u64) -> usize {
+    let pending = w.events.values();
+    pending.filter(|&&e| e == Event::Fix(PrNumber(pr))).count()
+}
+
+fn fixing() -> PrStatus {
+    PrStatus::Waiting(BTreeSet::from([Hold::OwnCiFailed]))
+}
+
+/// Whether each own-CI run of `pr`, in start order, was to fail.
+fn own_verdicts(w: &World, pr: u64) -> Vec<bool> {
+    let runs = w.pr_ci_runs().iter().filter(|r| r.pr == PrNumber(pr));
+    runs.map(|r| r.failed).collect()
+}
+
+#[test]
+fn under_label_a_broken_pull_request_s_re_push_fails_its_run_and_its_author_fixes_it() {
+    let mut w = admitting(Admission::Label, 30, 40);
+    let p = add(&mut w, false, 1);
+    w.advance_to(30 * 60);
+    break_now(&mut w, p);
+    // A plain re-push clears nothing: its run fails.
+    w.fire(Event::Repush(PrNumber(p)));
+    w.advance_to(60 * 60);
+    let o = w.observe().unwrap();
+    assert_eq!((observed(&o), status(&o, p)), (vec![p], fixing()));
+    assert_eq!(fixes(&w, p), 1);
+    assert_eq!(w.check_invariants(), Ok(()));
+    // A same-head re-run while the fix is pending fails too, and schedules
+    // no second fix; a re-push waits for the fix.
+    w.request_pr_ci(PrNumber(p), true);
+    let o = w.observe().unwrap();
+    let both = PrStatus::Waiting(BTreeSet::from([Hold::OwnCiPending, Hold::OwnCiFailed]));
+    assert_eq!(status(&o, p), both);
+    w.fire(Event::Repush(PrNumber(p)));
+    w.advance_to(90 * 60);
+    assert_eq!(fixes(&w, p), 1);
+    assert_eq!(status(&w.observe().unwrap(), p), fixing());
+    // The fix push, `rebase_minutes` after the failure, clears it.
+    w.advance_to(100 * 60);
+    let fixed = &w.prs[&PrNumber(p)];
+    assert_eq!(
+        (fixed.broke_at, fixed.last_fix_push, fixed.fix),
+        (None, Some(100 * 60), None)
+    );
+    assert_eq!(status(&w.observe().unwrap(), p), pending());
+    w.advance_to(130 * 60);
+    assert_eq!(status(&w.observe().unwrap(), p), PrStatus::Ready);
+    assert_eq!(own_verdicts(&w, p), [false, true, true, false]);
+    assert_eq!(
+        checked_lines(&mut w),
+        [
+            "arrive 1",
+            "admit 1",
+            "repush 1",
+            "rebase 1 broken",
+            "fixed 1",
+            "repush 1"
+        ]
+    );
+    assert_eq!(w.metrics(End::drained(w.now())).rebases, 1);
+    // Fixed, it is good: ejecting it now is not justified.
+    w.eject(PrNumber(p), &EjectReason::BatchFailed { batch: BatchId(9) })
+        .unwrap();
+    let left = w.prs[&PrNumber(p)].record.left.clone();
+    assert!(matches!(
+        left,
+        Some((
+            _,
+            Exit::Ejected {
+                bad_since: None,
+                ..
+            }
+        ))
+    ));
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn under_github_a_broken_pull_request_is_fixed_while_out_checking() {
+    let mut w = admitting(Admission::Github, 30, 20);
+    let p = add(&mut w, false, 1);
+    w.advance_to(30 * 60);
+    break_now(&mut w, p);
+    w.fire(Event::Repush(PrNumber(p)));
+    w.advance_to(60 * 60);
+    assert_eq!(w.prs[&PrNumber(p)].out, Some(Out::Checking));
+    assert_eq!(observed(&w.observe().unwrap()), Vec::<u64>::new());
+    assert_eq!(w.check_invariants(), Ok(()));
+    w.advance_to(110 * 60);
+    assert_eq!(status(&w.observe().unwrap(), p), PrStatus::Ready);
+    assert_eq!(
+        checked_lines(&mut w),
+        [
+            "arrive 1",
+            "admit 1",
+            "repush 1",
+            "recheck 1",
+            "rebase 1 broken",
+            "fixed 1",
+            "repush 1",
+            "admit 1"
+        ]
+    );
+}
+
+#[test]
+fn a_fix_pending_on_a_base_and_its_child_pushes_each_once_per_fix() {
+    let mut w = base_and_child(Admission::Label);
+    break_now(&mut w, 1);
+    break_now(&mut w, 2);
+    w.fire(Event::Repush(PrNumber(1)));
+    w.advance_to(60 * 60);
+    assert_eq!((fixes(&w, 1), fixes(&w, 2)), (1, 1));
+    // The base's fix re-heads the child and cancels the child's fix; the
+    // child's own breakage is untouched, so its new head's run fails.
+    w.advance_to(80 * 60);
+    assert_eq!((fixes(&w, 1), fixes(&w, 2)), (0, 0));
+    assert!(w.prs[&PrNumber(2)].broke_at.is_some());
+    w.advance_to(110 * 60);
+    assert_eq!(fixes(&w, 2), 1);
+    finish(&mut w);
+    assert_eq!(own_verdicts(&w, 1), [false, true, false]);
+    assert_eq!(own_verdicts(&w, 2), [false, true, true, false]);
+    let rebases: Vec<u32> = w.pr_records().iter().map(|r| r.rebases).collect();
+    assert_eq!(rebases, [1, 1]);
+    assert_eq!(
+        checked_lines(&mut w),
+        [
+            "arrive 1",
+            "admit 1",
+            "arrive 2",
+            "admit 2",
+            "repush 1",
+            "repush 2",
+            "rebase 1 broken",
+            "rebase 2 broken",
+            "fixed 1",
+            "repush 1",
+            "repush 2",
+            "rebase 2 broken",
+            "fixed 2",
+            "repush 2",
+        ]
+    );
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_child_of_a_broken_base_passes_its_own_ci_and_is_good_after_the_base_s_fix() {
+    let mut w = base_and_child(Admission::Label);
+    break_now(&mut w, 1);
+    w.fire(Event::Repush(PrNumber(1)));
+    w.advance_to(60 * 60);
+    assert_eq!(own_verdicts(&w, 2), [false, false]);
+    assert_eq!(fixes(&w, 2), 0);
+    assert_eq!(w.bad_since(PrNumber(2)), Some(30 * 60));
+    w.advance_to(80 * 60);
+    assert_eq!(w.bad_since(PrNumber(2)), None);
+    finish(&mut w);
+    let o = w.observe().unwrap();
+    assert_eq!(
+        (status(&o, 1), status(&o, 2)),
+        (PrStatus::Ready, PrStatus::Ready)
+    );
+}
+
+#[test]
+fn under_label_a_conflict_ejection_cancels_a_pending_fix_and_its_push_fails_again() {
+    let mut w = admitting(Admission::Label, 30, 20);
+    let p = add(&mut w, true, 1);
+    w.advance_to(30 * 60);
+    break_now(&mut w, p);
+    w.fire(Event::Repush(PrNumber(p)));
+    w.advance_to(60 * 60);
+    // The conflict is reported over the hold.
+    let o = w.observe().unwrap();
+    assert_eq!(status(&o, p), PrStatus::Conflicting(ConflictWith::Trunk));
+    assert_eq!(fixes(&w, p), 1);
+    w.advance_to(70 * 60);
+    w.eject(PrNumber(p), &conflict()).unwrap();
+    assert_eq!((fixes(&w, p), w.prs[&PrNumber(p)].fix), (0, None));
+    // The conflict push at 90 clears the conflict, not the breakage.
+    w.advance_to(120 * 60);
+    assert_eq!(fixes(&w, p), 1);
+    finish(&mut w);
+    assert_eq!(own_verdicts(&w, p), [false, true, true, false]);
+    assert_eq!(status(&w.observe().unwrap(), p), PrStatus::Ready);
+    assert_eq!(
+        checked_lines(&mut w),
+        [
+            "arrive 1",
+            "admit 1",
+            "repush 1",
+            "rebase 1 broken",
+            "eject 1 justified: conflicts with trunk, rebasing",
+            "rebase 1 conflict",
+            "repush 1",
+            "admit 1",
+            "rebase 1 broken",
+            "fixed 1",
+            "repush 1",
+        ]
+    );
+    assert_eq!(w.pr_records()[0].rebases, 2);
+}
+
+#[test]
+fn under_label_a_base_going_out_cancels_its_child_s_fix() {
+    let mut w = base_and_child(Admission::Label);
+    break_now(&mut w, 2);
+    w.fire(Event::Repush(PrNumber(2)));
+    w.advance_to(60 * 60);
+    assert_eq!(fixes(&w, 2), 1);
+    w.advance_to(70 * 60);
+    w.prs.get_mut(&PrNumber(1)).unwrap().conflicts_with_trunk = true;
+    w.observe().unwrap();
+    w.eject(PrNumber(1), &conflict()).unwrap();
+    assert_eq!(fixes(&w, 2), 0);
+    // The base's push at 90 re-heads the child; its run fails at 120.
+    w.advance_to(120 * 60);
+    assert_eq!(fixes(&w, 2), 1);
+    finish(&mut w);
+    assert_eq!(own_verdicts(&w, 2), [false, true, true, false]);
+    let lines = checked_lines(&mut w);
+    assert!(
+        lines.contains(&"blocked 2 with 1 bad".to_owned()),
+        "{lines:?}"
+    );
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn leaving_cancels_a_pending_fix() {
+    let mut w = admitting(Admission::Label, 30, 20);
+    let p = add(&mut w, false, 1);
+    w.advance_to(30 * 60);
+    break_now(&mut w, p);
+    w.fire(Event::Repush(PrNumber(p)));
+    w.advance_to(60 * 60);
+    assert_eq!(fixes(&w, p), 1);
+    w.fire(Event::Withdraw(PrNumber(p)));
+    assert_eq!((fixes(&w, p), w.prs[&PrNumber(p)].fix), (0, None));
+    assert_eq!(crate::trace::check_lives(&w.take_trace()), Ok(()));
+}
+
+#[test]
+fn a_failed_run_of_a_pull_request_out_for_a_rebase_starts_no_fix() {
+    let mut w = admitting(Admission::Label, 30, 30);
+    let p = add(&mut w, true, 1);
+    w.advance_to(30 * 60);
+    break_now(&mut w, p);
+    w.fire(Event::Repush(PrNumber(p)));
+    w.advance_to(40 * 60);
+    w.observe().unwrap();
+    w.eject(PrNumber(p), &conflict()).unwrap();
+    // The failed run ends at 60 while the author is rebasing.
+    w.advance_to(60 * 60);
+    assert_eq!(own_verdicts(&w, p), [false, true]);
+    assert_eq!(fixes(&w, p), 0);
+    // The rebase push at 70 runs a new head that fails at 100.
+    w.advance_to(100 * 60);
+    assert_eq!(fixes(&w, p), 1);
+    assert_eq!(crate::trace::check_lives(&w.take_trace()), Ok(()));
+}
+
+#[test]
+fn under_label_a_landed_base_s_re_run_of_a_broken_child_fails_and_starts_its_fix() {
+    let mut w = base_and_child(Admission::Label);
+    break_now(&mut w, 2);
+    land_now(&mut w, 1, &[1]);
+    w.advance_to(60 * 60);
+    assert_eq!(own_verdicts(&w, 2), [false, true]);
+    assert_eq!(status(&w.observe().unwrap(), 2), fixing());
+    finish(&mut w);
+    assert_eq!(status(&w.observe().unwrap(), 2), PrStatus::Ready);
+    assert_eq!(w.metrics(End::drained(w.now())).billed_pr_ci_runs, 1);
+    assert_eq!(crate::trace::check_lives(&w.take_trace()), Ok(()));
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn under_github_a_landed_base_cancels_its_child_s_fix_and_the_rebase_push_fails_again() {
+    let mut w = base_and_child(Admission::Github);
+    assert_eq!(w.prs[&PrNumber(2)].out, Some(Out::Stacked));
+    break_now(&mut w, 2);
+    w.fire(Event::Repush(PrNumber(2)));
+    w.advance_to(60 * 60);
+    assert_eq!(
+        (fixes(&w, 2), w.prs[&PrNumber(2)].out),
+        (1, Some(Out::Checking))
+    );
+    w.advance_to(70 * 60);
+    land_now(&mut w, 1, &[1]);
+    assert_eq!((fixes(&w, 2), w.prs[&PrNumber(2)].fix), (0, None));
+    // The landed-base push at 90 runs a head that fails at 120.
+    w.advance_to(120 * 60);
+    assert_eq!(fixes(&w, 2), 1);
+    finish(&mut w);
+    assert_eq!(own_verdicts(&w, 2), [false, true, true, false]);
+    assert_eq!(observed(&w.observe().unwrap()), [2]);
+    assert_eq!(w.pr_records()[1].rebases, 2);
+    let lines = checked_lines(&mut w);
+    let tail: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .skip_while(|l| !l.starts_with("repush 2"))
+        .collect();
+    assert_eq!(
+        tail,
+        [
+            "repush 2",
+            "rebase 2 broken",
+            "start 1 [1] on trunk",
+            "ci 1 passed",
+            "land 1 [1]",
+            "rebase 2 base landed",
+            "repush 2",
+            "rebase 2 broken",
+            "fixed 2",
+            "repush 2",
+            "admit 2",
+        ]
+    );
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn under_github_an_enqueued_pull_request_with_a_fix_pending_breaks_check_places() {
+    let mut w = admitting(Admission::Github, 30, 20);
+    let p = add(&mut w, false, 1);
+    w.advance_to(30 * 60);
+    assert_eq!(w.check_invariants(), Ok(()));
+    w.prs.get_mut(&PrNumber(p)).unwrap().fix = Some((u64::MAX, 0));
+    let message = w.check_invariants().unwrap_err();
+    assert!(message.contains("pr 1 is enqueued unchecked"), "{message}");
 }

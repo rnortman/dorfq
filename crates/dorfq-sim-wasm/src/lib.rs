@@ -129,7 +129,7 @@ mod tests {
         let (tag, document) = call(EXAMPLE);
         assert_eq!(tag, TAG_DOCUMENT);
         assert!(
-            document.starts_with(r#"{"schema":3,"name":"playground","config":"#),
+            document.starts_with(r#"{"schema":4,"name":"playground","config":"#),
             "{}",
             &document[..80.min(document.len())]
         );
@@ -141,8 +141,8 @@ mod tests {
         let text: String = EXAMPLE
             .lines()
             .map(|line| {
-                if line.starts_with("p_bad ") {
-                    "p_bad = 1.5"
+                if line.starts_with("p_flake ") {
+                    "p_flake = 1.5"
                 } else {
                     line
                 }
@@ -150,12 +150,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("\np_bad = 1.5\n"),
-            "the example has a p_bad line"
+            text.contains("\np_flake = 1.5\n"),
+            "the example has a p_flake line"
         );
         let (tag, message) = call(&text);
         assert_eq!(tag, TAG_ERROR);
-        assert!(message.contains("p_bad"), "{message}");
+        assert!(message.contains("p_flake"), "{message}");
     }
 
     /// The only test that panics, so the empty check cannot read another

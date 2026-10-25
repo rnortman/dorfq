@@ -100,10 +100,10 @@ fn a_dotted_key_sets_a_leaf_two_tables_deep() {
 
 #[test]
 fn a_key_through_a_value_that_is_not_a_table_fails_naming_key_and_segment() {
-    let axes = "[[axis]]\nkeys = [\"world.p_bad.x\"]\nvalues = [1]\n";
+    let axes = "[[axis]]\nkeys = [\"world.p_flake.x\"]\nvalues = [1]\n";
     let message = rejected(&file("floor", axes));
     assert!(
-        message.contains("key world.p_bad.x: p_bad is not a table"),
+        message.contains("key world.p_flake.x: p_flake is not a table"),
         "{message}"
     );
 }
@@ -130,9 +130,9 @@ fn a_key_outside_world_and_policy_fails() {
 
 #[test]
 fn a_misspelt_field_fails_by_name() {
-    let world = "[[axis]]\nkeys = [\"world.p_badd\"]\nvalues = [0.1]\n";
+    let world = "[[axis]]\nkeys = [\"world.p_flakee\"]\nvalues = [0.1]\n";
     let message = rejected(&file("floor", world));
-    assert!(message.contains("p_badd"), "{message}");
+    assert!(message.contains("p_flakee"), "{message}");
     let policy = "[[axis]]\nkeys = [\"policy.bisect.max_batchh\"]\nvalues = [2]\n";
     let message = rejected(&file("floor", policy));
     assert!(message.contains("max_batchh"), "{message}");
@@ -140,12 +140,11 @@ fn a_misspelt_field_fails_by_name() {
 
 #[test]
 fn a_value_out_of_range_fails_naming_the_point_and_the_field() {
-    let axes =
-        "[[axis]]\nkeys = [\"world.p_bad\"]\nvalues = [0.1, 1.5]\nlabels = [\"low\", \"broken\"]\n";
+    let axes = "[[axis]]\nkeys = [\"world.p_flake\"]\nvalues = [0.1, 1.5]\nlabels = [\"low\", \"broken\"]\n";
     let message = rejected(&file("floor", axes));
     assert!(message.contains("point [broken]"), "{message}");
     assert!(
-        message.contains("world.p_bad must be in [0, 1]"),
+        message.contains("world.p_flake must be in [0, 1]"),
         "{message}"
     );
 }
@@ -173,19 +172,19 @@ fn an_axis_needs_keys_values_and_one_label_per_value() {
         message.contains("axis 1: keys must not be empty"),
         "{message}"
     );
-    let axes = "[[axis]]\nkeys = [\"world.p_bad\"]\nvalues = []\n";
+    let axes = "[[axis]]\nkeys = [\"world.p_flake\"]\nvalues = []\n";
     let message = rejected(&file("floor", axes));
     assert!(
         message.contains("axis 1: values must not be empty"),
         "{message}"
     );
-    let axes = "[[axis]]\nkeys = [\"world.p_bad\"]\nvalues = [0.1]\nlabels = [\"a\", \"b\"]\n";
+    let axes = "[[axis]]\nkeys = [\"world.p_flake\"]\nvalues = [0.1]\nlabels = [\"a\", \"b\"]\n";
     let message = rejected(&file("floor", axes));
     assert!(
         message.contains("axis 1: has 2 labels for 1 values"),
         "{message}"
     );
-    let axes = "[[axis]]\nkeys = [\"world.p_bad\"]\nvalues = [0.1]\nname = \"x\"\n";
+    let axes = "[[axis]]\nkeys = [\"world.p_flake\"]\nvalues = [0.1]\nname = \"x\"\n";
     let message = rejected(&file("floor", axes));
     assert!(message.contains("name"), "{message}");
 }
@@ -219,8 +218,9 @@ fn metrics(landed: usize, runs: usize) -> Metrics {
         ejected_bad: 0,
         ejected_good: 0,
         withdrawn: 0,
-        blocked: 0,
         unfinished: 10 - landed,
+        left_with_base: 0,
+        ever_bad: 0,
         rebases: 0,
         runs,
         cancelled_runs: 0,
@@ -234,6 +234,11 @@ fn metrics(landed: usize, runs: usize) -> Metrics {
         land_p95_hours: None,
         reject_p50_hours: None,
         reject_p95_hours: None,
+        detect_p50_hours: None,
+        detect_p95_hours: None,
+        ended_hours: 72.0,
+        cut_off: false,
+        stalled: false,
     }
 }
 
@@ -287,13 +292,16 @@ fn row<'a>(text: &'a str, first: &str) -> Vec<&'a str> {
 fn the_grid_has_a_row_per_point_and_policy_with_means_and_failures() {
     let text = report().to_string();
     let header = cells(text.lines().next().unwrap());
-    assert_eq!(header[..4], ["point", "lanes", "policy", "arrived"]);
+    assert_eq!(
+        header[..6],
+        ["point", "lanes", "policy", "arrived", "ever_bad", "landed"]
+    );
     assert_eq!(header.last(), Some(&"failure"));
     assert!(header.contains(&"cancelled_runs"));
     let rows: Vec<Vec<&str>> = text.lines().skip(1).take(4).map(cells).collect();
-    assert_eq!(rows[0][..5], ["0", "4", "chain", "10.0", "4.0"]);
-    assert_eq!(rows[1][..5], ["0", "4", "tree", "10.0", "6.0"]);
-    assert_eq!(rows[3][..5], ["1", "8", "tree", "10.0", "4.0"]);
+    assert_eq!(rows[0][..6], ["0", "4", "chain", "10.0", "0.0", "4.0"]);
+    assert_eq!(rows[1][..6], ["0", "4", "tree", "10.0", "0.0", "6.0"]);
+    assert_eq!(rows[3][..6], ["1", "8", "tree", "10.0", "0.0", "4.0"]);
     assert_eq!(rows[3].last(), Some(&"1: livelock at t=7"));
     assert_eq!(rows[2].last(), Some(&"-"));
 }
@@ -302,15 +310,29 @@ fn the_grid_has_a_row_per_point_and_policy_with_means_and_failures() {
 fn the_summary_averages_relative_deltas_over_points_with_direction() {
     let text = report().to_string();
     assert_eq!(row(&text, "against chain"), ["against chain", "tree"]);
-    // landed: +50% and -20%, better at one point of two.
-    assert_eq!(row(&text, "landed"), ["landed", "+15.0% (1/2)"]);
+    // landed: +50% and -20%, better at one point of two, worse at one.
+    assert_eq!(row(&text, "landed"), ["landed", "+15.0% (1+ 1- /2)"]);
     // runs: -25% and +20%; lower is better.
-    assert_eq!(row(&text, "runs"), ["runs", "-2.5% (1/2)"]);
+    assert_eq!(row(&text, "runs"), ["runs", "-2.5% (1+ 1- /2)"]);
     // arrived has no direction.
     assert_eq!(row(&text, "arrived"), ["arrived", "+0.0%"]);
-    // No point has it, or the baseline is 0.
+    // No point has it.
     assert_eq!(row(&text, "land_p50_hours"), ["land_p50_hours", "-"]);
-    assert_eq!(row(&text, "cancelled_runs"), ["cancelled_runs", "-"]);
+    // The baseline is 0 at every point: no relative delta, and the points
+    // still compare, here as ties.
+    assert_eq!(
+        row(&text, "cancelled_runs"),
+        ["cancelled_runs", "- (0+ 0- /2)"]
+    );
+}
+
+#[test]
+fn the_summary_counts_a_policy_worse_where_the_baseline_is_0() {
+    let mut report = report();
+    let tree = &mut report.points[0].report.policies[1].replications[0];
+    tree.as_mut().unwrap().stalled = true;
+    let text = report.to_string();
+    assert_eq!(row(&text, "stalled"), ["stalled", "- (0+ 1- /2)"]);
 }
 
 #[test]
@@ -332,7 +354,7 @@ fn the_document_carries_schema_axes_points_and_cells() {
     results.points.truncate(1);
     let document: serde_json::Value =
         serde_json::from_str(&results.to_json("grid", &config, &text)).unwrap();
-    assert_eq!(document["schema"], 1);
+    assert_eq!(document["schema"], 2);
     assert_eq!(document["name"], "grid");
     assert_eq!(document["config_text"], text.as_str());
     assert_eq!(document["baseline"], "chain");
@@ -355,14 +377,19 @@ fn the_document_carries_schema_axes_points_and_cells() {
 }
 
 /// Each bayes column's settings at a point, flags aside.
-fn bayes_settings(config: &SimConfig) -> Vec<(usize, usize, f64, f64, f64)> {
+fn bayes_settings(config: &SimConfig) -> Vec<(usize, usize, f64, f64, f64, f64)> {
     config
         .policy
         .iter()
         .filter_map(|p| match &p.scheduler {
-            SchedulerConfig::Bayes(b) => {
-                Some((b.lanes, b.max_batch, b.p_flake, b.p_interact, b.run_cost))
-            }
+            SchedulerConfig::Bayes(b) => Some((
+                b.lanes,
+                b.max_batch,
+                b.p_flake,
+                b.p_interact,
+                b.run_cost,
+                b.w_reject,
+            )),
             SchedulerConfig::Bisect { .. } | SchedulerConfig::AllAtOnce {} => None,
         })
         .collect()
@@ -383,7 +410,7 @@ fn the_shipped_speculation_sweep_runs_four_bayes_variants_at_like_settings() {
         ]
     );
     assert_eq!(sweep.baseline, "bayes-chain");
-    assert_eq!(sweep.points.len(), 288);
+    assert_eq!(sweep.points.len(), 384);
     let busy = SimConfig::parse(include_str!("../../examples/busy.toml")).unwrap();
     assert_eq!(sweep.base.world, busy.world);
     let flags: Vec<_> = sweep
@@ -404,9 +431,21 @@ fn the_shipped_speculation_sweep_runs_four_bayes_variants_at_like_settings() {
             (Speculation::Tree, Charge::Full, Landing::Transfer),
         ]
     );
+    let mut max_batches = Vec::new();
+    let mut w_rejects = Vec::new();
+    let mut ci = Vec::new();
     for point in &sweep.points {
         let world = &point.config.world;
         let settings = bayes_settings(&point.config);
+        if !max_batches.contains(&settings[0].1) {
+            max_batches.push(settings[0].1);
+        }
+        if !w_rejects.contains(&settings[0].5) {
+            w_rejects.push(settings[0].5);
+        }
+        if !ci.contains(&world.ci_minutes) {
+            ci.push(world.ci_minutes);
+        }
         assert_eq!(settings.len(), 4);
         assert!(settings.iter().all(|s| *s == settings[0]), "{settings:?}");
         assert_eq!(
@@ -422,6 +461,12 @@ fn the_shipped_speculation_sweep_runs_four_bayes_variants_at_like_settings() {
             }
         );
     }
+    assert_eq!(max_batches, [16, 30]);
+    assert_eq!(w_rejects, [1.0, 10.0]);
+    assert_eq!(
+        ci,
+        [Minutes { min: 45, max: 120 }, Minutes { min: 90, max: 120 }]
+    );
 }
 
 #[test]

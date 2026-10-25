@@ -3,11 +3,16 @@
 //!
 //! The [`World`] is a [`Forge`]: it checks rules 5, 6 and 8 of the
 //! [`dorfq_core`] contract through its [`Ledger`](dorfq_core::ledger::Ledger)
-//! and answers a breach with [`ForgeError::Permanent`]. Behind it each pull request is bad or good,
-//! conflicts with trunk or not, and carries a key from which the truth of
-//! every pair is a function. A batch's run starts the instant the batch
-//! does, takes a uniform time and fails when its tree is broken or the
-//! flake draw fires. The world has no runner pool: CI capacity is not the
+//! and answers a breach with [`ForgeError::Permanent`]. Behind it each pull
+//! request conflicts textually with trunk or not, and carries a key from
+//! which whether two pull requests conflict is a function: a pair that
+//! conflicts breaks together, and whichever lands first breaks the other.
+//! A pull request is bad while something that landed since it arrived or
+//! since its author's last fix conflicts with it, or while its base is
+//! bad. A batch's run starts the instant the batch does, takes a uniform time and fails when, at its
+//! start, its tree held a bad pull request or a conflicting pair not yet
+//! landed, or when the flake draw fires. An ejection is justified only of
+//! a pull request bad at that instant. The world has no runner pool: CI capacity is not the
 //! constraint, and the only bound on concurrent batch runs is the
 //! scheduler's own `lanes`. Time is the simulator's: the scheduler never
 //! sees it.
@@ -19,15 +24,19 @@
 //! burst on top of what is left of it, or on trunk if nothing is. Only a
 //! stack's root can conflict with trunk; everything above it was cut from
 //! the stack's branch. A base that leaves without landing takes everything
-//! stacked on it with it (`Blocked`), and a re-push restacks every
-//! descendant.
+//! stacked on it with it (`Blocked`), each counted under its base's exit
+//! with its own truth, and a re-push restacks every descendant.
 //!
 //! Every pull request also runs its own CI, beside the queue, each time it
-//! gets a head: at arrival and at every re-push. A run starts at once,
-//! takes a uniform time and passes; a head change cancels the old head's
-//! run. As the GitHub forge does, the world reports a pull request
-//! `Waiting(OwnCiPending)` until its current head's run has passed, so no
-//! batch takes it before then. With `pr_ci_on_base_landed`, a landed base
+//! gets a head: at arrival and at every re-push. A run starts at once and
+//! takes a uniform time; a head change cancels the old head's run. It
+//! tests the head against trunk as of its start: it fails when the pull
+//! request is itself broken (not merely on a broken base), and its author
+//! then pushes a fix after a rebase delay, the only push that clears the
+//! breakage. As the GitHub forge does, the world reports a pull request
+//! `Waiting(OwnCiPending)` until its current head's run has passed, and
+//! `Waiting(OwnCiFailed)` while its author fixes it, so no batch takes it
+//! before then. With `pr_ci_on_base_landed`, a landed base
 //! makes the pull requests stacked on it run again: the run of each direct
 //! child is the queue's doing, splitting the stack there, and is *billed*,
 //! counted in `runner_hours`; every other PR CI run is the author's and
@@ -54,8 +63,8 @@
 //!
 //! [`simulate`] runs every policy of a [`SimConfig`] at every replication
 //! and returns a [`Report`]: runner-hours per landed pull request, time to
-//! land and to reject, wasted runner time and false ejections, one column
-//! per policy. Traced, the first replication of each policy is recorded as
+//! land, to reject and from breaking to ejection, wasted runner time and
+//! false ejections, one column per policy. Traced, the first replication of each policy is recorded as
 //! [`TraceEvent`]s: every step and its plan, and everything the world did.
 //! [`Report::to_json`] writes the report, its configuration and those
 //! traces as one JSON document, the input of the report site.
@@ -80,13 +89,13 @@ use dorfq_core::{BatchState, CiStatus, Forge, ForgeError, Observation, Plan, Sch
 use dorfq_scheduler::SchedulerConfig;
 
 pub use config::{Admission, Minutes, Policy, SimConfig, SimConfigError, WorldConfig};
-pub use metrics::{Exit, Metrics, PrCiRecord, PrRecord, RunRecord, RunningSeconds};
+pub use metrics::{End, Exit, Metrics, PrCiRecord, PrRecord, RunRecord, RunningSeconds};
 pub use report::{PolicyReport, Report, SCHEMA};
 pub use rng::{SplitMix64, Streams};
 pub use sweep::{
     Axis, Point, PointReport, SWEEP_SCHEMA, SweepConfig, SweepConfigError, SweepReport, sweep,
 };
-pub use trace::{PlannedEject, PlannedStart, Rebase, TraceEvent, Truth};
+pub use trace::{PlannedEject, PlannedStart, Rebase, TraceEvent};
 pub use world::World;
 
 /// Non-empty plans at one instant after which a scheduler is livelocked.
@@ -139,7 +148,8 @@ impl fmt::Display for SimError {
 impl Error for SimError {}
 
 /// Runs the scheduler `scheduler` describes for replication `k` of `seed`
-/// in `world` under `admission`, to drain or deadline, appending its steps and events to
+/// in `world` under `admission`, until the world empties, it stalls or it
+/// reaches its deadline, appending its steps and events to
 /// `trace` when given, failed replication or not. `world` must have passed
 /// [`WorldConfig::validate`] and `scheduler` [`SchedulerConfig::validate`].
 pub fn run(
@@ -151,7 +161,7 @@ pub fn run(
     trace: Option<&mut Vec<TraceEvent>>,
 ) -> Result<Metrics, SimError> {
     let (world, outcome) = replicate(world, admission, scheduler, seed, k, trace);
-    outcome.map(|()| world.metrics())
+    outcome.map(|end| world.metrics(end))
 }
 
 /// One replication as [`run`] runs it, returning the world as it was left
@@ -163,14 +173,15 @@ fn replicate(
     seed: u64,
     k: u64,
     trace: Option<&mut Vec<TraceEvent>>,
-) -> (World, Result<(), SimError>) {
+) -> (World, Result<End, SimError>) {
     let deadline = (config.hours + config.drain_hours) * HOUR;
+    let stall = config.stall_hours * HOUR;
     let mut world = World::new(config.clone(), admission, Streams::for_replication(seed, k));
     if trace.is_some() {
         world = world.traced();
     }
     let mut scheduler = scheduler.build();
-    let outcome = drive(&mut world, scheduler.as_mut(), deadline, trace);
+    let outcome = drive(&mut world, scheduler.as_mut(), deadline, stall, trace);
     debug_assert_eq!(world.check_invariants(), Ok(()));
     (world, outcome)
 }
@@ -209,15 +220,21 @@ pub fn simulate(config: &SimConfig, trace: bool) -> Report {
 }
 
 /// The loop: observe, step, execute in rule 7's order, then advance to the
-/// next event once a plan is empty. A replication cut off at `deadline`
-/// ends with the clock at the deadline.
+/// next event once a plan is empty. The replication runs until the world is
+/// empty with no event left, and ends at the instant the world last
+/// emptied; or it is cut off with the clock at `deadline`, or at `stall`
+/// seconds after the last progress — a landing, an ejection, or an empty
+/// world — while a pull request is present.
 fn drive(
     world: &mut World,
     scheduler: &mut dyn Scheduler,
     deadline: u64,
+    stall: u64,
     mut trace: Option<&mut Vec<TraceEvent>>,
-) -> Result<(), SimError> {
+) -> Result<End, SimError> {
     let mut same_instant = 0;
+    let mut empty_since = world.now();
+    let mut emptied_at = None;
     loop {
         let at = world.now();
         // The world is this crate's own deterministic forge: an observation
@@ -227,6 +244,15 @@ fn drive(
             .unwrap_or_else(|e| panic!("the simulated world failed to observe at t={at}: {e}"));
         if let Some(events) = trace.as_deref_mut() {
             events.extend(world.take_trace());
+        }
+        let empty =
+            observation.prs.is_empty() && observation.batches.is_empty() && world.out() == 0;
+        // A departed pull request's own CI run still runs, and is billed,
+        // after the world empties; the replication ended when it emptied.
+        if !empty {
+            emptied_at = None;
+        } else if emptied_at.is_none() {
+            emptied_at = Some(at);
         }
         let plan = scheduler
             .step(&observation)
@@ -246,14 +272,14 @@ fn drive(
             continue;
         }
         same_instant = 0;
-        match world.next_event() {
-            None if observation.prs.is_empty()
-                && observation.batches.is_empty()
-                && world.out() == 0 =>
-            {
-                return Ok(());
-            }
-            None => {
+        let stalled_at = if empty {
+            u64::MAX
+        } else {
+            world.last_progress().max(empty_since).saturating_add(stall)
+        };
+        match (world.next_event(), emptied_at) {
+            (None, Some(emptied)) => return Ok(End::drained(emptied)),
+            (None, None) => {
                 return Err(SimError::Stuck {
                     at,
                     queued: observation.prs.len(),
@@ -261,11 +287,24 @@ fn drive(
                     out: world.out(),
                 });
             }
-            Some(t) if t > deadline => {
-                world.advance_to(deadline);
-                return Ok(());
+            (Some(t), emptied) if t > deadline.min(stalled_at) => {
+                let at = deadline.min(stalled_at);
+                world.advance_to(at);
+                return Ok(emptied.map_or(
+                    End {
+                        at,
+                        cut_off: true,
+                        stalled: stalled_at < deadline,
+                    },
+                    End::drained,
+                ));
             }
-            Some(t) => world.advance_to(t),
+            (Some(t), _) => {
+                world.advance_to(t);
+                if empty {
+                    empty_since = t;
+                }
+            }
         }
     }
 }

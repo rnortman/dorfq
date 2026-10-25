@@ -11,14 +11,14 @@ baseline = "bisect"        # the only column
 
 [world]
 hours = 72                 # arrivals stop after this many hours
-drain_hours = 12           # then the run drains, and stops at hours + drain_hours at the latest
+drain_hours = 1000         # the backstop: a run lasts until its queue empties, and stops at hours + drain_hours at the latest
+stall_hours = 168          # a run is cut off as stalled this long after its last landing or ejection
 arrivals_per_hour = 5.0    # mean rate of new pull requests
 ci_minutes = { min = 45, max = 120 }   # uniform duration of a batch's CI run
 pr_ci_minutes = { min = 45, max = 120 }   # uniform duration of a pull request's own CI run
 rebase_minutes = { min = 15, max = 120 }   # uniform delay from a rebase becoming necessary to the author's push of it
 pr_ci_on_base_landed = true   # the repository re-runs a pull request's own CI when its base lands
-p_bad = 0.05               # a pull request breaks on its own against trunk
-p_interact = 0.005         # a pair whose queue time overlapped breaks only together
+p_interact = 0.005         # a pair conflicts: a run with both fails; whichever lands first breaks the other
 p_flake = 0.03             # a run fails for no reason in the tree
 p_conflict = 0.02          # a stack arrives with its root conflicting against trunk
 repush_per_hour = 0.02     # per open pull request, the rate at which its author pushes a new head

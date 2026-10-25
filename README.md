@@ -43,30 +43,31 @@ that probability, and `landing` whether a landing regrows every other
 belief by the interaction prior or transfers each pair's belief. Both are
 measured with `dorfq-sim`, a seeded,
 event-driven simulator that runs any scheduler against a world of pull
-requests with hidden truths (bad ones, pairs that break only together,
-flaky runs) and reports runner-hours per landed pull request, time to land
-and to reject, wasted runner time and false ejections. The capacity knob is
+requests with hidden truths (pairs that break when tested together and
+break whichever lands second, flaky runs; no pull request is bad on its
+own) and reports runner-hours per landed pull request, time to land,
+to reject and from breaking to ejection, wasted runner time and false
+ejections, running each replication until its queue empties. The capacity knob is
 each policy's `lanes`, the batches it runs at once: dorfq's columns in an
 example share one capacity, and `github-like` runs at the concurrency
 GitHub's queue is given in practice. PR CI, the CI a pull request runs on its own, runs
 beside the queue, on capacity the queue does not own: at arrival, after each
-push, and after the rebase a conflict forces. As the GitHub forge does, the
-world lets a pull request into a batch only once its current head has
-passed, so time to land includes it. The queue is billed only for the PR CI
+push, and after the rebase a conflict forces. It fails when the pull
+request is broken against trunk, and its author then pushes a fix. As the
+GitHub forge does, the world lets a pull request into a batch only once its
+current head has passed, so time to land includes it. The queue is billed only for the PR CI
 it causes by landing part of a stack — the run of each direct child of what
 landed, which under GitHub's admission is every pull request of a stack in
 turn. In the busy example world, a high-velocity team's with batch and PR
-CI of 45 to 120 minutes, `bayes` is the status quo at its best measured
-settings, and lands the most: 170 against 157 for `bisect`, whose best
-cap there is 1 (no pooling at all), and 140 for `github-like`, at 3.2
-runner-hours per landed pull request against their 4.6 and 5.5.
-`bayes-tree`, the tree of futures at the same settings, lands 159 at 2.2
-runner-hours per landed, ejects 6 of the bad pull requests against
-`bayes`'s 32 and leaves 89 unfinished against 27. Over the speculation
-sweep the tree lands more only under overload, and at the cost of
-resolution: about 80% fewer bad pull requests ejected and about three
-times as many left unfinished, at about 40% fewer runner-hours per landed;
-see **Simulator reports**.
+CI of 45 to 120 minutes, `bayes`, the status quo, lands 264 at 1.7
+runner-hours per landed pull request, ejecting 47 bad pull requests and
+1.5 good ones, against 238 for `bisect` at cap 1 (no pooling at all; 70
+bad and 17 good ejected, 3.1 runner-hours per landed) and 239 for
+`github-like` (39 and 26, 3.2). `bayes-tree`, the tree of futures at the
+same settings, lands 278 at 1.3 runner-hours per landed and ejects 28 bad
+pull requests and 0.8 good ones, at a median of 12 hours from a pull
+request breaking to its ejection against `bayes`'s 5.5; see **Simulator
+reports**.
 
 ```sh
 make run ARGS="run --config $PWD/crates/dorfq/examples/mock.toml --exit-when-idle"
@@ -111,8 +112,9 @@ and `[[axis]]` tables, each with `keys` (fields such as
 `values` and optional `labels`. The sweep runs every point of the axes'
 cartesian product and prints one row per point and policy with every
 metric's mean over the replications, then each policy's mean relative
-delta against the baseline over the points, with the count of points at
-which it is better. `--json PATH` writes every replication's metrics,
+delta against the baseline over the points where the baseline's is not 0,
+with the counts of points at which it is better and worse, `(B+ W- /N)`,
+over every point where both have the metric. `--json PATH` writes every replication's metrics,
 `--jobs N` caps the threads. Two sweep files ship in
 `crates/dorfq-sim/sweeps/`: `speculation.toml` compares the `bayes` flag
 combinations with each other and with `github-like` over arrival rate, CI
