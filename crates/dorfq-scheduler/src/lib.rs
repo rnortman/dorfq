@@ -10,7 +10,10 @@
 //!   queued pull request, beliefs for pairs that failed together and a flake
 //!   rate, updated exactly from every run's verdict; batches chosen by
 //!   expected value against a run's cost, and a pull request ejected only
-//!   when a failed run singles it out.
+//!   when a failed run singles it out. Its `speculation` flag chooses
+//!   between one chain of batches with culprit finders on trunk beside it
+//!   (`chain`) and a tree of futures that scores batches on every standing
+//!   tip and beside every pending batch by the chance they land (`tree`).
 //!
 //! All three batch stacked pull requests, every member after its base, and
 //! keep an `Atomic` pull request with its ancestors:
@@ -22,7 +25,7 @@
 //!   ejects its `Atomic` members and retests the ancestors.
 //! - `Bayes` grows batches from the same units, never treats a child and its
 //!   base as a pair cause (the child's own CI tested them together), and runs
-//!   a stacked suspect's culprit finder with every enqueued ancestor.
+//!   a stacked suspect's batch with every enqueued ancestor not beneath it.
 //!
 //! [`SchedulerConfig`] is the configuration both the application and the
 //! simulator parse to choose and build one of them.
@@ -44,7 +47,7 @@ mod test_support;
 
 pub use all_at_once::AllAtOnce;
 pub use bisect::Bisect;
-pub use config::{BayesConfig, ConfigError, SchedulerConfig};
+pub use config::{BayesConfig, Charge, ConfigError, Landing, SchedulerConfig, Speculation};
 
 /// A pull request at a head: re-pushing it makes a different member.
 type Member = (PrNumber, Sha);

@@ -1,0 +1,45 @@
+# The pipelined bisect's batch cap at two capacities, in the busy example's
+# world. Run it with:
+#   make sweep ARGS="--config $PWD/crates/dorfq-sim/sweeps/bisect-cap.toml"
+#
+# One column, so the output is the grid alone; the busy example's bisect
+# column runs at the cap that lands the most here at dorfq's lanes.
+
+seed = 1                   # master seed; every replication's streams derive from it
+replications = 4           # independent runs per point, each from its own seed
+baseline = "bisect"        # the only column
+
+[world]
+hours = 72                 # arrivals stop after this many hours
+drain_hours = 12           # then the run drains, and stops at hours + drain_hours at the latest
+arrivals_per_hour = 5.0    # mean rate of new pull requests
+ci_minutes = { min = 45, max = 120 }   # uniform duration of a batch's CI run
+pr_ci_minutes = { min = 45, max = 120 }   # uniform duration of a pull request's own CI run
+rebase_minutes = { min = 15, max = 120 }   # uniform delay from a rebase becoming necessary to the author's push of it
+pr_ci_on_base_landed = true   # the repository re-runs a pull request's own CI when its base lands
+p_bad = 0.05               # a pull request breaks on its own against trunk
+p_interact = 0.005         # a pair whose queue time overlapped breaks only together
+p_flake = 0.03             # a run fails for no reason in the tree
+p_conflict = 0.02          # a stack arrives with its root conflicting against trunk
+repush_per_hour = 0.02     # per open pull request, the rate at which its author pushes a new head
+withdraw_per_hour = 0.005  # per open pull request, the rate at which its author takes it out of the queue
+stack_sizes = [16, 16, 15, 13, 11, 9, 7, 5, 3, 2, 2, 1]   # relative weights of a stack arriving with 1, 2, … 12 pull requests
+p_stack_grows = 0.3        # a stack later gets a second burst of pull requests on top
+stack_growth_sizes = [3, 2, 1]   # relative weights of that burst bringing 1, 2 or 3 pull requests
+stack_growth_minutes = { min = 30, max = 480 }   # uniform delay from a stack's arrival to that second burst
+p_atomic = 0.2             # a stack lands only whole
+
+[[policy]]
+name = "bisect"
+admission = "label"
+kind = "bisect"
+lanes = 8
+max_batch = 1
+
+[[axis]]
+keys = ["policy.bisect.lanes"]
+values = [4, 8]
+
+[[axis]]
+keys = ["policy.bisect.max_batch"]
+values = [1, 2, 4, 8, 16, 30]

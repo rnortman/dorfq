@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use dorfq_core::{BatchId, PrNumber, PrSnapshot, Sha};
 
-use crate::{ancestors, bases};
+use crate::{Landing, ancestors, bases};
 
 /// The belief an alibi leaves: inference treats a cause at the floor as
 /// false, and decay can raise it again.
@@ -40,6 +40,14 @@ impl Cause {
             Cause::Pair(i, j) => i == pr || j == pr,
         }
     }
+
+    /// The pull request, or the pair's two.
+    pub(crate) fn prs(&self) -> Vec<PrNumber> {
+        match *self {
+            Cause::Bad(i) => vec![i],
+            Cause::Pair(i, j) => vec![i, j],
+        }
+    }
 }
 
 /// The prior probabilities the model starts from.
@@ -65,6 +73,8 @@ pub(crate) struct FailedRun {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Model {
     pub(crate) priors: Priors,
+    /// What a landing does to the beliefs of what stays queued.
+    landing: Landing,
     /// Each queued pull request's head and its `Bad` belief.
     bad: BTreeMap<PrNumber, (Sha, f64)>,
     /// Pairs a failed run exercised, with their belief.
@@ -76,9 +86,10 @@ pub(crate) struct Model {
 }
 
 impl Model {
-    pub(crate) fn new(priors: Priors) -> Model {
+    pub(crate) fn new(priors: Priors, landing: Landing) -> Model {
         Model {
             priors,
+            landing,
             bad: BTreeMap::new(),
             pairs: BTreeMap::new(),
             evidence: VecDeque::new(),
@@ -92,8 +103,15 @@ impl Model {
     /// leave every run if it is in `landed`, and otherwise every run that
     /// exercised one of them leaves with it. `landed` is what reached trunk,
     /// by the queue or by another hand. The bases of `prs` replace the stack
-    /// relation the model holds.
+    /// relation the model holds. Under [`Landing::Transfer`], first, every
+    /// pull request the model holds takes into its `Bad` belief its
+    /// pair belief with each one in `landed`, judged by the stack relation
+    /// held before this observation: once one of a pair is trunk, the pair
+    /// failing is the other failing on trunk.
     pub(crate) fn sync(&mut self, prs: &[PrSnapshot], landed: &BTreeSet<PrNumber>) {
+        if self.landing == Landing::Transfer {
+            self.transfer(landed);
+        }
         let base = bases(prs);
         self.ancestors = prs
             .iter()
@@ -107,7 +125,6 @@ impl Model {
             .map(|(pr, _)| *pr)
             .collect();
         for pr in gone {
-            // TODO(bayes-landing-transfers-pair-belief)
             if landed.contains(&pr) {
                 for run in &mut self.evidence {
                     run.exercised.retain(|cause| !cause.involves(pr));
@@ -125,6 +142,28 @@ impl Model {
                 .or_insert_with(|| (head.clone(), self.priors.p_bad));
         }
         self.prune();
+    }
+
+    /// Each pull request the model holds, other than those in `landed`,
+    /// takes in its pair belief with each of `landed`, up to `1 − FLOOR`.
+    fn transfer(&mut self, landed: &BTreeSet<PrNumber>) {
+        let survive: Vec<(PrNumber, f64)> = self
+            .bad
+            .keys()
+            .filter(|pr| !landed.contains(pr))
+            .map(|&b| {
+                let survive = landed
+                    .iter()
+                    .map(|&a| 1.0 - self.belief(Cause::pair(a, b)))
+                    .product();
+                (b, survive)
+            })
+            .collect();
+        for (pr, survive) in survive {
+            if let Some((_, p)) = self.bad.get_mut(&pr) {
+                *p = (1.0 - (1.0 - *p) * survive).min(1.0 - FLOOR);
+            }
+        }
     }
 
     /// Whether one of `a`, `b` is a queued ancestor of the other: the
@@ -396,7 +435,7 @@ mod tests {
     fn a_pair_within_one_stack_is_never_exercised_materialised_or_believed() {
         // 3 on 2 on 1, and 4 on trunk.
         let prs = vec![ready(1), stacked(2, 1), stacked(3, 2), ready(4)];
-        let mut model = Model::new(priors());
+        let mut model = Model::new(priors(), Landing::Decay);
         model.sync(&prs, &none());
         assert!(model.related(PrNumber(1), PrNumber(3)));
         assert!(model.related(PrNumber(3), PrNumber(2)));
@@ -435,10 +474,13 @@ mod tests {
 
     #[test]
     fn decay_stops_below_one() {
-        let mut model = Model::new(Priors {
-            p_interact: 0.5,
-            ..priors()
-        });
+        let mut model = Model::new(
+            Priors {
+                p_interact: 0.5,
+                ..priors()
+            },
+            Landing::Decay,
+        );
         model.sync(&ready_all(&[1, 2, 3]), &none());
         for _ in 0..60 {
             model.decay(&BTreeSet::from([PrNumber(9)]));
@@ -451,6 +493,74 @@ mod tests {
             let p = inference.posterior(&model, bad(n));
             assert!(p.is_finite() && p > 0.99, "{n}: {p}");
         }
+    }
+
+    /// A model at [`priors`] under `transfer`, holding `prs`.
+    fn transferring(prs: &[PrSnapshot]) -> Model {
+        let mut model = Model::new(priors(), Landing::Transfer);
+        model.sync(prs, &none());
+        model
+    }
+
+    fn landing(prs: &[u64]) -> BTreeSet<PrNumber> {
+        prs.iter().copied().map(PrNumber).collect()
+    }
+
+    #[test]
+    fn transfer_regrows_an_untouched_pair_exactly_as_decay_does() {
+        let mut decayed = model(&[1, 2, 3, 4]);
+        decayed.passed(&members(&[4]));
+        decayed.decay(&landing(&[1, 2]));
+        let mut transferred = transferring(&ready_all(&[1, 2, 3, 4]));
+        transferred.passed(&members(&[4]));
+        transferred.sync(&ready_all(&[3, 4]), &landing(&[1, 2]));
+        for n in [3, 4] {
+            let (d, t) = (decayed.belief(bad(n)), transferred.belief(bad(n)));
+            assert!((d - t).abs() < 1e-15, "{n}: {d} {t}");
+        }
+        assert_eq!(transferred.belief(bad(1)), 0.0);
+    }
+
+    #[test]
+    fn transfer_takes_a_pairs_held_belief_so_an_alibied_pair_barely_regrows() {
+        let mut model = transferring(&ready_all(&[1, 2, 3]));
+        // The failure materialises every pair at the prior; the pass alibis
+        // 1, 2 and their pair.
+        model.failed(BatchId(1), &members(&[1, 2, 3]));
+        model.passed(&members(&[1, 2]));
+        model.sync(&ready_all(&[2, 3]), &landing(&[1]));
+        let floor_twice = 1.0 - (1.0 - FLOOR) * (1.0 - FLOOR);
+        assert!((model.belief(bad(2)) - floor_twice).abs() < 1e-15);
+        // Pair (1, 3) held the prior, so 3 regrows by it.
+        assert!((model.belief(bad(3)) - (1.0 - 0.95 * 0.998)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn transfer_leaves_a_child_whose_base_landed_and_a_repushed_one_alone() {
+        // 2 on 1, and 3 on trunk.
+        let mut model = transferring(&[ready(1), stacked(2, 1), ready(3)]);
+        let mut retargeted = stacked(2, 1);
+        retargeted.base = PrBase::Trunk;
+        model.sync(&[retargeted, repushed(3)], &landing(&[1]));
+        // The child's own CI tested it on its base, so nothing transfers.
+        assert!((model.belief(bad(2)) - 0.05).abs() < 1e-15);
+        // A re-pushed pull request starts again at the prior.
+        assert_eq!(model.belief(bad(3)), 0.05);
+    }
+
+    #[test]
+    fn transfer_stops_below_one() {
+        let mut model = Model::new(
+            Priors {
+                p_interact: 0.9,
+                ..priors()
+            },
+            Landing::Transfer,
+        );
+        let prs: Vec<u64> = (1..=40).collect();
+        model.sync(&ready_all(&prs), &none());
+        model.sync(&ready_all(&[40]), &landing(&prs[..39]));
+        assert_eq!(model.belief(bad(40)), 1.0 - FLOOR);
     }
 
     #[test]

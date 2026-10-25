@@ -1,4 +1,15 @@
 //! Choosing and parameterising a scheduler.
+//!
+//! A change to what a scheduler decides is a flag: an enum field on that
+//! scheduler's config, one variant per behaviour, the status quo named for
+//! what it is and never `off` or `on`. A variant that carries parameters
+//! makes the flag a `kind`-tagged table, as [`SchedulerConfig`] is, so a
+//! parameter meaningless under one variant is absent from it; a flag whose
+//! variants carry none is a bare string. Every flag is required and has no
+//! default, so a configuration names every behaviour it runs with. Each
+//! flag's doc comment states which other parameters change meaning under
+//! each variant. A flag is retired by deleting the losing variant and the
+//! field.
 
 use std::error::Error;
 use std::fmt;
@@ -51,6 +62,64 @@ pub struct BayesConfig {
     pub others_below: f64,
     /// A candidate starts when its score exceeds this.
     pub speculate_above: f64,
+    /// How batches beyond the first are chosen.
+    pub speculation: Speculation,
+    /// How `run_cost` enters a candidate's score.
+    pub charge: Charge,
+    /// What a landing does to the beliefs about what stays queued.
+    pub landing: Landing,
+}
+
+/// How the scheduler chooses batches beyond the first.
+///
+/// `lanes` bounds the pending batches under both variants. Under `tree`, an
+/// unresolvable hypothetical failure scores no resolution credit, where
+/// under `chain` it stops the step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Speculation {
+    /// One chain of batches built to land, each on the previous tip, and
+    /// culprit finders on trunk beside it; at most one extension a step.
+    Chain,
+    /// Every standing batch's tip is a node, and so is trunk; candidates on
+    /// every node are scored at the chance their batch lands, which counts
+    /// each older batch on the same node failing, and a batch whose node
+    /// dies, or whose chance of landing falls to zero, is cancelled.
+    Tree,
+}
+
+/// How a run's cost enters the score of a candidate whose base stands with
+/// probability `p_node`.
+///
+/// `speculate_above` is a threshold on the score each variant gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Charge {
+    /// `p_node · (EV − run_cost)`: the cost shrinks with the chance the
+    /// base stands.
+    Discounted,
+    /// `p_node · EV − run_cost`: a run occupies its lane whether or not its
+    /// base stands, so the cost is paid in full.
+    Full,
+}
+
+/// What a landing does to the `Bad` belief of every pull request that stays
+/// queued.
+///
+/// Under `decay`, `p_interact` is the regrowth per landed pull request of
+/// every other belief; under `transfer`, only of those whose pair with the
+/// landed pull request no run has touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Landing {
+    /// Each queued pull request's `Bad` regrows by one `p_interact` per
+    /// pull request the queue landed.
+    Decay,
+    /// Each queued pull request's `Bad` absorbs its pair belief with each
+    /// pull request that reached trunk, by the queue or by another hand: the
+    /// prior for an untouched pair, the floor for an alibied one, nothing
+    /// for a stack relative.
+    Transfer,
 }
 
 /// A parameter outside its range.
@@ -197,6 +266,9 @@ w_reject = 1.0
 eject_above = 0.9
 others_below = 0.1
 speculate_above = 0.0
+speculation = \"chain\"
+charge = \"discounted\"
+landing = \"decay\"
 ";
 
     fn bayes() -> BayesConfig {
@@ -239,9 +311,74 @@ speculate_above = 0.0
                 eject_above: 0.9,
                 others_below: 0.1,
                 speculate_above: 0.0,
+                speculation: Speculation::Chain,
+                charge: Charge::Discounted,
+                landing: Landing::Decay,
             }
         );
         assert_eq!(SchedulerConfig::Bayes(bayes()).validate(), Ok(()));
+    }
+
+    #[test]
+    fn each_flag_parses_every_variant_by_name() {
+        let with = |from: &str, to: &str| match parse(&BAYES.replace(from, to)).unwrap() {
+            SchedulerConfig::Bayes(config) => config,
+            other => panic!("{other:?}"),
+        };
+        let tree = with("speculation = \"chain\"", "speculation = \"tree\"");
+        assert_eq!(
+            (tree.speculation, tree.charge, tree.landing),
+            (Speculation::Tree, Charge::Discounted, Landing::Decay)
+        );
+        let full = with("charge = \"discounted\"", "charge = \"full\"");
+        assert_eq!((full.charge, full.landing), (Charge::Full, Landing::Decay));
+        let transfer = with("landing = \"decay\"", "landing = \"transfer\"");
+        assert_eq!(
+            (transfer.charge, transfer.landing),
+            (Charge::Discounted, Landing::Transfer)
+        );
+    }
+
+    #[test]
+    fn a_flag_with_an_unknown_variant_or_missing_is_rejected() {
+        for (field, line, variants) in [
+            (
+                "speculation",
+                "speculation = \"chain\"\n",
+                "`chain` or `tree`",
+            ),
+            (
+                "charge",
+                "charge = \"discounted\"\n",
+                "`discounted` or `full`",
+            ),
+            ("landing", "landing = \"decay\"\n", "`decay` or `transfer`"),
+        ] {
+            // Inside the `kind`-tagged table the error names the variants
+            // the flag accepts, not the field.
+            let message = parse(&BAYES.replace(line, &format!("{field} = \"on\"\n"))).unwrap_err();
+            assert!(
+                message.contains("unknown variant `on`") && message.contains(variants),
+                "{message}"
+            );
+            let message = parse(&BAYES.replace(line, "")).unwrap_err();
+            assert!(message.contains(field), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_bayes_config_round_trips_through_toml_with_its_flags() {
+        let config = SchedulerConfig::Bayes(BayesConfig {
+            speculation: Speculation::Tree,
+            charge: Charge::Full,
+            landing: Landing::Transfer,
+            ..bayes()
+        });
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("speculation = \"tree\""), "{text}");
+        assert!(text.contains("charge = \"full\""), "{text}");
+        assert!(text.contains("landing = \"transfer\""), "{text}");
+        assert_eq!(parse(&text).unwrap(), config);
     }
 
     #[test]

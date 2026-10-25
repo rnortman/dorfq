@@ -297,7 +297,7 @@ impl WorldConfig {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use dorfq_scheduler::BayesConfig;
+    use dorfq_scheduler::{BayesConfig, Charge, Landing, Speculation};
 
     pub(crate) const WORLD: &str = "\
 hours = 48
@@ -365,8 +365,8 @@ max_batch = 16
         assert_eq!(config.world.drain_hours, 24);
         assert_eq!(config.world.arrivals_per_hour, 0.75);
         assert!(config.world.pr_ci_on_base_landed);
-        assert_eq!(config.world.ci_minutes, Minutes { min: 150, max: 210 });
-        assert_eq!(config.world.pr_ci_minutes, Minutes { min: 40, max: 60 });
+        assert_eq!(config.world.ci_minutes, Minutes { min: 45, max: 120 });
+        assert_eq!(config.world.pr_ci_minutes, Minutes { min: 45, max: 120 });
         assert_eq!(config.world.rebase_minutes, Minutes { min: 15, max: 120 });
         let sizes = [
             16.0, 16.0, 15.0, 13.0, 11.0, 9.0, 7.0, 5.0, 3.0, 2.0, 2.0, 1.0,
@@ -393,9 +393,25 @@ max_batch = 16
                 Admission::Label,
                 Admission::Github,
                 Admission::Label,
+                Admission::Label,
                 Admission::Label
             ]
         );
+        let bayes = |speculation, charge| BayesConfig {
+            lanes: 2,
+            max_batch: 16,
+            p_bad: 0.05,
+            p_interact: 0.002,
+            p_flake: 0.02,
+            run_cost: 0.5,
+            w_reject: 1.0,
+            eject_above: 0.9,
+            others_below: 0.1,
+            speculate_above: 0.0,
+            speculation,
+            charge,
+            landing: Landing::Decay,
+        };
         assert_eq!(
             policies,
             [
@@ -403,7 +419,7 @@ max_batch = 16
                 (
                     "github-like",
                     &SchedulerConfig::Bisect {
-                        lanes: 2,
+                        lanes: 16,
                         max_batch: 1
                     }
                 ),
@@ -416,31 +432,29 @@ max_batch = 16
                 ),
                 (
                     "bayes",
-                    &SchedulerConfig::Bayes(BayesConfig {
-                        lanes: 2,
-                        max_batch: 24,
-                        p_bad: 0.05,
-                        p_interact: 0.002,
-                        p_flake: 0.02,
-                        run_cost: 0.5,
-                        w_reject: 1.0,
-                        eject_above: 0.9,
-                        others_below: 0.1,
-                        speculate_above: 0.0,
-                    })
+                    &SchedulerConfig::Bayes(bayes(Speculation::Chain, Charge::Discounted))
+                ),
+                (
+                    "bayes-tree",
+                    &SchedulerConfig::Bayes(bayes(Speculation::Tree, Charge::Full))
                 ),
             ]
         );
     }
 
     #[test]
-    fn the_busy_world_parses_with_its_four_policies() {
+    fn the_busy_world_parses_with_its_five_policies() {
         let config = SimConfig::parse(include_str!("../examples/busy.toml")).unwrap();
         assert_eq!(config.world.arrivals_per_hour, 5.0);
+        assert_eq!(config.world.ci_minutes, Minutes { min: 45, max: 120 });
+        assert_eq!(
+            (config.world.p_flake, config.world.p_interact),
+            (0.03, 0.005)
+        );
         assert!(config.world.pr_ci_on_base_landed);
         assert_eq!(config.world.stack_sizes.len(), 12);
         assert_eq!(config.world.stack_growth_sizes, [3.0, 2.0, 1.0]);
-        assert_eq!(config.world.pr_ci_minutes, Minutes { min: 15, max: 25 });
+        assert_eq!(config.world.pr_ci_minutes, Minutes { min: 45, max: 120 });
         assert_eq!(config.world.rebase_minutes, Minutes { min: 15, max: 120 });
         let admissions: Vec<Admission> = config.policy.iter().map(|p| p.admission).collect();
         assert_eq!(
@@ -449,36 +463,59 @@ max_batch = 16
                 Admission::Label,
                 Admission::Github,
                 Admission::Label,
+                Admission::Label,
                 Admission::Label
             ]
         );
         let names: Vec<&str> = config.policy.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["all-at-once", "github-like", "bisect", "bayes"]);
+        assert_eq!(
+            names,
+            [
+                "all-at-once",
+                "github-like",
+                "bisect",
+                "bayes",
+                "bayes-tree"
+            ]
+        );
         assert_eq!(
             config.policy[1].scheduler,
             SchedulerConfig::Bisect {
-                lanes: 6,
+                lanes: 16,
                 max_batch: 1
             }
         );
         assert_eq!(
             config.policy[2].scheduler,
             SchedulerConfig::Bisect {
-                lanes: 6,
+                lanes: 8,
                 max_batch: 1
             }
         );
-        let SchedulerConfig::Bayes(bayes) = config.policy[3].scheduler else {
-            panic!("{:?}", config.policy[3]);
-        };
-        assert_eq!((bayes.lanes, bayes.max_batch), (6, 4));
+        let flags: Vec<_> = config.policy[3..]
+            .iter()
+            .map(|p| {
+                let SchedulerConfig::Bayes(bayes) = p.scheduler else {
+                    panic!("{p:?}");
+                };
+                assert_eq!((bayes.lanes, bayes.max_batch), (8, 8));
+                assert_eq!(
+                    (bayes.p_bad, bayes.p_interact, bayes.p_flake),
+                    (
+                        config.world.p_bad,
+                        config.world.p_interact,
+                        config.world.p_flake
+                    )
+                );
+                (bayes.speculation, bayes.charge, bayes.landing)
+            })
+            .collect();
         assert_eq!(
-            (bayes.p_bad, bayes.p_interact, bayes.p_flake),
-            (
-                config.world.p_bad,
-                config.world.p_interact,
-                config.world.p_flake
-            )
+            flags,
+            [
+                (Speculation::Chain, Charge::Discounted, Landing::Decay),
+                (Speculation::Tree, Charge::Full, Landing::Decay)
+            ]
         );
     }
 
@@ -499,15 +536,16 @@ max_batch = 16
             value["policy"][1],
             serde_json::json!({
                 "name": "github-like", "admission": "github",
-                "kind": "bisect", "lanes": 2, "max_batch": 1
+                "kind": "bisect", "lanes": 16, "max_batch": 1
             })
         );
     }
 
-    /// `lanes` is the capacity knob, so a comparison across an example's
-    /// columns holds it equal.
+    /// `lanes` is the capacity knob, so a comparison across dorfq's columns
+    /// holds it equal; `github-like` runs at the concurrency GitHub's queue
+    /// is given in practice.
     #[test]
-    fn every_policy_with_lanes_in_an_example_has_the_same_lanes() {
+    fn every_policy_with_lanes_but_github_like_in_an_example_has_the_same_lanes() {
         for (name, text) in [
             ("sim.toml", include_str!("../examples/sim.toml")),
             ("busy.toml", include_str!("../examples/busy.toml")),
@@ -516,6 +554,7 @@ max_batch = 16
             let lanes: BTreeSet<usize> = config
                 .policy
                 .iter()
+                .filter(|p| p.name != "github-like")
                 .filter_map(|p| match &p.scheduler {
                     SchedulerConfig::Bisect { lanes, .. } => Some(*lanes),
                     SchedulerConfig::Bayes(bayes) => Some(bayes.lanes),

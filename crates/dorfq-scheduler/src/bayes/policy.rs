@@ -1,20 +1,21 @@
-//! Each step of the Bayesian scheduler: ingest, eject, retire, land, start.
+//! Each step of the Bayesian scheduler: ingest and infer, then plan under
+//! the configured speculation; and the pieces both plans share.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use dorfq_core::{
-    BatchId, BatchStart, BatchState, BatchStatus, CiStatus, ConflictWith, Departed, EjectReason,
-    Observation, Plan, PrNumber, Scheduler, SchedulerError, Sha,
+    BatchId, BatchState, BatchStatus, CiStatus, ConflictWith, Departed, EjectReason, Observation,
+    Plan, PrNumber, Scheduler, SchedulerError, Sha,
 };
 
 use super::Bayes;
 use super::infer::{Inference, Unresolved};
 use super::model::Cause;
 use crate::stacks::{Footing, Stacks};
-use crate::{Ejections, Member, chain, is_pending};
+use crate::{Charge, Ejections, Landing, Member, Speculation, is_pending};
 
-/// What this step does with one tracked batch.
-enum Fate {
+/// What a step does with one tracked batch.
+pub(super) enum Fate {
     /// Landed by this plan.
     Land,
     /// Left running, or waiting for its base to land.
@@ -25,22 +26,26 @@ enum Fate {
     Retire,
 }
 
-/// What a candidate batch is for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    /// Built on the chain's end, to land; on an empty chain, on trunk.
-    Extension,
-    /// Built on trunk for its verdict about a suspect.
-    Finder,
+/// Whether `batch` holds a member no longer queued at the head it was
+/// built with: such a batch can never land, and nothing stands on it.
+pub(super) fn doomed(heads: &BTreeMap<PrNumber, &Sha>, batch: &BatchStatus) -> bool {
+    batch
+        .members
+        .iter()
+        .any(|m| heads.get(&m.pr) != Some(&&m.head))
 }
 
-/// A batch the step could start.
-#[derive(Debug, Clone, PartialEq)]
-struct Candidate {
-    kind: Kind,
-    base: Sha,
-    members: Vec<Member>,
-    score: f64,
+/// The members of the batches `fates` lands.
+pub(super) fn landing_members<'a>(
+    observation: &'a Observation,
+    fates: &'a [Fate],
+) -> impl Iterator<Item = PrNumber> + 'a {
+    observation
+        .batches
+        .iter()
+        .zip(fates)
+        .filter(|(_, fate)| matches!(fate, Fate::Land))
+        .flat_map(|(batch, _)| batch.members.iter().map(|m| m.pr))
 }
 
 /// For each cause some run singles out, the last such run in `runs`: the
@@ -152,7 +157,9 @@ impl Bayes {
                         self.model.failed(batch.id, tree);
                     }
                 }
-                BatchState::Landed { .. } if self.landings.insert(batch.id) => {
+                BatchState::Landed { .. }
+                    if self.params.landing == Landing::Decay && self.landings.insert(batch.id) =>
+                {
                     self.model
                         .decay(&batch.members.iter().map(|m| m.pr).collect());
                 }
@@ -166,7 +173,12 @@ impl Bayes {
 
     /// The probability that a batch of `members` passes on a node whose tree
     /// beyond trunk is `below`.
-    fn p_pass(&self, inference: &Inference, members: &[Member], below: &[Member]) -> f64 {
+    pub(super) fn p_pass(
+        &self,
+        inference: &Inference,
+        members: &[Member],
+        below: &[Member],
+    ) -> f64 {
         let posterior = |cause| inference.posterior(&self.model, cause);
         let mut p = 1.0 - self.params.p_flake;
         for (n, &(i, _)) in members.iter().enumerate() {
@@ -181,7 +193,7 @@ impl Bayes {
     /// The resolution value of a batch of `members` on a node whose tree
     /// beyond trunk is `below`: `w_reject` per pull request its failure
     /// would single out, beyond those `ejected` already.
-    fn resolution(
+    pub(super) fn resolution(
         &self,
         inference: &Inference,
         members: &[Member],
@@ -216,9 +228,13 @@ impl Bayes {
         Ok(self.params.w_reject * resolved.len() as f64)
     }
 
-    /// `P(n) · EV(B, n)` for a batch of `members` on a node whose tree beyond
-    /// trunk is `below` and which stands with probability `p_node`.
-    fn score(
+    /// The score of a batch of `members` on a node whose tree beyond trunk is
+    /// `below` and which stands with probability `p_node`: its value,
+    /// `p·|B| + (1 − p)·R`, weighted by `p_node`, less `run_cost` as
+    /// [`Charge`] places it. Under [`Speculation::Tree`] a failure whose
+    /// consequence cannot be resolved counts `R = 0`; under `Chain` it is
+    /// the error.
+    pub(super) fn score(
         &self,
         inference: &Inference,
         members: &[Member],
@@ -227,9 +243,15 @@ impl Bayes {
         ejected: &BTreeSet<PrNumber>,
     ) -> Result<f64, Unresolved> {
         let p = self.p_pass(inference, members, below);
-        let resolution = self.resolution(inference, members, below, ejected)?;
-        let ev = p * members.len() as f64 + (1.0 - p) * resolution - self.params.run_cost;
-        Ok(p_node * ev)
+        let resolution = match self.resolution(inference, members, below, ejected) {
+            Err(_) if self.params.speculation == Speculation::Tree => 0.0,
+            resolution => resolution?,
+        };
+        let value = p * members.len() as f64 + (1.0 - p) * resolution;
+        Ok(match self.params.charge {
+            Charge::Discounted => p_node * (value - self.params.run_cost),
+            Charge::Full => p_node * value - self.params.run_cost,
+        })
     }
 
     /// Grows a batch on a node from `units`, in order, while its score
@@ -237,7 +259,7 @@ impl Bayes {
     /// trunk, an earlier member, or beneath the node in `footing`; a unit
     /// that would take the batch past `max_batch` is skipped unless the
     /// batch is empty, so an `Atomic` stack larger than the cap runs alone.
-    fn grow(
+    pub(super) fn grow(
         &self,
         inference: &Inference,
         footing: &Footing,
@@ -269,27 +291,35 @@ impl Bayes {
         Ok((!members.is_empty()).then_some((members, best)))
     }
 
-    /// The culprit finders: per component, a batch for each of its three
+    /// The suspect batches for a node whose tree beyond the observation's
+    /// trunk holds `beneath`: per component, a batch for each of its three
     /// most probable causes, and one of its two most probable `Bad` suspects
-    /// together. A finder runs on trunk, so it holds its suspects' closures:
-    /// each suspect with every enqueued ancestor, bases first. Only finders
-    /// whose members are all batchable and in `pool` are generated.
-    fn finders(&self, inference: &Inference, stacks: &Stacks, pool: &[Member]) -> Vec<Vec<Member>> {
+    /// together. Each holds its suspects' closures less `beneath`: each
+    /// suspect with every enqueued ancestor not beneath the node, bases
+    /// first. Only batches whose suspects are not beneath the node and whose
+    /// members are all batchable and in `pool` are generated.
+    pub(super) fn suspects(
+        &self,
+        inference: &Inference,
+        stacks: &Stacks,
+        pool: &[Member],
+        beneath: &BTreeSet<PrNumber>,
+    ) -> Vec<Vec<Member>> {
         let available: BTreeMap<PrNumber, &Sha> = pool.iter().map(|(pr, h)| (*pr, h)).collect();
         let closure = |suspects: &[PrNumber]| -> Option<Vec<PrNumber>> {
             let mut all: BTreeSet<PrNumber> = BTreeSet::new();
             for &pr in suspects {
+                if beneath.contains(&pr) {
+                    return None;
+                }
                 all.extend(stacks.closure(pr)?);
             }
-            Some(stacks.ordered(all))
+            Some(stacks.ordered(all.difference(beneath).copied()))
         };
         let mut out: Vec<Vec<Member>> = Vec::new();
         for runs in inference.components() {
-            let causes: BTreeSet<Cause> = runs
-                .iter()
-                .flat_map(|&r| inference.effective()[r].iter().copied())
-                .collect();
-            let mut ranked: Vec<(f64, Cause)> = causes
+            let mut ranked: Vec<(f64, Cause)> = inference
+                .component_causes(runs)
                 .into_iter()
                 .map(|cause| (inference.posterior(&self.model, cause), cause))
                 .collect();
@@ -298,16 +328,13 @@ impl Bayes {
             // searched one pair per finder, in rank order; cross-subset
             // finders would locate the failing pair in logarithmically many
             // runs.
-            // TODO(trunk-broken-probe): every finder runs on trunk; after a
-            // flaky pass landed a bad pull request, every one of them fails
-            // and each singles out an innocent suspect.
+            // TODO(trunk-broken-probe): every chain finder runs on trunk;
+            // after a flaky pass landed a bad pull request, every one of them
+            // fails and each singles out an innocent suspect.
             let mut sets: Vec<Vec<PrNumber>> = ranked
                 .iter()
                 .take(3)
-                .map(|&(_, cause)| match cause {
-                    Cause::Bad(i) => vec![i],
-                    Cause::Pair(i, j) => vec![i, j],
-                })
+                .map(|(_, cause)| cause.prs())
                 .collect();
             let bads: Vec<PrNumber> = ranked
                 .iter()
@@ -335,102 +362,20 @@ impl Bayes {
         }
         out
     }
-}
 
-impl Scheduler for Bayes {
-    fn step(&mut self, observation: &Observation) -> Result<Plan, SchedulerError> {
-        self.ids.raise(observation);
-        let heads: BTreeMap<PrNumber, &Sha> = observation
-            .prs
-            .iter()
-            .map(|p| (p.number, &p.head))
-            .collect();
-        self.ingest(observation, &heads);
-        let inference = Inference::of(&self.model).map_err(SchedulerError::new)?;
-        let trunk = &observation.trunk;
-        let mut plan = Plan::default();
-
-        // A batch holding a member no longer queued at the head it was built
-        // with can never land: it is retired, never landed, and never a
-        // live tip, so nothing stands on it.
-        let doomed = |b: &BatchStatus| b.members.iter().any(|m| heads.get(&m.pr) != Some(&&m.head));
-        // Land one chain from trunk; a passed finder lands only on trunk
-        // with no chain batch on trunk, and is otherwise retired.
-        let chain_on_trunk = observation.batches.iter().any(|b| {
-            !self.finders.contains(&b.id)
-                && !doomed(b)
-                && b.base == *trunk
-                && matches!(
-                    b.state,
-                    BatchState::Testing {
-                        ci: CiStatus::Pending | CiStatus::Passed,
-                        ..
-                    }
-                )
-        });
-        let mut live: BTreeSet<&Sha> = BTreeSet::new();
-        let mut after = trunk;
-        let mut fates = Vec::with_capacity(observation.batches.len());
-        for batch in &observation.batches {
-            let finder = self.finders.contains(&batch.id);
-            let base_live = batch.base == *trunk || live.contains(&batch.base);
-            let fate = match &batch.state {
-                BatchState::Testing { .. } if doomed(batch) => Fate::Retire,
-                BatchState::Testing {
-                    ci: CiStatus::Pending,
-                    ..
-                } if finder => Fate::Wait,
-                BatchState::Testing {
-                    tip,
-                    ci: CiStatus::Passed,
-                } if finder => {
-                    if batch.base == *after
-                        && !chain_on_trunk
-                        && observation.split_atomic(batch).is_none()
-                    {
-                        after = tip;
-                        plan.land.push(batch.id);
-                        Fate::Land
-                    } else {
-                        Fate::Retire
-                    }
-                }
-                BatchState::Testing {
-                    tip,
-                    ci: CiStatus::Pending,
-                } if base_live => {
-                    live.insert(tip);
-                    Fate::Wait
-                }
-                BatchState::Testing {
-                    tip,
-                    ci: CiStatus::Passed,
-                } if base_live => {
-                    // An `Atomic` pull request above a member arrived after
-                    // the batch started: the members go back to the pool.
-                    if batch.base == *after && observation.split_atomic(batch).is_some() {
-                        Fate::Retire
-                    } else {
-                        live.insert(tip);
-                        if batch.base == *after {
-                            after = tip;
-                            plan.land.push(batch.id);
-                            Fate::Land
-                        } else {
-                            Fate::Wait
-                        }
-                    }
-                }
-                BatchState::Conflict { pr, with } => Fate::Conflict(*pr, *with),
-                BatchState::Testing { .. }
-                | BatchState::Landed { .. }
-                | BatchState::LandRefused { .. } => Fate::Retire,
-            };
-            fates.push(fate);
-        }
-
+    /// The ejections every plan makes: each culprit a run singles out and
+    /// each conflict, never a member of a batch `fates` lands. A batch left
+    /// waiting that holds an ejected pull request can never land, and its
+    /// fate becomes `Retire`. Returns the ejected pull requests.
+    pub(super) fn eject(
+        &self,
+        observation: &Observation,
+        inference: &Inference,
+        fates: &mut [Fate],
+        plan: &mut Plan,
+    ) -> BTreeSet<PrNumber> {
         let mut ejections = Ejections::new(observation, &mut plan.eject);
-        for (batch, fate) in observation.batches.iter().zip(&fates) {
+        for (batch, fate) in observation.batches.iter().zip(fates.iter()) {
             if matches!(fate, Fate::Land) {
                 ejections.landing(batch);
             }
@@ -452,24 +397,32 @@ impl Scheduler for Bayes {
             ejections.eject(culprit(cause), culprit_reason(cause, batch));
         }
         ejections.eject_conflicting(observation);
-        for fate in &fates {
+        for fate in fates.iter() {
             if let Fate::Conflict(pr, with) = fate {
                 ejections.eject(*pr, EjectReason::Conflicts { with: *with });
             }
         }
 
-        // A batch left waiting that holds a pull request this plan ejects
-        // can never land: it is retired, and nothing builds on it.
         let ejected: BTreeSet<PrNumber> = plan.eject.iter().map(|e| e.pr).collect();
-        for (batch, fate) in observation.batches.iter().zip(&mut fates) {
+        for (batch, fate) in observation.batches.iter().zip(fates.iter_mut()) {
             if matches!(fate, Fate::Wait) && batch.members.iter().any(|m| ejected.contains(&m.pr)) {
                 *fate = Fate::Retire;
             }
         }
+        ejected
+    }
 
+    /// Retires every batch whose fate is neither `Land` nor `Wait`. Returns
+    /// the members of the batches that stay, and how many of them pend.
+    pub(super) fn settle(
+        &self,
+        observation: &Observation,
+        fates: &[Fate],
+        plan: &mut Plan,
+    ) -> (BTreeSet<PrNumber>, usize) {
         let mut in_flight: BTreeSet<PrNumber> = BTreeSet::new();
         let mut pending = 0;
-        for (batch, fate) in observation.batches.iter().zip(&fates) {
+        for (batch, fate) in observation.batches.iter().zip(fates) {
             match fate {
                 Fate::Land | Fate::Wait => {
                     in_flight.extend(batch.members.iter().map(|m| m.pr));
@@ -480,70 +433,34 @@ impl Scheduler for Bayes {
                 Fate::Conflict(..) | Fate::Retire => plan.retire.push(batch.id),
             }
         }
+        (in_flight, pending)
+    }
 
-        if pending >= self.params.lanes {
-            return Ok(plan);
-        }
-        let free = self.params.lanes - pending;
-        let mut taken: BTreeSet<PrNumber> = in_flight.union(&ejected).copied().collect();
-
-        // The chain's end: the newest chain tip still standing once this
-        // plan's landings run. `below` is its tree beyond trunk, and
-        // `p_end` the chance that every pending batch beneath it passes.
-        let (chain_end, path) = chain(
-            after,
-            observation
-                .batches
-                .iter()
-                .zip(&fates)
-                .filter(|(batch, fate)| {
-                    matches!(fate, Fate::Wait) && !self.finders.contains(&batch.id)
-                })
-                .map(|(batch, _)| batch),
-        );
-        let mut below: Vec<Member> = Vec::new();
-        let mut p_end = 1.0;
-        for batch in path.iter().rev() {
-            let members: Vec<Member> = batch
-                .members
-                .iter()
-                .map(|m| (m.pr, m.head.clone()))
-                .collect();
-            if is_pending(&batch.state) {
-                p_end *= self.p_pass(&inference, &members, &below);
-            }
-            below.extend(members);
-        }
-
-        // The members beneath the chain end beyond the observation's trunk:
-        // the standing path, and the batches this plan lands, which are
-        // trunk's by the time the starts run.
-        let beneath: BTreeSet<PrNumber> = below
-            .iter()
-            .map(|m| m.0)
-            .chain(
-                observation
-                    .batches
-                    .iter()
-                    .zip(&fates)
-                    .filter(|(_, fate)| matches!(fate, Fate::Land))
-                    .flat_map(|(batch, _)| batch.members.iter().map(|m| m.pr)),
-            )
-            .collect();
-
-        let stacks = Stacks::new(observation);
-        let member = |n: PrNumber| (n, heads[&n].clone());
-        let pool: Vec<Member> = stacks
+    /// The batchable pull requests not `taken`, at their heads, bases first.
+    pub(super) fn pool(
+        &self,
+        stacks: &Stacks,
+        heads: &BTreeMap<PrNumber, &Sha>,
+        taken: &BTreeSet<PrNumber>,
+    ) -> Vec<Member> {
+        stacks
             .order()
             .iter()
             .copied()
             .filter(|n| !taken.contains(n))
-            .map(member)
-            .collect();
-        if pool.is_empty() {
-            return Ok(plan);
-        }
-        // Whole units with nothing taken, least likely to fail first.
+            .map(|n| (n, heads[&n].clone()))
+            .collect()
+    }
+
+    /// The units with nothing `taken`, at their heads, least likely to fail
+    /// first.
+    pub(super) fn units(
+        &self,
+        inference: &Inference,
+        stacks: &Stacks,
+        heads: &BTreeMap<PrNumber, &Sha>,
+        taken: &BTreeSet<PrNumber>,
+    ) -> Vec<Vec<Member>> {
         // TODO(bayes-atomic-unit-starvation): a large `Atomic` unit sorts
         // late and can be skipped step after step under a standing backlog.
         let risk = |unit: &[Member]| {
@@ -556,103 +473,38 @@ impl Scheduler for Bayes {
             .units()
             .iter()
             .filter(|unit| unit.iter().all(|n| !taken.contains(n)))
-            .map(|unit| unit.iter().copied().map(member).collect())
+            .map(|unit| unit.iter().map(|&n| (n, heads[&n].clone())).collect())
             .collect();
         units.sort_by(|a, b| risk(a).total_cmp(&risk(b)));
+        units
+    }
+}
 
-        let mut candidates: Vec<Candidate> = Vec::new();
-        if let Some((members, score)) = self
-            .grow(
-                &inference,
-                &stacks.on(&beneath),
-                &units,
-                &below,
-                p_end,
-                &ejected,
-            )
-            .map_err(SchedulerError::new)?
-        {
-            candidates.push(Candidate {
-                kind: Kind::Extension,
-                base: chain_end.clone(),
-                members,
-                score,
-            });
+impl Scheduler for Bayes {
+    fn step(&mut self, observation: &Observation) -> Result<Plan, SchedulerError> {
+        self.ids.raise(observation);
+        let heads: BTreeMap<PrNumber, &Sha> = observation
+            .prs
+            .iter()
+            .map(|p| (p.number, &p.head))
+            .collect();
+        self.ingest(observation, &heads);
+        let inference = Inference::of(&self.model).map_err(SchedulerError::new)?;
+        match self.params.speculation {
+            Speculation::Chain => self.chain_plan(observation, &heads, &inference),
+            Speculation::Tree => self.tree_plan(observation, &heads, &inference),
         }
-        for members in self.finders(&inference, &stacks, &pool) {
-            let score = self
-                .score(&inference, &members, &[], 1.0, &ejected)
-                .map_err(SchedulerError::new)?;
-            candidates.push(Candidate {
-                kind: Kind::Finder,
-                base: after.clone(),
-                members,
-                score,
-            });
-        }
-        candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
-
-        let mut chosen: Vec<&Candidate> = Vec::new();
-        for candidate in &candidates {
-            if chosen.len() == free {
-                break;
-            }
-            let extends = candidate.kind == Kind::Extension;
-            if candidate.score > self.params.speculate_above
-                && !(extends && chosen.iter().any(|c| c.kind == Kind::Extension))
-                && candidate.members.iter().all(|m| !taken.contains(&m.0))
-            {
-                taken.extend(candidate.members.iter().map(|m| m.0));
-                chosen.push(candidate);
-            }
-        }
-        // Liveness: a free lane with ready work runs the best candidate on
-        // trunk even when none is worth its run: the fresh batch on an empty
-        // chain, a culprit finder beside a non-empty one. With neither,
-        // nothing starts, and the chain drains.
-        if chosen.is_empty()
-            && let Some(candidate) = candidates.iter().find(|c| c.base == *after)
-        {
-            chosen.push(candidate);
-        }
-
-        for candidate in chosen {
-            let id = self.ids.mint();
-            if candidate.kind == Kind::Finder {
-                self.finders.insert(id);
-            }
-            let prs = stacks.ordered(candidate.members.iter().map(|m| m.0));
-            plan.start
-                .push(BatchStart::new(id, candidate.base.clone(), prs));
-        }
-        Ok(plan)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::model::FLOOR;
-    use super::super::test_support::{bad, members, pair, priors};
+    use super::super::test_support::{bad, members, pair, params};
     use super::*;
     use crate::BayesConfig;
     use crate::test_support::*;
     use dorfq_core::{Departure, LandRefusal, PrSnapshot, Withdrawal};
-
-    fn params() -> BayesConfig {
-        let priors = priors();
-        BayesConfig {
-            lanes: 2,
-            max_batch: 24,
-            p_bad: priors.p_bad,
-            p_interact: priors.p_interact,
-            p_flake: priors.p_flake,
-            run_cost: 0.5,
-            w_reject: 1.0,
-            eject_above: 0.9,
-            others_below: 0.1,
-            speculate_above: 0.0,
-        }
-    }
 
     fn bayes() -> Bayes {
         Bayes::new(params())
@@ -961,6 +813,38 @@ mod tests {
     }
 
     #[test]
+    fn under_transfer_a_landing_or_a_merge_regrows_a_survivor_once_by_the_pair() {
+        let transferring = || {
+            Bayes::new(BayesConfig {
+                landing: Landing::Transfer,
+                ..params()
+            })
+        };
+        // 1 lands by the queue: Bad(2) takes the pair's prior once, and no
+        // decay is applied on top.
+        let mut queue = transferring();
+        step(&mut queue, &observation(ready_all(&[1, 2]), vec![]));
+        let batch = batch(1, trunk(), &[1], BatchState::Landed { tip: tip(1) });
+        let mut input = observation(ready_all(&[2]), vec![batch]);
+        input.trunk = tip(1);
+        input.departed = vec![landed(1, 1)];
+        step(&mut queue, &input);
+        let regrown = 1.0 - 0.95 * 0.998;
+        assert!((belief(&queue, bad(2)) - regrown).abs() < 1e-15);
+        // 1 merged by another hand: the same, where decay does nothing.
+        let merged = |mut bayes: Bayes| {
+            step(&mut bayes, &observation(ready_all(&[1, 2]), vec![]));
+            let mut input = observation(ready_all(&[2]), vec![]);
+            input.trunk = tip(9);
+            input.departed = vec![Departure::new(PrNumber(1), sha(1), Departed::Merged)];
+            step(&mut bayes, &input);
+            belief(&bayes, bad(2))
+        };
+        assert!((merged(transferring()) - regrown).abs() < 1e-15);
+        assert_eq!(merged(bayes()), 0.05);
+    }
+
+    #[test]
     fn a_failure_seen_with_a_members_repush_teaches_nothing_and_is_retired() {
         let mut bayes = bayes();
         let plan = step(&mut bayes, &observation(ready_all(&[1, 2]), vec![]));
@@ -1176,7 +1060,7 @@ mod tests {
         let pool = members(&[1, 2, 3, 4, 5, 6]);
         let stacks = Stacks::new(&observation(prs.clone(), vec![]));
         assert_eq!(
-            bayes.finders(&inference, &stacks, &pool),
+            bayes.suspects(&inference, &stacks, &pool, &BTreeSet::new()),
             vec![members(&[1, 4]), members(&[1, 5]), members(&[1, 6])]
         );
 
@@ -1190,7 +1074,7 @@ mod tests {
         assert!(belief(&bayes, pair(2, 4)) > FLOOR);
         let inference = Inference::of(&bayes.model).unwrap();
         assert_eq!(
-            bayes.finders(&inference, &stacks, &pool),
+            bayes.suspects(&inference, &stacks, &pool, &BTreeSet::new()),
             vec![members(&[1, 5]), members(&[1, 6]), members(&[2, 4])]
         );
     }
@@ -1263,6 +1147,50 @@ mod tests {
             score(&[3, 1]),
             score(&[3])
         );
+    }
+
+    #[test]
+    fn a_full_charge_keeps_an_extension_off_an_unlikely_root() {
+        // A pending root of ten at the prior passes about half the time; one
+        // fresh pull request could extend it.
+        let charged = |charge| {
+            Bayes::new(BayesConfig {
+                run_cost: 0.6,
+                charge,
+                ..params()
+            })
+        };
+        let root: Vec<u64> = (1..=10).collect();
+        let prs: Vec<u64> = (1..=11).collect();
+        let input = observation(
+            ready_all(&prs),
+            vec![testing(1, trunk(), &root, CiStatus::Pending)],
+        );
+        let mut discounted = charged(Charge::Discounted);
+        let plan = step(&mut discounted, &input);
+        assert_eq!(plan.start, vec![start(2, tip(1), &[11])]);
+        let mut full = charged(Charge::Full);
+        assert_eq!(step(&mut full, &input), Plan::default());
+
+        let inference = Inference::of(&full.model).unwrap();
+        let none = BTreeSet::new();
+        let (root, extension) = (members(&root), members(&[11]));
+        let p_end = full.p_pass(&inference, &root, &[]);
+        let p = full.p_pass(&inference, &extension, &root);
+        let r = full
+            .resolution(&inference, &extension, &root, &none)
+            .unwrap();
+        let value = p + (1.0 - p) * r;
+        assert!(p_end < 0.6 && value > 0.6, "{p_end} {value}");
+        let score = |bayes: &Bayes| {
+            bayes
+                .score(&inference, &extension, &root, p_end, &none)
+                .unwrap()
+        };
+        assert!((score(&discounted) - p_end * (value - 0.6)).abs() < 1e-12);
+        assert!(score(&discounted) > 0.0);
+        assert!((score(&full) - (p_end * value - 0.6)).abs() < 1e-12);
+        assert!(score(&full) < 0.0);
     }
 
     #[test]
@@ -1546,10 +1474,19 @@ mod tests {
 
     #[test]
     fn a_fresh_scheduler_starts_above_every_tracked_id() {
-        let mut bayes = bayes();
-        let landed = batch(7, trunk(), &[9], BatchState::Landed { tip: tip(7) });
-        let plan = step(&mut bayes, &observation(ready_all(&[1, 2]), vec![landed]));
-        assert_eq!(plan.start, vec![start(8, trunk(), &[1, 2])]);
+        for speculation in [Speculation::Chain, Speculation::Tree] {
+            let mut bayes = Bayes::new(BayesConfig {
+                speculation,
+                ..params()
+            });
+            let landed = batch(7, trunk(), &[9], BatchState::Landed { tip: tip(7) });
+            let plan = step(&mut bayes, &observation(ready_all(&[1, 2]), vec![landed]));
+            assert_eq!(
+                plan.start,
+                vec![start(8, trunk(), &[1, 2])],
+                "{speculation:?}"
+            );
+        }
     }
 
     #[test]
@@ -1597,11 +1534,19 @@ mod tests {
                 ],
             ),
         ];
-        let (mut a, mut b) = (bayes(), bayes());
-        for input in &inputs {
-            assert_eq!(a.step(input).unwrap(), b.step(input).unwrap());
+        for speculation in [Speculation::Chain, Speculation::Tree] {
+            let make = || {
+                Bayes::new(BayesConfig {
+                    speculation,
+                    ..params()
+                })
+            };
+            let (mut a, mut b) = (make(), make());
+            for input in &inputs {
+                assert_eq!(a.step(input).unwrap(), b.step(input).unwrap());
+            }
+            assert_eq!(a, b);
         }
-        assert_eq!(a, b);
     }
 
     #[test]
@@ -1680,12 +1625,12 @@ mod tests {
         let inference = Inference::of(model).unwrap();
         let stacks = Stacks::new(&observation(prs, vec![]));
         assert_eq!(
-            bayes.finders(&inference, &stacks, &members(&[1, 2, 3])),
+            bayes.suspects(&inference, &stacks, &members(&[1, 2, 3]), &BTreeSet::new()),
             vec![members(&[1]), members(&[1, 2]), members(&[3])]
         );
         // With 1 in flight, neither finder holding it is generated.
         assert_eq!(
-            bayes.finders(&inference, &stacks, &members(&[2, 3])),
+            bayes.suspects(&inference, &stacks, &members(&[2, 3]), &BTreeSet::new()),
             vec![members(&[3])]
         );
     }

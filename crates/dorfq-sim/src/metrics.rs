@@ -52,6 +52,8 @@ pub struct RunRecord {
     pub tree: Vec<PrNumber>,
     /// True once its batch landed.
     pub landed: bool,
+    /// True when its batch was retired while the run was running.
+    pub cancelled: bool,
 }
 
 /// One pull request's own CI run.
@@ -87,6 +89,8 @@ pub struct Metrics {
     pub rebases: u64,
     /// Batch runs started, cancelled included.
     pub runs: usize,
+    /// Batch runs stopped by their batch's retirement.
+    pub cancelled_runs: usize,
     pub mean_batch_size: Option<f64>,
     /// Billed PR CI runs, cancelled included.
     pub billed_pr_ci_runs: usize,
@@ -190,6 +194,7 @@ impl Metrics {
             unfinished,
             rebases,
             runs: runs.len(),
+            cancelled_runs: runs.iter().filter(|r| r.cancelled).count(),
             mean_batch_size: ratio(members as f64, runs.len() as f64),
             billed_pr_ci_runs: billed_runs,
             runner_hours,
@@ -226,6 +231,7 @@ mod tests {
             verdict: None,
             tree: Vec::new(),
             landed,
+            cancelled: false,
         }
     }
 
@@ -260,7 +266,8 @@ mod tests {
             pr(6, 0, None),
             pr(7, 0, Some((60, Exit::Blocked { on: PrNumber(5) }))),
         ];
-        let runs = [run(3600, 2, true), run(3600, 4, false)];
+        let mut runs = [run(3600, 2, true), run(3600, 4, false)];
+        runs[1].cancelled = true;
         let mut prs = prs;
         prs[0].rebases = 2;
         prs[5].rebases = 1;
@@ -278,7 +285,7 @@ mod tests {
             ),
             (7, 2, 1, 1, 1, 1, 1)
         );
-        assert_eq!(m.runs, 2);
+        assert_eq!((m.runs, m.cancelled_runs), (2, 1));
         assert_eq!(m.mean_batch_size, Some(3.0));
         assert_eq!(m.runner_hours, 2.0);
         assert_eq!(m.runner_hours_per_landed, Some(1.0));

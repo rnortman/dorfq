@@ -14,18 +14,6 @@ Every entry is public writing.
 
 ## Open
 
-### bayes-landing-transfers-pair-belief
-
-When a pull request leaves the Bayesian scheduler's model because its
-content reached trunk (`Departed::Landed` or `Departed::Merged`), every
-pair it belonged to is dropped. A pair `Interact(A, B)` holding belief
-when A lands says that B now fails on trunk, so that belief should fold
-into `Bad(B)` rather than vanish. The `TODO(bayes-landing-transfers-pair-belief)`
-comment sits where `sync` in `crates/dorfq-scheduler/src/bayes/model.rs`
-drops a departed pull request's pairs. Deferred because it changes the
-model's posteriors, and how much belief transfers, and with what effect on
-ejections, needs a simulated world to size it.
-
 ### bayes-pair-search
 
 The Bayesian scheduler's culprit finders search a set of materialised cross
@@ -65,7 +53,12 @@ is scored over their union, whose runs count as if they were one cluster:
 two clusters of four, each resolved comfortably on its own, stop the
 process. The chain extension grows from the ready pull requests in
 ascending order of belief, which puts members lifted off their alibi by a
-landing first, so such a batch is an ordinary candidate. Until it is
+landing first, so such a batch is an ordinary candidate. That scoring stop
+remains under `speculation = "chain"`, the control, and is gone under
+`"tree"`, where a hypothetical failure that cannot be resolved scores with
+no resolution credit: the tree scores several times more hypotheticals a
+step, over deeper trees, and would stop far more often. The stop on the
+evidence remains under both. Until it is
 resolved, `bayes` is not to be run against a real forge: a flaky spell
 would stop the queue. Two recoveries are candidates: drop the component's
 oldest runs until the sum is significant, or fall back to exact

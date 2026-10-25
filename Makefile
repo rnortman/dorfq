@@ -34,6 +34,7 @@ help:
 	@echo "  make changes       run allthechanges (ARGS=\"query\", ARGS=\"todo query\", ...)"
 	@echo "  make local-deploy  install the optimised binary to ~/.local/bin and restart the user unit if running"
 	@echo "  make sim           run the dorfq-sim simulator (ARGS=... for arguments)"
+	@echo "  make sweep         run a dorfq-sim sweep, optimised (ARGS=\"--config FILE ...\")"
 	@echo "  make sim-report    run every simulator example to JSON for the report site (bazel-bin/site/reports/)"
 	@echo "                     and build the browser simulator (bazel-bin/site/dorfq_sim_wasm.wasm)"
 	@echo "  make fix           rustfmt and buildifier the tree in place"
@@ -83,6 +84,11 @@ live-test:
 .PHONY: sim
 sim:
 	bazel run //crates/dorfq-sim -- $(ARGS)
+
+# Optimised: a sweep runs thousands of replications and speed is the point.
+.PHONY: sweep
+sweep:
+	bazel run --config=release //crates/dorfq-sim -- sweep $(ARGS)
 
 # The report site's data: every shipped simulator example as a JSON document
 # under bazel-bin/site/reports/, and the playground's simulator compiled to

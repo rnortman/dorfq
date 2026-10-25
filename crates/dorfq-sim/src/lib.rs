@@ -59,11 +59,17 @@
 //! [`TraceEvent`]s: every step and its plan, and everything the world did.
 //! [`Report::to_json`] writes the report, its configuration and those
 //! traces as one JSON document, the input of the report site.
+//!
+//! [`sweep`] runs a [`SweepConfig`], a grid of configurations over one
+//! base, every replication an independent task on a pool of threads, and
+//! returns a [`SweepReport`]: every point's means, and every policy's mean
+//! relative delta against a baseline policy over the points.
 
 mod config;
 mod metrics;
 mod report;
 mod rng;
+mod sweep;
 mod trace;
 mod world;
 
@@ -77,6 +83,9 @@ pub use config::{Admission, Minutes, Policy, SimConfig, SimConfigError, WorldCon
 pub use metrics::{Exit, Metrics, PrCiRecord, PrRecord, RunRecord, RunningSeconds};
 pub use report::{PolicyReport, Report, SCHEMA};
 pub use rng::{SplitMix64, Streams};
+pub use sweep::{
+    Axis, Point, PointReport, SWEEP_SCHEMA, SweepConfig, SweepConfigError, SweepReport, sweep,
+};
 pub use trace::{PlannedEject, PlannedStart, Rebase, TraceEvent, Truth};
 pub use world::World;
 

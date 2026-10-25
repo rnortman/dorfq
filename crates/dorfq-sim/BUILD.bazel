@@ -39,6 +39,8 @@ rust_test(
     compile_data = [
         "examples/busy.toml",
         "examples/sim.toml",
+        "sweeps/bisect-cap.toml",
+        "sweeps/speculation.toml",
     ],
     crate = ":dorfq_sim",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),

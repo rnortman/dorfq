@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use dorfq_core::PrNumber;
 
 use super::model::{Cause, Model, Priors};
-use crate::Member;
 use crate::test_support::{ready_all, sha};
+use crate::{BayesConfig, Charge, Landing, Member, Speculation};
 
 pub(super) fn priors() -> Priors {
     Priors {
@@ -16,9 +16,29 @@ pub(super) fn priors() -> Priors {
     }
 }
 
+/// The scheduler's parameters at [`priors`], every flag at the status quo.
+pub(super) fn params() -> BayesConfig {
+    let priors = priors();
+    BayesConfig {
+        lanes: 2,
+        max_batch: 24,
+        p_bad: priors.p_bad,
+        p_interact: priors.p_interact,
+        p_flake: priors.p_flake,
+        run_cost: 0.5,
+        w_reject: 1.0,
+        eject_above: 0.9,
+        others_below: 0.1,
+        speculate_above: 0.0,
+        speculation: Speculation::Chain,
+        charge: Charge::Discounted,
+        landing: Landing::Decay,
+    }
+}
+
 /// A model at [`priors`] holding `prs` at their original heads.
 pub(super) fn model(prs: &[u64]) -> Model {
-    let mut model = Model::new(priors());
+    let mut model = Model::new(priors(), Landing::Decay);
     model.sync(&ready_all(prs), &BTreeSet::new());
     model
 }

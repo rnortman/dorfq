@@ -1,17 +1,24 @@
-# A high-velocity team: five pull requests an hour for three days on six
-# lanes, then twelve hours to drain, four replications. Run it with:
+# A high-velocity team: five pull requests an hour for three days, then
+# twelve hours to drain, four replications, with batch and PR CI both 45 to
+# 120 minutes. Run it with:
 #   make sim ARGS="run --config $PWD/crates/dorfq-sim/examples/busy.toml"
 #
-# Each pooling policy's max_batch was chosen by measurement in this world,
-# over eight replications with every lane-bearing column on six lanes.
-# Bisect is best at cap 1 and keeps up there; larger caps land fewer, cost
-# more per landed pull request and leave arrivals unfinished, so its pooling
-# does not pay here and its column is the naive queue on the six lanes
-# github-like runs on: its deltas against github-like show GitHub's
-# admission alone. Bayes is best at 4 to 6, landing the most at the lowest
-# cost per landed pull request of the policies that keep their good pull
-# requests, though its 95th-percentile time to land is longer than
-# bisect's.
+# dorfq's columns share eight lanes; github-like runs on sixteen, the
+# concurrency GitHub's queue is given in practice. The settings were chosen
+# by measurement with the shipped sweeps (crates/dorfq-sim/sweeps/). bayes
+# is the status quo, which measured best: over the speculation sweep's grid
+# at run_cost 0.5 no flagged variant beat it on landed at more than half
+# the points without leaving more unfinished at more than half, and it
+# lands the most at eight lanes and max_batch 8. bayes-tree is the tree of
+# futures at the same settings, so the two differ only in their flags.
+# Over the sweep the tree lands more only under overload, and at the cost
+# of resolution: it ejects about 80% fewer bad pull requests and leaves
+# about three times as many unfinished, at about 40% fewer runner-hours per
+# landed pull request. Bisect lands the most at cap 1 on eight lanes
+# (bisect-cap.toml), so its column is the naive queue under dorfq's
+# admission. Here, bayes lands 170 (32 bad ejected, 27 unfinished, 3.2
+# runner-hours per landed), bayes-tree 159 (6, 89, 2.2), bisect 157 (38,
+# 18, 4.6) and github-like 140 (32, 25, 5.5).
 
 seed = 1                   # master seed; every replication's streams derive from it
 replications = 4           # independent runs per policy, each from its own seed; the table shows their mean [min–max]
@@ -20,13 +27,13 @@ replications = 4           # independent runs per policy, each from its own seed
 hours = 72                 # arrivals stop after this many hours
 drain_hours = 12           # then the run drains, and stops at hours + drain_hours at the latest
 arrivals_per_hour = 5.0    # mean rate of new pull requests; stacks arrive as a Poisson process at this rate over the mean number of pull requests a stack brings
-ci_minutes = { min = 45, max = 75 }   # uniform duration of a batch's CI run
-pr_ci_minutes = { min = 15, max = 25 }   # uniform duration of a pull request's own CI run, a lighter check than the batch run; it starts when requested and needs no lane; a pull request is batchable only once it has passed on its current head
+ci_minutes = { min = 45, max = 120 }   # uniform duration of a batch's CI run
+pr_ci_minutes = { min = 45, max = 120 }   # uniform duration of a pull request's own CI run, as long as the batch run; it starts when requested and needs no lane; a pull request is batchable only once it has passed on its current head
 rebase_minutes = { min = 15, max = 120 }   # uniform delay from a rebase becoming necessary (a conflict with trunk, or under github admission a landed base) to the author's push of it
 pr_ci_on_base_landed = true   # the repository re-runs a pull request's own CI when the pull request it was based on lands; the queue is billed for the direct children's runs
 p_bad = 0.05               # a pull request breaks on its own against trunk
-p_interact = 0.002         # a pair of pull requests whose queue time overlapped break only together
-p_flake = 0.02             # a run fails for no reason in the tree
+p_interact = 0.005         # a pair of pull requests whose queue time overlapped break only together
+p_flake = 0.03             # a run fails for no reason in the tree
 p_conflict = 0.02          # a stack arrives with its root conflicting against trunk
 repush_per_hour = 0.02     # per open pull request, the rate at which its author pushes a new head; its intent to land is kept
 withdraw_per_hour = 0.005  # per open pull request, the rate at which its author takes it out of the queue for good
@@ -43,16 +50,15 @@ admission = "label"          # dorfq's: in the queue from arrival, held until it
 kind = "all-at-once"         # the scheduler: one batch of everything ready, and on failure eject every member
 
 # GitHub's merge queue, approximately: each pull request built on top of
-# the ones ahead of it, as many builds in flight as the columns it is
-# compared against; a failed one is removed once everything ahead of it
-# passed, and the rest rebuilt. Admission is GitHub's: a stacked pull
-# request waits for its base to land, is rebased and re-checked, then
-# enters.
+# the ones ahead of it, at the concurrency GitHub's queue is given in
+# practice; a failed one is removed once everything ahead of it passed,
+# and the rest rebuilt. Admission is GitHub's: a stacked pull request waits
+# for its base to land, is rebased and re-checked, then enters.
 [[policy]]
 name = "github-like"         # the column's name in the table and on the page
 admission = "github"         # the queue sees a pull request only on trunk, once its own CI passed
 kind = "bisect"              # the scheduler: pipelined batches, a failed one split in halves until the culprit is alone
-lanes = 6                    # most batches in flight at once
+lanes = 16                   # most batches in flight at once
 max_batch = 1                # most pull requests one batch may hold
 
 # The pipelined bisect at its best measured cap here: no pooling.
@@ -60,21 +66,45 @@ max_batch = 1                # most pull requests one batch may hold
 name = "bisect"              # the column's name in the table and on the page
 admission = "label"          # dorfq's: in the queue from arrival, held until its own CI passes
 kind = "bisect"              # the scheduler: pipelined batches, a failed one split in halves until the culprit is alone
-lanes = 6                    # most batches in flight at once
+lanes = 8                    # most batches in flight at once
 max_batch = 1                # most pull requests one batch may hold
 
-# The Bayesian scheduler, its priors set equal to the world's rates.
+# The Bayesian scheduler at the status-quo flags, which measured best:
+# one chain of batches built to land, with culprit finders beside it.
 [[policy]]
 name = "bayes"               # the column's name in the table and on the page
 admission = "label"          # dorfq's: in the queue from arrival, held until its own CI passes
 kind = "bayes"               # the scheduler: batches chosen and culprits inferred from a posterior over who is bad
-lanes = 6                    # most batches in flight at once
-max_batch = 4                # most pull requests one batch may hold
+lanes = 8                    # most batches in flight at once
+max_batch = 8                # most pull requests one batch may hold
 p_bad = 0.05               # prior: a pull request fails on its own against trunk
-p_interact = 0.002         # prior: a pair fails only together; also the per-landing decay
-p_flake = 0.02             # a run fails for no reason
+p_interact = 0.005         # prior: a pair fails only together; also the per-landing decay
+p_flake = 0.03             # a run fails for no reason
 run_cost = 0.5             # one run, in landed-pull-request units
 w_reject = 1.0             # resolving a bad pull request, in the same units
 eject_above = 0.9          # posterior at which a singled-out cause is ejected
 others_below = 0.1         # a run singles a cause out when every other cause in it is below this
 speculate_above = 0.0      # a candidate starts when its score exceeds this
+speculation = "chain"      # one chain of batches built to land, culprit finders on trunk; "tree" scores every node's branches
+charge = "discounted"      # run_cost weighed by the chance the batch's base stands; "full" charges it whole
+landing = "decay"          # a landing regrows every other belief by p_interact; "transfer" by each pair's belief
+
+# The tree of futures at the same settings: for every batch in flight,
+# what to run if it passes and if it fails, weighed by each future's chance.
+[[policy]]
+name = "bayes-tree"          # the column's name in the table and on the page
+admission = "label"          # dorfq's: in the queue from arrival, held until its own CI passes
+kind = "bayes"               # the scheduler: batches chosen and culprits inferred from a posterior over who is bad
+lanes = 8                    # most batches in flight at once
+max_batch = 8                # most pull requests one batch may hold
+p_bad = 0.05               # prior: a pull request fails on its own against trunk
+p_interact = 0.005         # prior: a pair fails only together; also the per-landing decay
+p_flake = 0.03             # a run fails for no reason
+run_cost = 0.5             # one run, in landed-pull-request units
+w_reject = 1.0             # resolving a bad pull request, in the same units
+eject_above = 0.9          # posterior at which a singled-out cause is ejected
+others_below = 0.1         # a run singles a cause out when every other cause in it is below this
+speculate_above = 0.0      # a candidate starts when its net score exceeds this
+speculation = "tree"       # for every batch in flight, what to run if it passes and if it fails, weighted by each future's chance; "chain" builds one chain
+charge = "full"            # run_cost charged whole whatever the chance the batch's base stands; "discounted" weighs it by that chance
+landing = "decay"          # a landing regrows every other belief by p_interact; "transfer" by each pair's belief
