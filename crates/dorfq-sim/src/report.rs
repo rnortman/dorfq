@@ -30,9 +30,9 @@ pub struct Report {
 }
 
 /// A metric row: its name, the decimals it prints with, and its value.
-type Row = (&'static str, usize, fn(&Metrics) -> Option<f64>);
+pub(crate) type Row = (&'static str, usize, fn(&Metrics) -> Option<f64>);
 
-const ROWS: [Row; 19] = [
+pub(crate) const ROWS: [Row; 20] = [
     ("arrived", 1, |m| Some(m.arrived as f64)),
     ("landed", 1, |m| Some(m.landed as f64)),
     ("ejected_bad", 1, |m| Some(m.ejected_bad as f64)),
@@ -42,6 +42,7 @@ const ROWS: [Row; 19] = [
     ("unfinished", 1, |m| Some(m.unfinished as f64)),
     ("rebases", 1, |m| Some(m.rebases as f64)),
     ("runs", 1, |m| Some(m.runs as f64)),
+    ("cancelled_runs", 1, |m| Some(m.cancelled_runs as f64)),
     ("mean_batch_size", 2, |m| m.mean_batch_size),
     ("billed_pr_ci_runs", 1, |m| Some(m.billed_pr_ci_runs as f64)),
     ("runner_hours", 1, |m| Some(m.runner_hours)),
@@ -53,6 +54,35 @@ const ROWS: [Row; 19] = [
     ("reject_p50_hours", 2, |m| m.reject_p50_hours),
     ("reject_p95_hours", 2, |m| m.reject_p95_hours),
 ];
+
+/// Which way a metric is better.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Better {
+    Higher,
+    Lower,
+}
+
+/// The metrics of [`ROWS`] that have a direction; the rest have none.
+pub(crate) const BETTER: [(&str, Better); 13] = [
+    ("landed", Better::Higher),
+    ("ejected_bad", Better::Higher),
+    ("ejected_good", Better::Lower),
+    ("unfinished", Better::Lower),
+    ("runs", Better::Lower),
+    ("cancelled_runs", Better::Lower),
+    ("runner_hours", Better::Lower),
+    ("runner_hours_per_landed", Better::Lower),
+    ("wasted_fraction", Better::Lower),
+    ("land_p50_hours", Better::Lower),
+    ("land_p95_hours", Better::Lower),
+    ("reject_p50_hours", Better::Lower),
+    ("reject_p95_hours", Better::Lower),
+];
+
+/// The direction of the metric `name`, if it has one.
+pub(crate) fn better(name: &str) -> Option<Better> {
+    BETTER.iter().find(|(n, _)| *n == name).map(|&(_, b)| b)
+}
 
 /// The JSON document.
 #[derive(Serialize)]
@@ -74,9 +104,18 @@ struct PolicyDocument<'a> {
 /// A replication's cell: its metrics, or its failure's text.
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Replication<'a> {
+pub(crate) enum Replication<'a> {
     Metrics(&'a Metrics),
     Error(String),
+}
+
+impl<'a> Replication<'a> {
+    pub(crate) fn of(replication: &'a Result<Metrics, SimError>) -> Self {
+        match replication {
+            Ok(metrics) => Replication::Metrics(metrics),
+            Err(error) => Replication::Error(error.to_string()),
+        }
+    }
 }
 
 impl Report {
@@ -97,14 +136,7 @@ impl Report {
             .iter()
             .map(|p| PolicyDocument {
                 name: &p.name,
-                replications: p
-                    .replications
-                    .iter()
-                    .map(|r| match r {
-                        Ok(metrics) => Replication::Metrics(metrics),
-                        Err(error) => Replication::Error(error.to_string()),
-                    })
-                    .collect(),
+                replications: p.replications.iter().map(Replication::of).collect(),
                 trace: &p.trace,
             })
             .collect();
@@ -120,25 +152,35 @@ impl Report {
 }
 
 impl PolicyReport {
+    /// The values of the replications that ran and have the value.
+    fn values(&self, value: fn(&Metrics) -> Option<f64>) -> Vec<f64> {
+        self.replications
+            .iter()
+            .filter_map(|r| r.as_ref().ok().and_then(value))
+            .collect()
+    }
+
+    /// The mean over the replications that ran and have the value; `None`
+    /// when none has it.
+    pub(crate) fn mean(&self, value: fn(&Metrics) -> Option<f64>) -> Option<f64> {
+        let values = self.values(value);
+        (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+    }
+
     /// The mean over the replications that ran and have the value, with the
     /// minimum and maximum; `-` when none has it.
     fn cell(&self, decimals: usize, value: fn(&Metrics) -> Option<f64>) -> String {
-        let values: Vec<f64> = self
-            .replications
-            .iter()
-            .filter_map(|r| r.as_ref().ok().and_then(value))
-            .collect();
-        if values.is_empty() {
+        let values = self.values(value);
+        let Some(mean) = self.mean(value) else {
             return "-".to_owned();
-        }
-        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        };
         let min = values.iter().copied().fold(f64::INFINITY, f64::min);
         let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         format!("{mean:.decimals$} [{min:.decimals$}–{max:.decimals$}]")
     }
 
     /// `-`, or the count of failed replications and the first one's text.
-    fn failure(&self) -> String {
+    pub(crate) fn failure(&self) -> String {
         let mut failures = self.replications.iter().filter_map(|r| r.as_ref().err());
         match failures.next() {
             None => "-".to_owned(),
@@ -166,29 +208,37 @@ impl fmt::Display for Report {
                 .chain(failures)
                 .collect(),
         );
-        let columns = lines[0].len();
-        let widths: Vec<usize> = (0..columns)
-            .map(|c| {
-                lines
-                    .iter()
-                    .map(|l| l[c].chars().count())
-                    .max()
-                    .unwrap_or(0)
+        table(f, &lines)
+    }
+}
+
+/// Writes `lines` as a table: every column padded to its widest cell, two
+/// spaces between columns. Every line has as many cells as the first.
+pub(crate) fn table(f: &mut fmt::Formatter<'_>, lines: &[Vec<String>]) -> fmt::Result {
+    let Some(first) = lines.first() else {
+        return Ok(());
+    };
+    let widths: Vec<usize> = (0..first.len())
+        .map(|c| {
+            lines
+                .iter()
+                .map(|l| l[c].chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    for line in lines {
+        let padded: Vec<String> = line
+            .iter()
+            .zip(&widths)
+            .map(|(cell, &width)| {
+                let pad = width - cell.chars().count();
+                format!("{cell}{}", " ".repeat(pad))
             })
             .collect();
-        for line in &lines {
-            let padded: Vec<String> = line
-                .iter()
-                .zip(&widths)
-                .map(|(cell, &width)| {
-                    let pad = width - cell.chars().count();
-                    format!("{cell}{}", " ".repeat(pad))
-                })
-                .collect();
-            writeln!(f, "{}", padded.join("  ").trim_end())?;
-        }
-        Ok(())
+        writeln!(f, "{}", padded.join("  ").trim_end())?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -206,6 +256,7 @@ mod tests {
             unfinished: 10 - landed,
             rebases: 0,
             runs: 2,
+            cancelled_runs: 1,
             mean_batch_size: Some(5.0),
             billed_pr_ci_runs: 3,
             runner_hours: 6.0,
@@ -304,6 +355,7 @@ mod tests {
                 "unfinished",
                 "rebases",
                 "runs",
+                "cancelled_runs",
                 "mean_batch_size",
                 "billed_pr_ci_runs",
                 "runner_hours",
@@ -321,6 +373,17 @@ mod tests {
             row(&table, "billed_pr_ci_hours"),
             ["billed_pr_ci_hours", "1.5 [1.5–1.5]", "1.5 [1.5–1.5]"]
         );
+    }
+
+    #[test]
+    fn every_direction_names_a_row() {
+        for (name, _) in BETTER {
+            assert!(ROWS.iter().any(|(row, _, _)| *row == name), "{name}");
+        }
+        assert_eq!(better("landed"), Some(Better::Higher));
+        assert_eq!(better("ejected_bad"), Some(Better::Higher));
+        assert_eq!(better("cancelled_runs"), Some(Better::Lower));
+        assert_eq!(better("arrived"), None);
     }
 
     #[test]

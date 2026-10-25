@@ -1,0 +1,178 @@
+# The four bayes variants against each other, and GitHub's queue beside
+# them, over the world and policy parameters that matter most. Run it with:
+#   make sweep ARGS="--config $PWD/crates/dorfq-sim/sweeps/speculation.toml"
+#
+# The bayes columns differ only in their flags; every policy axis names all
+# four, so at each point they run at the same lanes, max_batch, run_cost and
+# priors. github-like is fixed at the concurrency GitHub's queue is given in
+# practice and is named by the world axes alone. The summary reads every
+# column against bayes-chain, the status quo; the grid rows show, point by
+# point, where the best bayes beats github-like and where it does not.
+#
+# 288 points, five columns, two replications: 5,760 simulations. On a
+# 32-thread machine, at the default --jobs, the sweep took 5.5 minutes of
+# wall time (2.8 hours of CPU time); four replications took 13.6 minutes.
+
+seed = 1                   # master seed; every replication's streams derive from it
+replications = 2           # independent runs per policy and point, each from its own seed
+baseline = "bayes-chain"   # the column every other column's deltas are against
+
+[world]
+hours = 72                 # arrivals stop after this many hours
+drain_hours = 12           # then the run drains, and stops at hours + drain_hours at the latest
+arrivals_per_hour = 5.0    # mean rate of new pull requests (swept)
+ci_minutes = { min = 45, max = 120 }   # uniform duration of a batch's CI run (swept)
+pr_ci_minutes = { min = 45, max = 120 }   # uniform duration of a pull request's own CI run (swept with ci_minutes)
+rebase_minutes = { min = 15, max = 120 }   # uniform delay from a rebase becoming necessary to the author's push of it
+pr_ci_on_base_landed = true   # the repository re-runs a pull request's own CI when its base lands
+p_bad = 0.05               # a pull request breaks on its own against trunk
+p_interact = 0.005         # a pair whose queue time overlapped breaks only together (swept)
+p_flake = 0.03             # a run fails for no reason in the tree (swept)
+p_conflict = 0.02          # a stack arrives with its root conflicting against trunk
+repush_per_hour = 0.02     # per open pull request, the rate at which its author pushes a new head
+withdraw_per_hour = 0.005  # per open pull request, the rate at which its author takes it out of the queue
+stack_sizes = [16, 16, 15, 13, 11, 9, 7, 5, 3, 2, 2, 1]   # relative weights of a stack arriving with 1, 2, … 12 pull requests
+p_stack_grows = 0.3        # a stack later gets a second burst of pull requests on top
+stack_growth_sizes = [3, 2, 1]   # relative weights of that burst bringing 1, 2 or 3 pull requests
+stack_growth_minutes = { min = 30, max = 480 }   # uniform delay from a stack's arrival to that second burst
+p_atomic = 0.2             # a stack lands only whole
+
+# GitHub's merge queue at its realistic concurrency.
+[[policy]]
+name = "github-like"
+admission = "github"
+kind = "bisect"
+lanes = 16
+max_batch = 1
+
+# The status quo: one chain built to land, culprit finders on trunk.
+[[policy]]
+name = "bayes-chain"
+admission = "label"
+kind = "bayes"
+lanes = 8
+max_batch = 16
+p_bad = 0.05
+p_interact = 0.005
+p_flake = 0.03
+run_cost = 0.5
+w_reject = 1.0
+eject_above = 0.9
+others_below = 0.1
+speculate_above = 0.0
+speculation = "chain"
+charge = "discounted"
+landing = "decay"
+
+# The chain with run_cost charged whole.
+[[policy]]
+name = "bayes-full"
+admission = "label"
+kind = "bayes"
+lanes = 8
+max_batch = 16
+p_bad = 0.05
+p_interact = 0.005
+p_flake = 0.03
+run_cost = 0.5
+w_reject = 1.0
+eject_above = 0.9
+others_below = 0.1
+speculate_above = 0.0
+speculation = "chain"
+charge = "full"
+landing = "decay"
+
+# The tree of futures.
+[[policy]]
+name = "bayes-tree"
+admission = "label"
+kind = "bayes"
+lanes = 8
+max_batch = 16
+p_bad = 0.05
+p_interact = 0.005
+p_flake = 0.03
+run_cost = 0.5
+w_reject = 1.0
+eject_above = 0.9
+others_below = 0.1
+speculate_above = 0.0
+speculation = "tree"
+charge = "full"
+landing = "decay"
+
+# The tree of futures with belief transfer at landing.
+[[policy]]
+name = "bayes-tree-transfer"
+admission = "label"
+kind = "bayes"
+lanes = 8
+max_batch = 16
+p_bad = 0.05
+p_interact = 0.005
+p_flake = 0.03
+run_cost = 0.5
+w_reject = 1.0
+eject_above = 0.9
+others_below = 0.1
+speculate_above = 0.0
+speculation = "tree"
+charge = "full"
+landing = "transfer"
+
+[[axis]]
+keys = ["world.arrivals_per_hour"]
+values = [3.0, 6.0, 12.0]
+
+[[axis]]
+keys = ["world.ci_minutes", "world.pr_ci_minutes"]
+values = [{ min = 45, max = 75 }, { min = 90, max = 120 }]
+labels = ["ci-45-75", "ci-90-120"]
+
+[[axis]]
+keys = [
+    "world.p_flake",
+    "policy.bayes-chain.p_flake",
+    "policy.bayes-full.p_flake",
+    "policy.bayes-tree.p_flake",
+    "policy.bayes-tree-transfer.p_flake",
+]
+values = [0.01, 0.05]
+
+[[axis]]
+keys = [
+    "world.p_interact",
+    "policy.bayes-chain.p_interact",
+    "policy.bayes-full.p_interact",
+    "policy.bayes-tree.p_interact",
+    "policy.bayes-tree-transfer.p_interact",
+]
+values = [0.002, 0.02]
+
+[[axis]]
+keys = [
+    "policy.bayes-chain.max_batch",
+    "policy.bayes-full.max_batch",
+    "policy.bayes-tree.max_batch",
+    "policy.bayes-tree-transfer.max_batch",
+]
+values = [8, 16, 30]
+
+[[axis]]
+keys = [
+    "policy.bayes-chain.lanes",
+    "policy.bayes-full.lanes",
+    "policy.bayes-tree.lanes",
+    "policy.bayes-tree-transfer.lanes",
+]
+values = [4, 8]
+
+[[axis]]
+keys = [
+    "policy.bayes-chain.run_cost",
+    "policy.bayes-full.run_cost",
+    "policy.bayes-tree.run_cost",
+    "policy.bayes-tree-transfer.run_cost",
+]
+values = [0.5, 2.0]

@@ -101,6 +101,13 @@ impl Inference {
         &self.effective
     }
 
+    /// Every cause above the floor in a component's `runs`.
+    pub(crate) fn component_causes(&self, runs: &[usize]) -> BTreeSet<Cause> {
+        runs.iter()
+            .flat_map(|&r| self.effective[r].iter().copied())
+            .collect()
+    }
+
     /// The posteriors were a further run with causes `extra` to fail: over
     /// the component that run would join, with the existing runs inference
     /// would read in it, oldest first.

@@ -13,8 +13,11 @@
 //! every ancestor batch's) and every pair of them. A passing run is an
 //! alibi: every cause it exercised drops to a floor that inference treats
 //! as false. A failing run is evidence. When a batch lands, every other
-//! queued pull request's `Bad` belief regrows by one chance per landed pull
-//! request of being broken by what trunk now holds, so an old alibi fades.
+//! queued pull request's `Bad` belief regrows, so an old alibi fades: under
+//! `landing = "decay"` by one `p_interact` per pull request the queue
+//! landed; under `"transfer"` by its pair belief with each pull request
+//! that reached trunk, which is the prior for a pair no run touched, the
+//! floor for an alibied pair and nothing for a stack relative.
 //! A run leaves the evidence when nothing it could blame is left above the
 //! floor, or when a member of its tree leaves other than by landing. A
 //! member that lands takes only its own causes out of the runs it was in.
@@ -26,11 +29,13 @@
 //! and flakes, and inference then stops the process rather than return
 //! noise.
 
+mod chain;
 mod infer;
 mod model;
 mod policy;
 #[cfg(test)]
 mod test_support;
+mod tree;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,17 +48,21 @@ pub(crate) use model::{FLOOR, Priors};
 /// The Bayesian scheduler: beliefs about causes, updated exactly from every
 /// verdict, and batches chosen by expected value.
 ///
-/// It keeps one chain of batches built to land, each on the previous one's
-/// tip, and runs culprit finders on trunk beside it: small batches started
-/// for their verdict. A pull request is ejected only when a failed run
-/// singles it out.
+/// Under `speculation = "chain"` it keeps one chain of batches built to
+/// land, each on the previous one's tip, and runs culprit finders on trunk
+/// beside it: small batches started for their verdict. Under `"tree"` every
+/// standing batch's tip is a node beside trunk, and each free lane takes the
+/// best batch on any node, weighted by the chance it lands: its node becomes
+/// trunk and every older batch on the node fails; a batch whose node dies,
+/// or whose chance of landing falls to zero, is cancelled. A pull request is
+/// ejected only when a failed run singles it out.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Bayes {
     params: BayesConfig,
     ids: Ids,
     model: Model,
     /// Culprit finders started and still tracked; every other tracked batch,
-    /// started here or not, is a chain batch.
+    /// started here or not, is a chain batch. Empty under the tree.
     finders: BTreeSet<BatchId>,
     /// Each tracked batch's tree members, taken when it was first observed.
     trees: BTreeMap<BatchId, Vec<Member>>,
@@ -68,7 +77,7 @@ impl Bayes {
         Bayes {
             params,
             ids: Ids::new(),
-            model: Model::new(params.priors()),
+            model: Model::new(params.priors(), params.landing),
             finders: BTreeSet::new(),
             trees: BTreeMap::new(),
             read: BTreeSet::new(),

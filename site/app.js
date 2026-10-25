@@ -10,18 +10,25 @@ const DEFAULT_REPORT = "busy";
 // Fixed text shown beside a named report's world.
 const REPORT_NOTES = {
   busy:
-    "bisect's max_batch was chosen by measurement in this world, and its best " +
-    "measured cap is 1: its column is the naive queue on the same six lanes " +
-    "as github-like, so its deltas against github-like show GitHub's " +
-    "admission, not pooling. bayes, best at 4 to 6, lands the most at the " +
-    "lowest cost per landed pull request of the policies that keep their good " +
-    "pull requests; its 95th-percentile time to land is longer than bisect's.",
+    "dorfq's columns share eight lanes; github-like runs on sixteen, the " +
+    "concurrency GitHub's queue is given in practice. bayes is the status " +
+    "quo, which measured best, at its best measured settings (eight lanes, " +
+    "max_batch 8); bayes-tree is the tree of futures at the same settings. " +
+    "Over the speculation sweep the tree lands more only under overload, and " +
+    "at the cost of resolution: about 80% fewer bad pull requests ejected and " +
+    "about three times as many left unfinished, at about 40% fewer " +
+    "runner-hours per landed pull request. bisect's best measured cap here " +
+    "is 1, so its column is the naive queue under dorfq's admission. Here " +
+    "bayes lands 170 (32 bad ejected, 27 unfinished, 3.2 runner-hours per " +
+    "landed), bayes-tree 159 (6, 89, 2.2), bisect 157 (38, 18, 4.6) and " +
+    "github-like 140 (32, 25, 5.5).",
 };
 
 // Metric rows, as the command line's table prints them: key and decimals.
 const ROWS = [
   ["arrived", 1], ["landed", 1], ["ejected_bad", 1], ["ejected_good", 1],
   ["withdrawn", 1], ["blocked", 1], ["unfinished", 1], ["rebases", 1], ["runs", 1],
+  ["cancelled_runs", 1],
   ["mean_batch_size", 2], ["billed_pr_ci_runs", 1], ["runner_hours", 1], ["billed_pr_ci_hours", 1],
   ["runner_hours_per_landed", 2], ["wasted_fraction", 3], ["land_p50_hours", 2], ["land_p95_hours", 2],
   ["reject_p50_hours", 2], ["reject_p95_hours", 2],

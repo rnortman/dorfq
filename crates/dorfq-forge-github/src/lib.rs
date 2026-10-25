@@ -1099,6 +1099,8 @@ impl Forge for GitHubForge {
                 }
             }
         }
+        // TODO(github-retire-cancels-run): a pending batch's CI run keeps
+        // running after its refs are deleted.
         // The record goes first: a record whose batch branch is gone reads
         // back as `Permanent`, a batch branch with no record is never read.
         self.api.delete_ref(&record_ref(batch))?;

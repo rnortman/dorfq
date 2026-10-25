@@ -334,6 +334,7 @@ fn retiring_a_running_batch_charges_its_elapsed_time() {
     let m = w.metrics();
     assert_eq!(m.runner_hours, 480.0 / 3600.0);
     assert_eq!(m.wasted_fraction, Some(1.0));
+    assert_eq!(m.cancelled_runs, 2);
     assert_eq!(w.check_invariants(), Ok(()));
 }
 

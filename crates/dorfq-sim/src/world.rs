@@ -1017,6 +1017,7 @@ impl Forge for World {
             verdict: None,
             tree: Vec::new(),
             landed: false,
+            cancelled: false,
         });
         let run = Run::Running {
             run: self.runs.len() - 1,
@@ -1109,6 +1110,7 @@ impl Forge for World {
         if let Run::Running { run, done } = b.run {
             self.events.remove(&done);
             self.runs[run].consumed = self.now - self.runs[run].started_at;
+            self.runs[run].cancelled = true;
         }
         Ok(())
     }
