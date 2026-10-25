@@ -57,6 +57,8 @@ pub struct BayesConfig {
     /// Resolving a bad pull request, in the same units.
     pub w_reject: f64,
     /// The posterior at which a singled-out cause is ejected.
+    // TODO(soft-eject): a second, lower threshold at which the author is told
+    // the pull request is probably broken, without an ejection.
     pub eject_above: f64,
     /// A run singles a cause out when every other cause in it is below this.
     pub others_below: f64,

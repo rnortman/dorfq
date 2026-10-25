@@ -55,7 +55,7 @@ fn json_writes_the_document_and_still_prints_the_table() {
     assert!(!table.contains("policy bisect"), "{table}");
     let document = fs::read_to_string(&path).expect("the document is written");
     assert!(
-        document.starts_with(r#"{"schema":3,"name":"sim","config":"#),
+        document.starts_with(r#"{"schema":4,"name":"sim","config":"#),
         "{document:.80}"
     );
     for name in [
@@ -80,13 +80,13 @@ fn an_invalid_probability_exits_one_naming_it() {
     let dir = PathBuf::from(std::env::var("TEST_TMPDIR").expect("TEST_TMPDIR under bazel test"));
     let path = dir.join("bad.toml");
     let example = fs::read_to_string(env!("DORFQ_SIM_EXAMPLE")).expect("read example");
-    let bad = example.replace("p_bad = 0.05", "p_bad = 1.5");
-    assert_ne!(bad, example, "the example sets p_bad = 0.05");
+    let bad = example.replacen("p_flake = 0.02", "p_flake = 1.5", 1);
+    assert_ne!(bad, example, "the example sets p_flake = 0.02");
     fs::write(&path, bad).expect("write config");
     let output = sim(&["run", "--config", path.to_str().expect("UTF-8 path")]);
     assert_eq!(output.status.code(), Some(1), "dorfq-sim: {output:?}");
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
-    assert!(stderr.contains("p_bad"), "{stderr}");
+    assert!(stderr.contains("p_flake"), "{stderr}");
 }
 
 #[test]
@@ -138,7 +138,7 @@ fn sweep_prints_the_grid_and_the_summary_and_writes_the_document() {
     }
     let document = fs::read_to_string(&out).expect("the document is written");
     assert!(
-        document.starts_with(r#"{"schema":1,"name":"grid","config_text":"#),
+        document.starts_with(r#"{"schema":2,"name":"grid","config_text":"#),
         "{document:.80}"
     );
 }

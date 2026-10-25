@@ -5,16 +5,6 @@ use std::fmt;
 
 use serde::Serialize;
 
-/// A pull request's hidden truth, as drawn at arrival. The simulator's own:
-/// a forge replaying production has none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct Truth {
-    /// Fails on its own against trunk.
-    pub bad: bool,
-    /// Conflicts textually with trunk.
-    pub conflicts: bool,
-}
-
 /// Why a pull request's author rebases it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +13,9 @@ pub enum Rebase {
     Conflict,
     /// Its base landed, under `github` admission.
     BaseLanded,
+    /// Its own CI failed on its head: it is broken against trunk, and the
+    /// push is its author's fix.
+    Broken,
 }
 
 /// One start of a step's plan.
@@ -44,26 +37,35 @@ pub struct PlannedEject {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TraceEvent {
-    /// A pull request arrived, stacked on `base` or on trunk.
+    /// A pull request arrived, stacked on `base` or on trunk; `conflicts`
+    /// is the hidden truth that it conflicts textually with trunk.
     Arrive {
         t: u64,
         pr: u64,
         base: Option<u64>,
         atomic: bool,
-        truth: Truth,
+        conflicts: bool,
     },
+    /// Hidden truth: the landing of `by` broke the pull request against
+    /// trunk.
+    Broken { t: u64, pr: u64, by: u64 },
+    /// Hidden truth: its author's fix push cleared its breakage; the push
+    /// follows as `repush`.
+    Fixed { t: u64, pr: u64 },
     /// A head changed, intent kept.
     Repush { t: u64, pr: u64 },
     /// Intent cleared by the world's churn.
     Withdraw { t: u64, pr: u64 },
     /// Out of the queue with its base `on`: for good when `final`, its base
     /// having left without landing; otherwise its base is out for a rebase
-    /// and it returns, traced `admit`, at the base's push.
+    /// and it returns, traced `admit`, at the base's push. `bad` when it was
+    /// bad against trunk at that instant, its base's badness included.
     Blocked {
         t: u64,
         pr: u64,
         on: u64,
         r#final: bool,
+        bad: bool,
     },
     /// A batch started; `base` is the batch whose tip it runs on, `None`
     /// when that is trunk at the moment of the start.
@@ -106,9 +108,14 @@ pub enum TraceEvent {
     /// when the queue caused it by landing the pull request's direct base
     /// without it.
     PrCi { t: u64, pr: u64, billed: bool },
-    /// The pull request's own CI run ended: passed, or `cancelled` by a
-    /// head change.
-    PrCiEnd { t: u64, pr: u64, cancelled: bool },
+    /// The pull request's own CI run ended: passed, `failed` with its head
+    /// broken against trunk, or `cancelled` by a head change.
+    PrCiEnd {
+        t: u64,
+        pr: u64,
+        cancelled: bool,
+        failed: bool,
+    },
     /// The pull request's author starts rebasing it, for `why`; the push
     /// follows as `repush`.
     Rebase { t: u64, pr: u64, why: Rebase },
@@ -151,13 +158,23 @@ impl fmt::Display for TraceEvent {
                 }
                 Ok(())
             }
+            TraceEvent::Broken { pr, by, .. } => write!(f, "broken {pr} by {by}"),
+            TraceEvent::Fixed { pr, .. } => write!(f, "fixed {pr}"),
             TraceEvent::Repush { pr, .. } => write!(f, "repush {pr}"),
             TraceEvent::Withdraw { pr, .. } => write!(f, "withdraw {pr}"),
             TraceEvent::Blocked {
-                pr, on, r#final, ..
+                pr,
+                on,
+                r#final,
+                bad,
+                ..
             } => {
                 let how = if *r#final { "on" } else { "with" };
-                write!(f, "blocked {pr} {how} {on}")
+                write!(f, "blocked {pr} {how} {on}")?;
+                if *bad {
+                    write!(f, " bad")?;
+                }
+                Ok(())
             }
             TraceEvent::Start {
                 batch,
@@ -226,13 +243,23 @@ impl fmt::Display for TraceEvent {
                 }
                 Ok(())
             }
-            TraceEvent::PrCiEnd { pr, cancelled, .. } => {
-                let end = if *cancelled { "cancelled" } else { "passed" };
+            TraceEvent::PrCiEnd {
+                pr,
+                cancelled,
+                failed,
+                ..
+            } => {
+                let end = match (cancelled, failed) {
+                    (true, _) => "cancelled",
+                    (false, true) => "failed",
+                    (false, false) => "passed",
+                };
                 write!(f, "pr-ci {pr} {end}")
             }
             TraceEvent::Rebase { pr, why, .. } => match why {
                 Rebase::Conflict => write!(f, "rebase {pr} conflict"),
                 Rebase::BaseLanded => write!(f, "rebase {pr} base landed"),
+                Rebase::Broken => write!(f, "rebase {pr} broken"),
             },
             TraceEvent::Admit { pr, base, .. } => {
                 write!(f, "admit {pr}")?;
@@ -276,20 +303,26 @@ impl fmt::Display for TraceEvent {
 /// Checks every pull request's life along its own events: after a
 /// `blocked` or `eject` that is not final only `rebase` and `repush` come
 /// before its return (`admit`), a `withdraw` or a final `blocked`; after a
-/// `rebase` comes its push or a withdrawal; after a `wait` a rebase, a
+/// `rebase` for a conflict or a landed base comes its push or a withdrawal;
+/// after a `rebase` for breakage, its fix push or whatever ends the pending
+/// fix: a push re-heading it, another `rebase`, an `eject`, a `blocked` or a
+/// withdrawal; after a `wait` a rebase, a
 /// push, an `admit`, a final `blocked` or a withdrawal; after a final exit that is not
 /// a landing at most one `pr_ci_end`, its last head's run's; after a
 /// landing one `pr_ci_end` if a billed run was in flight at the landing,
 /// and nothing else; and no `start` names it unless its current head, from
-/// its `arrive` or latest `repush`, has passed its own CI.
+/// its `arrive` or latest `repush`, has passed its own CI (a failed run does
+/// not count).
 #[cfg(test)]
 pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
     use std::collections::BTreeMap;
 
-    /// What a pending `rebase` or `wait` allows next.
+    /// What the pending event allows next: a `rebase` for a conflict or a
+    /// landed base, one for breakage, or a `wait`.
     enum Expect {
-        AfterRebase,
-        AfterWait,
+        Rebase,
+        Fix,
+        Wait,
     }
 
     #[derive(Default)]
@@ -350,8 +383,10 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
                     life.billed = *billed;
                     continue;
                 }
-                TraceEvent::PrCiEnd { cancelled, .. } => {
-                    life.checked |= !cancelled;
+                TraceEvent::PrCiEnd {
+                    cancelled, failed, ..
+                } => {
+                    life.checked |= !cancelled && !failed;
                     life.billed = false;
                     continue;
                 }
@@ -360,10 +395,14 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
             if let Some((expect, after)) = life.expecting.take() {
                 let fits = match (expect, event) {
                     (_, TraceEvent::Repush { .. } | TraceEvent::Withdraw { .. }) => true,
-                    (Expect::AfterWait, TraceEvent::Rebase { .. } | TraceEvent::Admit { .. }) => {
-                        true
-                    }
-                    (Expect::AfterWait, TraceEvent::Blocked { r#final, .. }) => *r#final,
+                    (Expect::Wait, TraceEvent::Rebase { .. } | TraceEvent::Admit { .. }) => true,
+                    (Expect::Wait, TraceEvent::Blocked { r#final, .. }) => *r#final,
+                    (
+                        Expect::Fix,
+                        TraceEvent::Rebase { .. }
+                        | TraceEvent::Eject { .. }
+                        | TraceEvent::Blocked { .. },
+                    ) => true,
                     _ => false,
                 };
                 if !fits {
@@ -385,10 +424,14 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
                 }
                 TraceEvent::Blocked { r#final: false, .. }
                 | TraceEvent::Eject { r#final: false, .. } => life.returning = Some(text.clone()),
+                TraceEvent::Rebase {
+                    why: Rebase::Broken,
+                    ..
+                } => life.expecting = Some((Expect::Fix, text.clone())),
                 TraceEvent::Rebase { .. } => {
-                    life.expecting = Some((Expect::AfterRebase, text.clone()));
+                    life.expecting = Some((Expect::Rebase, text.clone()));
                 }
-                TraceEvent::Wait { .. } => life.expecting = Some((Expect::AfterWait, text.clone())),
+                TraceEvent::Wait { .. } => life.expecting = Some((Expect::Wait, text.clone())),
                 TraceEvent::Blocked { r#final: true, .. }
                 | TraceEvent::Eject { r#final: true, .. }
                 | TraceEvent::Withdraw { .. } => life.exit = Some((text.clone(), false)),
@@ -412,20 +455,14 @@ mod tests {
                 pr: 7,
                 base: Some(3),
                 atomic: true,
-                truth: Truth {
-                    bad: false,
-                    conflicts: false,
-                },
+                conflicts: false,
             },
             TraceEvent::Arrive {
                 t: 1,
                 pr: 8,
                 base: None,
                 atomic: false,
-                truth: Truth {
-                    bad: true,
-                    conflicts: true,
-                },
+                conflicts: true,
             },
             TraceEvent::Repush { t: 2, pr: 7 },
             TraceEvent::Withdraw { t: 3, pr: 3 },
@@ -434,12 +471,14 @@ mod tests {
                 pr: 7,
                 on: 3,
                 r#final: true,
+                bad: true,
             },
             TraceEvent::Blocked {
                 t: 3,
                 pr: 8,
                 on: 3,
                 r#final: false,
+                bad: false,
             },
             TraceEvent::Start {
                 t: 4,
@@ -522,11 +561,13 @@ mod tests {
                 t: 8,
                 pr: 7,
                 cancelled: false,
+                failed: false,
             },
             TraceEvent::PrCiEnd {
                 t: 8,
                 pr: 8,
                 cancelled: true,
+                failed: false,
             },
             TraceEvent::Rebase {
                 t: 9,
@@ -575,6 +616,23 @@ mod tests {
                 }],
                 retire: vec![3, 4],
             },
+            TraceEvent::Broken {
+                t: 12,
+                pr: 7,
+                by: 2,
+            },
+            TraceEvent::PrCiEnd {
+                t: 13,
+                pr: 7,
+                cancelled: false,
+                failed: true,
+            },
+            TraceEvent::Rebase {
+                t: 13,
+                pr: 7,
+                why: Rebase::Broken,
+            },
+            TraceEvent::Fixed { t: 14, pr: 7 },
         ]
     }
 
@@ -588,7 +646,7 @@ mod tests {
                 "arrive 8",
                 "repush 7",
                 "withdraw 3",
-                "blocked 7 on 3",
+                "blocked 7 on 3 bad",
                 "blocked 8 with 3",
                 "start 2 [1,2] on trunk",
                 "start 3 [5] on 2",
@@ -612,6 +670,10 @@ mod tests {
                 "recheck 7",
                 "wait 7 on 3",
                 "t=6 queued=4 in_flight=1 | land [2] | start 5[6,7] 6[8] | eject 5(batch 3 failed) | retire [3,4]",
+                "broken 7 by 2",
+                "pr-ci 7 failed",
+                "rebase 7 broken",
+                "fixed 7",
             ]
         );
     }
@@ -633,6 +695,7 @@ mod tests {
             t: 1,
             pr: 7,
             cancelled: false,
+            failed: false,
         };
         let land = TraceEvent::Land {
             t: 2,
@@ -688,6 +751,7 @@ mod tests {
             t: 3,
             pr: 7,
             cancelled: false,
+            failed: false,
         };
         let start = TraceEvent::Start {
             t: 1,
@@ -715,6 +779,92 @@ mod tests {
             events.extend(tail);
             let error = check_lives(&events).unwrap_err();
             assert!(error.contains("after its exit `land 1 [7]`"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_failed_own_run_leaves_its_head_unchecked() {
+        let pr_ci = TraceEvent::PrCi {
+            t: 0,
+            pr: 7,
+            billed: false,
+        };
+        let failed = TraceEvent::PrCiEnd {
+            t: 1,
+            pr: 7,
+            cancelled: false,
+            failed: true,
+        };
+        let start = TraceEvent::Start {
+            t: 2,
+            batch: 1,
+            base: None,
+            members: vec![7],
+        };
+        let error = check_lives(&[pr_ci, failed, start]).unwrap_err();
+        assert!(error.contains("unchecked head"), "{error}");
+    }
+
+    #[test]
+    fn a_pending_fix_ends_only_as_the_fix_says() {
+        let rebase = |why| TraceEvent::Rebase { t: 1, pr: 7, why };
+        let eject = |r#final| TraceEvent::Eject {
+            t: 2,
+            pr: 7,
+            reason: "batch 3 failed".to_owned(),
+            justified: true,
+            r#final,
+        };
+        let blocked = |r#final| TraceEvent::Blocked {
+            t: 2,
+            pr: 7,
+            on: 3,
+            r#final,
+            bad: false,
+        };
+        let repush = TraceEvent::Repush { t: 2, pr: 7 };
+        let withdraw = TraceEvent::Withdraw { t: 2, pr: 7 };
+        let fixed = TraceEvent::Fixed { t: 2, pr: 7 };
+        for next in [
+            vec![fixed, repush.clone()],
+            vec![repush.clone()],
+            vec![rebase(Rebase::BaseLanded), repush.clone()],
+            vec![rebase(Rebase::Conflict), repush.clone()],
+            vec![withdraw],
+            vec![eject(true)],
+            vec![eject(false)],
+            vec![blocked(true)],
+            vec![blocked(false)],
+        ] {
+            let mut events = vec![rebase(Rebase::Broken)];
+            events.extend(next);
+            assert_eq!(check_lives(&events), Ok(()), "{events:?}");
+        }
+        let admit = TraceEvent::Admit {
+            t: 2,
+            pr: 7,
+            base: None,
+        };
+        for (events, after) in [
+            (
+                vec![rebase(Rebase::Broken), admit],
+                "after `rebase 7 broken`",
+            ),
+            (
+                vec![rebase(Rebase::Conflict), eject(true)],
+                "after `rebase 7 conflict`",
+            ),
+            (
+                vec![
+                    rebase(Rebase::Broken),
+                    rebase(Rebase::BaseLanded),
+                    eject(true),
+                ],
+                "after `rebase 7 base landed`",
+            ),
+        ] {
+            let error = check_lives(&events).unwrap_err();
+            assert!(error.contains(after), "{error}");
         }
     }
 
@@ -770,6 +920,10 @@ mod tests {
             "recheck",
             "wait",
             "step",
+            "broken",
+            "pr_ci_end",
+            "rebase",
+            "fixed",
         ];
         assert_eq!(kinds, expected.map(|k| json!(k)));
         let events = every_kind();
@@ -777,7 +931,7 @@ mod tests {
             serde_json::to_value(&events[0]).unwrap(),
             json!({
                 "kind": "arrive", "t": 1, "pr": 7, "base": 3, "atomic": true,
-                "truth": { "bad": false, "conflicts": false }
+                "conflicts": false
             })
         );
         assert_eq!(
@@ -786,7 +940,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(&events[5]).unwrap(),
-            json!({ "kind": "blocked", "t": 3, "pr": 8, "on": 3, "final": false })
+            json!({ "kind": "blocked", "t": 3, "pr": 8, "on": 3, "final": false, "bad": false })
         );
         assert_eq!(
             serde_json::to_value(&events[14]).unwrap(),
@@ -805,7 +959,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(&events[20]).unwrap(),
-            json!({ "kind": "pr_ci_end", "t": 8, "pr": 8, "cancelled": true })
+            json!({ "kind": "pr_ci_end", "t": 8, "pr": 8, "cancelled": true, "failed": false })
         );
         assert_eq!(
             serde_json::to_value(&events[22]).unwrap(),
@@ -827,6 +981,22 @@ mod tests {
                 "eject": [{ "pr": 5, "reason": "batch 3 failed" }],
                 "retire": [3, 4]
             })
+        );
+        assert_eq!(
+            serde_json::to_value(&events[28]).unwrap(),
+            json!({ "kind": "broken", "t": 12, "pr": 7, "by": 2 })
+        );
+        assert_eq!(
+            serde_json::to_value(&events[29]).unwrap(),
+            json!({ "kind": "pr_ci_end", "t": 13, "pr": 7, "cancelled": false, "failed": true })
+        );
+        assert_eq!(
+            serde_json::to_value(&events[30]).unwrap(),
+            json!({ "kind": "rebase", "t": 13, "pr": 7, "why": "broken" })
+        );
+        assert_eq!(
+            serde_json::to_value(&events[31]).unwrap(),
+            json!({ "kind": "fixed", "t": 14, "pr": 7 })
         );
     }
 }

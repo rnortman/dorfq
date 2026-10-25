@@ -1,4 +1,4 @@
-# A week of arrivals on two lanes, then a day to drain, four
+# A week of arrivals on two lanes, then until the queue drains, four
 # replications, with batch and PR CI both 45 to 120 minutes. github-like
 # runs on sixteen lanes, the concurrency GitHub's queue is given in
 # practice. Run it with:
@@ -9,14 +9,14 @@ replications = 4           # independent runs per policy, each from its own seed
 
 [world]
 hours = 168                # arrivals stop after this many hours
-drain_hours = 24           # then the run drains, and stops at hours + drain_hours at the latest
+drain_hours = 1000         # the backstop: a run lasts until its queue empties, and stops at hours + drain_hours at the latest
+stall_hours = 168          # a run is cut off as stalled this long after its last landing or ejection
 arrivals_per_hour = 0.75   # mean rate of new pull requests; stacks arrive as a Poisson process at this rate over the mean number of pull requests a stack brings
 ci_minutes = { min = 45, max = 120 }   # uniform duration of a batch's CI run
 pr_ci_minutes = { min = 45, max = 120 }   # uniform duration of a pull request's own CI run, as long as the batch run; it starts when requested and needs no lane; a pull request is batchable only once it has passed on its current head
 rebase_minutes = { min = 15, max = 120 }   # uniform delay from a rebase becoming necessary (a conflict with trunk, or under github admission a landed base) to the author's push of it
 pr_ci_on_base_landed = true   # the repository re-runs a pull request's own CI when the pull request it was based on lands; the queue is billed for the direct children's runs
-p_bad = 0.05               # a pull request breaks on its own against trunk
-p_interact = 0.002         # a pair of pull requests whose queue time overlapped break only together
+p_interact = 0.002         # a pair conflicts: a run with both fails; whichever lands first breaks the other
 p_flake = 0.02             # a run fails for no reason in the tree
 p_conflict = 0.02          # a stack arrives with its root conflicting against trunk
 repush_per_hour = 0.0      # per open pull request, the rate at which its author pushes a new head; its intent to land is kept
@@ -62,7 +62,7 @@ admission = "label"          # dorfq's: in the queue from arrival, held until it
 kind = "bayes"               # the scheduler: batches chosen and culprits inferred from a posterior over who is bad
 lanes = 2                    # most batches in flight at once
 max_batch = 16               # most pull requests one batch may hold
-p_bad = 0.05               # prior: a pull request fails on its own against trunk
+p_bad = 0.05               # prior: broken against trunk at arrival; the world's own rate is 0, and every landing adds p_interact
 p_interact = 0.002         # prior: a pair fails only together; also the per-landing decay
 p_flake = 0.02             # a run fails for no reason
 run_cost = 0.5             # one run, in landed-pull-request units
@@ -82,7 +82,7 @@ admission = "label"          # dorfq's: in the queue from arrival, held until it
 kind = "bayes"               # the scheduler: batches chosen and culprits inferred from a posterior over who is bad
 lanes = 2                    # most batches in flight at once
 max_batch = 16               # most pull requests one batch may hold
-p_bad = 0.05               # prior: a pull request fails on its own against trunk
+p_bad = 0.05               # prior: broken against trunk at arrival; the world's own rate is 0, and every landing adds p_interact
 p_interact = 0.002         # prior: a pair fails only together; also the per-landing decay
 p_flake = 0.02             # a run fails for no reason
 run_cost = 0.5             # one run, in landed-pull-request units

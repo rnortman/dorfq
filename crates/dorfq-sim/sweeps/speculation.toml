@@ -3,15 +3,13 @@
 #   make sweep ARGS="--config $PWD/crates/dorfq-sim/sweeps/speculation.toml"
 #
 # The bayes columns differ only in their flags; every policy axis names all
-# four, so at each point they run at the same lanes, max_batch, run_cost and
-# priors. github-like is fixed at the concurrency GitHub's queue is given in
-# practice and is named by the world axes alone. The summary reads every
+# four, so at each point they run at the same lanes, max_batch, run_cost,
+# w_reject and priors. github-like is fixed at the concurrency GitHub's
+# queue is given in practice and is named by the world axes alone. The summary reads every
 # column against bayes-chain, the status quo; the grid rows show, point by
 # point, where the best bayes beats github-like and where it does not.
 #
-# 288 points, five columns, two replications: 5,760 simulations. On a
-# 32-thread machine, at the default --jobs, the sweep took 5.5 minutes of
-# wall time (2.8 hours of CPU time); four replications took 13.6 minutes.
+# 384 points, five columns, two replications: 7,680 simulations.
 
 seed = 1                   # master seed; every replication's streams derive from it
 replications = 2           # independent runs per policy and point, each from its own seed
@@ -19,14 +17,14 @@ baseline = "bayes-chain"   # the column every other column's deltas are against
 
 [world]
 hours = 72                 # arrivals stop after this many hours
-drain_hours = 12           # then the run drains, and stops at hours + drain_hours at the latest
+drain_hours = 1000         # the backstop: a run lasts until its queue empties, and stops at hours + drain_hours at the latest
+stall_hours = 168          # a run is cut off as stalled this long after its last landing or ejection
 arrivals_per_hour = 5.0    # mean rate of new pull requests (swept)
 ci_minutes = { min = 45, max = 120 }   # uniform duration of a batch's CI run (swept)
 pr_ci_minutes = { min = 45, max = 120 }   # uniform duration of a pull request's own CI run (swept with ci_minutes)
 rebase_minutes = { min = 15, max = 120 }   # uniform delay from a rebase becoming necessary to the author's push of it
 pr_ci_on_base_landed = true   # the repository re-runs a pull request's own CI when its base lands
-p_bad = 0.05               # a pull request breaks on its own against trunk
-p_interact = 0.005         # a pair whose queue time overlapped breaks only together (swept)
+p_interact = 0.005         # a pair conflicts: a run with both fails; whichever lands first breaks the other (swept)
 p_flake = 0.03             # a run fails for no reason in the tree (swept)
 p_conflict = 0.02          # a stack arrives with its root conflicting against trunk
 repush_per_hour = 0.02     # per open pull request, the rate at which its author pushes a new head
@@ -52,7 +50,7 @@ admission = "label"
 kind = "bayes"
 lanes = 8
 max_batch = 16
-p_bad = 0.05
+p_bad = 0.05  # prior: broken against trunk at arrival; the world's own rate is 0, and every landing adds p_interact
 p_interact = 0.005
 p_flake = 0.03
 run_cost = 0.5
@@ -71,7 +69,7 @@ admission = "label"
 kind = "bayes"
 lanes = 8
 max_batch = 16
-p_bad = 0.05
+p_bad = 0.05  # prior: broken against trunk at arrival; the world's own rate is 0, and every landing adds p_interact
 p_interact = 0.005
 p_flake = 0.03
 run_cost = 0.5
@@ -90,7 +88,7 @@ admission = "label"
 kind = "bayes"
 lanes = 8
 max_batch = 16
-p_bad = 0.05
+p_bad = 0.05  # prior: broken against trunk at arrival; the world's own rate is 0, and every landing adds p_interact
 p_interact = 0.005
 p_flake = 0.03
 run_cost = 0.5
@@ -109,7 +107,7 @@ admission = "label"
 kind = "bayes"
 lanes = 8
 max_batch = 16
-p_bad = 0.05
+p_bad = 0.05  # prior: broken against trunk at arrival; the world's own rate is 0, and every landing adds p_interact
 p_interact = 0.005
 p_flake = 0.03
 run_cost = 0.5
@@ -127,8 +125,8 @@ values = [3.0, 6.0, 12.0]
 
 [[axis]]
 keys = ["world.ci_minutes", "world.pr_ci_minutes"]
-values = [{ min = 45, max = 75 }, { min = 90, max = 120 }]
-labels = ["ci-45-75", "ci-90-120"]
+values = [{ min = 45, max = 120 }, { min = 90, max = 120 }]
+labels = ["ci-45-120", "ci-90-120"]
 
 [[axis]]
 keys = [
@@ -157,7 +155,7 @@ keys = [
     "policy.bayes-tree.max_batch",
     "policy.bayes-tree-transfer.max_batch",
 ]
-values = [8, 16, 30]
+values = [16, 30]
 
 [[axis]]
 keys = [
@@ -176,3 +174,12 @@ keys = [
     "policy.bayes-tree-transfer.run_cost",
 ]
 values = [0.5, 2.0]
+
+[[axis]]
+keys = [
+    "policy.bayes-chain.w_reject",
+    "policy.bayes-full.w_reject",
+    "policy.bayes-tree.w_reject",
+    "policy.bayes-tree-transfer.w_reject",
+]
+values = [1.0, 10.0]

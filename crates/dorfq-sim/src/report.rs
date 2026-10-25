@@ -12,7 +12,7 @@ use crate::trace::TraceEvent;
 
 /// The JSON document's schema number. It changes when a field changes
 /// meaning, not when one is added.
-pub const SCHEMA: u32 = 3;
+pub const SCHEMA: u32 = 4;
 
 /// One policy's replications, in replication order.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,13 +32,14 @@ pub struct Report {
 /// A metric row: its name, the decimals it prints with, and its value.
 pub(crate) type Row = (&'static str, usize, fn(&Metrics) -> Option<f64>);
 
-pub(crate) const ROWS: [Row; 20] = [
+pub(crate) const ROWS: [Row; 26] = [
     ("arrived", 1, |m| Some(m.arrived as f64)),
+    ("ever_bad", 1, |m| Some(m.ever_bad as f64)),
     ("landed", 1, |m| Some(m.landed as f64)),
     ("ejected_bad", 1, |m| Some(m.ejected_bad as f64)),
     ("ejected_good", 1, |m| Some(m.ejected_good as f64)),
     ("withdrawn", 1, |m| Some(m.withdrawn as f64)),
-    ("blocked", 1, |m| Some(m.blocked as f64)),
+    ("left_with_base", 1, |m| Some(m.left_with_base as f64)),
     ("unfinished", 1, |m| Some(m.unfinished as f64)),
     ("rebases", 1, |m| Some(m.rebases as f64)),
     ("runs", 1, |m| Some(m.runs as f64)),
@@ -53,6 +54,11 @@ pub(crate) const ROWS: [Row; 20] = [
     ("land_p95_hours", 2, |m| m.land_p95_hours),
     ("reject_p50_hours", 2, |m| m.reject_p50_hours),
     ("reject_p95_hours", 2, |m| m.reject_p95_hours),
+    ("detect_p50_hours", 2, |m| m.detect_p50_hours),
+    ("detect_p95_hours", 2, |m| m.detect_p95_hours),
+    ("ended_hours", 1, |m| Some(m.ended_hours)),
+    ("cut_off", 2, |m| Some(f64::from(u8::from(m.cut_off)))),
+    ("stalled", 2, |m| Some(f64::from(u8::from(m.stalled)))),
 ];
 
 /// Which way a metric is better.
@@ -63,7 +69,7 @@ pub(crate) enum Better {
 }
 
 /// The metrics of [`ROWS`] that have a direction; the rest have none.
-pub(crate) const BETTER: [(&str, Better); 13] = [
+pub(crate) const BETTER: [(&str, Better); 18] = [
     ("landed", Better::Higher),
     ("ejected_bad", Better::Higher),
     ("ejected_good", Better::Lower),
@@ -77,6 +83,11 @@ pub(crate) const BETTER: [(&str, Better); 13] = [
     ("land_p95_hours", Better::Lower),
     ("reject_p50_hours", Better::Lower),
     ("reject_p95_hours", Better::Lower),
+    ("detect_p50_hours", Better::Lower),
+    ("detect_p95_hours", Better::Lower),
+    ("ended_hours", Better::Lower),
+    ("cut_off", Better::Lower),
+    ("stalled", Better::Lower),
 ];
 
 /// The direction of the metric `name`, if it has one.
@@ -252,8 +263,9 @@ mod tests {
             ejected_bad: 0,
             ejected_good: 0,
             withdrawn: 0,
-            blocked: 1,
             unfinished: 10 - landed,
+            left_with_base: 1,
+            ever_bad: 2,
             rebases: 0,
             runs: 2,
             cancelled_runs: 1,
@@ -267,6 +279,11 @@ mod tests {
             land_p95_hours: None,
             reject_p50_hours: None,
             reject_p95_hours: None,
+            detect_p50_hours: None,
+            detect_p95_hours: None,
+            ended_hours: 80.0,
+            cut_off: landed < 10,
+            stalled: false,
         }
     }
 
@@ -321,17 +338,17 @@ mod tests {
     }
 
     #[test]
-    fn blocked_follows_withdrawn() {
+    fn left_with_base_follows_withdrawn() {
         let table = report().to_string();
         let names: Vec<&str> = table
             .lines()
             .map(|l| l.split(' ').next().unwrap())
             .collect();
         let withdrawn = names.iter().position(|&n| n == "withdrawn").unwrap();
-        assert_eq!(names[withdrawn + 1], "blocked");
+        assert_eq!(names[withdrawn + 1], "left_with_base");
         assert_eq!(
-            row(&table, "blocked"),
-            ["blocked", "1.0 [1.0–1.0]", "1.0 [1.0–1.0]"]
+            row(&table, "left_with_base"),
+            ["left_with_base", "1.0 [1.0–1.0]", "1.0 [1.0–1.0]"]
         );
     }
 
@@ -347,11 +364,12 @@ mod tests {
             [
                 "metric",
                 "arrived",
+                "ever_bad",
                 "landed",
                 "ejected_bad",
                 "ejected_good",
                 "withdrawn",
-                "blocked",
+                "left_with_base",
                 "unfinished",
                 "rebases",
                 "runs",
@@ -366,6 +384,11 @@ mod tests {
                 "land_p95_hours",
                 "reject_p50_hours",
                 "reject_p95_hours",
+                "detect_p50_hours",
+                "detect_p95_hours",
+                "ended_hours",
+                "cut_off",
+                "stalled",
                 "failure",
             ]
         );
@@ -384,6 +407,23 @@ mod tests {
         assert_eq!(better("ejected_bad"), Some(Better::Higher));
         assert_eq!(better("cancelled_runs"), Some(Better::Lower));
         assert_eq!(better("arrived"), None);
+        assert_eq!(better("stalled"), Some(Better::Lower));
+        assert_eq!(better("detect_p95_hours"), Some(Better::Lower));
+        assert_eq!(better("ever_bad"), None);
+        assert_eq!(better("left_with_base"), None);
+    }
+
+    #[test]
+    fn the_end_rows_read_as_fractions_of_replications() {
+        let table = report().to_string();
+        assert_eq!(
+            row(&table, "cut_off"),
+            ["cut_off", "1.00 [1.00–1.00]", "0.00 [0.00–0.00]"]
+        );
+        assert_eq!(
+            row(&table, "ended_hours"),
+            ["ended_hours", "80.0 [80.0–80.0]", "80.0 [80.0–80.0]"]
+        );
     }
 
     #[test]
@@ -418,7 +458,7 @@ mod tests {
         report.policies[0].trace = vec![TraceEvent::Withdraw { t: 3, pr: 1 }];
         let document: serde_json::Value =
             serde_json::from_str(&report.to_json("sim", &config, text)).unwrap();
-        assert_eq!(document["schema"], 3);
+        assert_eq!(document["schema"], 4);
         assert_eq!(document["name"], "sim");
         assert_eq!(document["config_text"], text);
         assert_eq!(document["config"]["seed"], 1);

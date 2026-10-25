@@ -5,9 +5,10 @@
   nested tables) to each of its values. Every point of the grid runs every
   policy at every replication on a pool of threads, and the sweep prints one
   row per point and policy with every metric's mean, then each policy's mean
-  relative delta against the baseline over the points, with the count of
-  points where it is better. `--json` writes every replication's metrics at
-  every point.
+  relative delta against the baseline over the points where the baseline's
+  is not 0, with the counts of points where it is better and worse out of
+  those where both have the metric. `--json` writes every replication's
+  metrics at every point.
 - The `cancelled_runs` metric: batch runs stopped by their batch's
   retirement, in the run table, the JSON document and the report site.
 - Two shipped sweep files under `crates/dorfq-sim/sweeps/`:

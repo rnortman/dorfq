@@ -27,7 +27,7 @@ use crate::{SimError, run};
 
 /// The sweep JSON document's schema number. It changes when a field
 /// changes meaning, not when one is added.
-pub const SWEEP_SCHEMA: u32 = 1;
+pub const SWEEP_SCHEMA: u32 = 2;
 
 /// One axis of the grid.
 #[derive(Debug, Clone, PartialEq)]
@@ -435,10 +435,10 @@ impl SweepReport {
     }
 
     /// One row per metric, one column per policy but the baseline: the
-    /// mean over points of the relative delta against the baseline, and
-    /// where the metric has a direction the points it is better at out of
-    /// those compared. A point is compared where both have the metric and
-    /// the baseline's is not 0.
+    /// mean over points of the relative delta against the baseline, over
+    /// the points where the baseline's is not 0, and where the metric has a
+    /// direction the points it is better and worse at out of those
+    /// compared. A point is compared where both have the metric.
     fn summary(&self) -> Vec<Vec<String>> {
         let Some(first) = self.points.first() else {
             return Vec::new();
@@ -461,7 +461,7 @@ impl SweepReport {
         for &(name, _, value) in &ROWS {
             let cells = others.iter().map(|&p| {
                 let mut deltas = Vec::new();
-                let mut better = 0;
+                let (mut compared, mut better, mut worse) = (0, 0, 0);
                 for point in &self.points {
                     let policies = &point.report.policies;
                     let (Some(b), Some(o)) =
@@ -469,23 +469,27 @@ impl SweepReport {
                     else {
                         continue;
                     };
-                    if b == 0.0 {
-                        continue;
+                    compared += 1;
+                    if b != 0.0 {
+                        deltas.push((o - b) / b);
                     }
-                    deltas.push((o - b) / b);
-                    better += usize::from(match report::better(name) {
-                        Some(Better::Higher) => o > b,
-                        Some(Better::Lower) => o < b,
-                        None => false,
-                    });
+                    let (up, down) = match report::better(name) {
+                        Some(Better::Higher) => (o > b, o < b),
+                        Some(Better::Lower) => (o < b, o > b),
+                        None => (false, false),
+                    };
+                    better += usize::from(up);
+                    worse += usize::from(down);
                 }
-                if deltas.is_empty() {
-                    return "-".to_owned();
-                }
-                let mean = 100.0 * deltas.iter().sum::<f64>() / deltas.len() as f64;
+                let mean = if deltas.is_empty() {
+                    "-".to_owned()
+                } else {
+                    let mean = 100.0 * deltas.iter().sum::<f64>() / deltas.len() as f64;
+                    format!("{mean:+.1}%")
+                };
                 match report::better(name) {
-                    Some(_) => format!("{mean:+.1}% ({better}/{})", deltas.len()),
-                    None => format!("{mean:+.1}%"),
+                    Some(_) if compared > 0 => format!("{mean} ({better}+ {worse}- /{compared})"),
+                    _ => mean,
                 }
             });
             lines.push([name.to_owned()].into_iter().chain(cells).collect());

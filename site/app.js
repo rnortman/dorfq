@@ -3,7 +3,7 @@
 // replication. Reads the documents `dorfq-sim run --json` writes.
 "use strict";
 
-const SCHEMA = 3;
+const SCHEMA = 4;
 const BASELINE = "github-like";
 const DEFAULT_REPORT = "busy";
 
@@ -12,26 +12,22 @@ const REPORT_NOTES = {
   busy:
     "dorfq's columns share eight lanes; github-like runs on sixteen, the " +
     "concurrency GitHub's queue is given in practice. bayes is the status " +
-    "quo, which measured best, at its best measured settings (eight lanes, " +
-    "max_batch 8); bayes-tree is the tree of futures at the same settings. " +
-    "Over the speculation sweep the tree lands more only under overload, and " +
-    "at the cost of resolution: about 80% fewer bad pull requests ejected and " +
-    "about three times as many left unfinished, at about 40% fewer " +
-    "runner-hours per landed pull request. bisect's best measured cap here " +
-    "is 1, so its column is the naive queue under dorfq's admission. Here " +
-    "bayes lands 170 (32 bad ejected, 27 unfinished, 3.2 runner-hours per " +
-    "landed), bayes-tree 159 (6, 89, 2.2), bisect 157 (38, 18, 4.6) and " +
-    "github-like 140 (32, 25, 5.5).",
+    "quo (eight lanes, max_batch 8); bayes-tree is the tree of futures at " +
+    "the same settings. bisect runs at cap 1, the naive queue under dorfq's " +
+    "admission. Every replication drains. Here bayes lands 264 (47 bad and " +
+    "1.5 good ejected, 1.7 runner-hours per landed), bayes-tree 278 (28, " +
+    "0.8, 1.3), bisect 238 (70, 17, 3.1) and github-like 239 (39, 26, 3.2).",
 };
 
 // Metric rows, as the command line's table prints them: key and decimals.
 const ROWS = [
-  ["arrived", 1], ["landed", 1], ["ejected_bad", 1], ["ejected_good", 1],
-  ["withdrawn", 1], ["blocked", 1], ["unfinished", 1], ["rebases", 1], ["runs", 1],
+  ["arrived", 1], ["ever_bad", 1], ["landed", 1], ["ejected_bad", 1], ["ejected_good", 1],
+  ["withdrawn", 1], ["left_with_base", 1], ["unfinished", 1], ["rebases", 1], ["runs", 1],
   ["cancelled_runs", 1],
   ["mean_batch_size", 2], ["billed_pr_ci_runs", 1], ["runner_hours", 1], ["billed_pr_ci_hours", 1],
   ["runner_hours_per_landed", 2], ["wasted_fraction", 3], ["land_p50_hours", 2], ["land_p95_hours", 2],
-  ["reject_p50_hours", 2], ["reject_p95_hours", 2],
+  ["reject_p50_hours", 2], ["reject_p95_hours", 2], ["detect_p50_hours", 2],
+  ["detect_p95_hours", 2], ["ended_hours", 1], ["cut_off", 2], ["stalled", 2],
 ];
 
 // Headline deltas against the baseline; lower is better for every one.
@@ -40,7 +36,7 @@ const HEADLINES = [
   ["land_p50_hours", "median time to land", 2, " h"],
   ["land_p95_hours", "95th-percentile time to land", 2, " h"],
   ["ejected_good", "good pull requests ejected", 1, ""],
-  ["blocked", "pull requests blocked by their base leaving", 1, ""],
+  ["detect_p50_hours", "median time from breaking to ejection", 2, " h"],
 ];
 
 const $ = (id) => document.getElementById(id);
@@ -311,13 +307,14 @@ function eventText(e) {
       let s = `arrive ${e.pr}`;
       if (e.base !== null) s += ` on ${e.base}`;
       if (e.atomic) s += " atomic";
-      const truth = [e.truth && e.truth.bad && "bad", e.truth && e.truth.conflicts && "conflicts"].filter(Boolean);
-      if (truth.length) s += ` (${truth.join(", ")})`;
+      if (e.conflicts) s += " (conflicts)";
       return s;
     }
+    case "broken": return `broken ${e.pr} by ${e.by}`;
+    case "fixed": return `fixed ${e.pr}`;
     case "repush": return `repush ${e.pr}`;
     case "withdraw": return `withdraw ${e.pr}`;
-    case "blocked": return `blocked ${e.pr} ${e.final ? "on" : "with"} ${e.on}`;
+    case "blocked": return `blocked ${e.pr} ${e.final ? "on" : "with"} ${e.on}${e.bad ? " bad" : ""}`;
     case "start": return `start ${e.batch} ${list(e.members)} on ${e.base === null ? "trunk" : e.base}`;
     case "run_end":
       return `ci ${e.batch} ${e.passed ? "passed" : "failed"}${e.broken ? " broken" : ""}${e.flake ? " flake" : ""}`;
@@ -327,8 +324,8 @@ function eventText(e) {
       return `eject ${e.pr} ${e.justified ? "justified" : "unjustified"}: ${e.reason}${e.final ? "" : ", rebasing"}`;
     case "retire": return `retire ${e.batch}${e.cancelled ? " cancelled" : ""}`;
     case "pr_ci": return `pr-ci ${e.pr}${e.billed ? " billed" : ""}`;
-    case "pr_ci_end": return `pr-ci ${e.pr} ${e.cancelled ? "cancelled" : "passed"}`;
-    case "rebase": return `rebase ${e.pr} ${e.why === "base_landed" ? "base landed" : "conflict"}`;
+    case "pr_ci_end": return `pr-ci ${e.pr} ${e.cancelled ? "cancelled" : e.failed ? "failed" : "passed"}`;
+    case "rebase": return `rebase ${e.pr} ${e.why === "base_landed" ? "base landed" : e.why}`;
     case "admit": return `admit ${e.pr}${e.base === null ? "" : ` on ${e.base}`}`;
     case "recheck": return `recheck ${e.pr}`;
     case "wait": return `wait ${e.pr} on ${e.on}`;
@@ -349,6 +346,7 @@ function eventText(e) {
 const OUTSIDE = {
   pr_ci: { long: "PR CI", short: "PR CI" },
   rebasing: { long: "rebasing", short: "rebasing" },
+  fixing: { long: "its author is fixing it", short: "fixing" },
   with_base: { long: "out with base", short: "with base" },
   waiting_for_base: { long: "waiting for base", short: "for base" },
 };
@@ -384,15 +382,51 @@ class World {
     this.runs = [];
     this.trunk = [];
     this.departed = [];
+    this.unresolved = [];
     this.count = {
-      landed: 0, ejected_bad: 0, ejected_good: 0, withdrawn: 0, blocked: 0, runs: 0, billed_pr_ci_runs: 0,
+      landed: 0, ejected_bad: 0, ejected_good: 0, withdrawn: 0, left_with_base: 0, runs: 0,
+      billed_pr_ci_runs: 0,
     };
+  }
+
+  // Bad against trunk: broken itself, or, while still here, stacked on a
+  // base that is here and bad. A departed one keeps the truth it left with.
+  bad(pr) {
+    if (pr.bad || pr.left !== null || pr.base === null) return pr.bad;
+    const base = this.prs.get(pr.base);
+    return Boolean(base) && base.left === null && this.bad(base);
+  }
+
+  // The departure a pull request that left with its base counts under: the
+  // first down its chain of bases that is not a block.
+  rootDeparture(on) {
+    let base = this.prs.get(on);
+    while (base && base.state === "blocked") base = this.prs.get(base.on);
+    return base ? base.state : null;
+  }
+
+  // Counts each final block under its root departure, with its own truth,
+  // once that root has departed: a base the same plan ejects after its
+  // child's block departs later in the trace.
+  resolveBlocked() {
+    this.unresolved = this.unresolved.filter(({ on, bad }) => {
+      const root = this.rootDeparture(on);
+      if (root === "ejected") {
+        if (bad) this.count.ejected_bad += 1;
+        else this.count.ejected_good += 1;
+      } else if (root === "withdrawn") {
+        this.count.withdrawn += 1;
+      } else {
+        return true;
+      }
+      return false;
+    });
   }
 
   // A queued pull request whose current head's PR CI has not passed: the
   // forge reports it waiting, and no batch can take it.
   held(pr) {
-    return this.queued.has(pr.pr) && pr.ci !== null;
+    return this.queued.has(pr.pr) && (pr.ci !== null || pr.fixing);
   }
 
   heldCount() {
@@ -472,8 +506,8 @@ class World {
       case "arrive":
         this.prs.set(e.pr, {
           pr: e.pr, base: e.base, atomic: e.atomic, arrived: e.t, state: "queued", left: null,
-          bad: Boolean(e.truth && e.truth.bad), conflicts: Boolean(e.truth && e.truth.conflicts),
-          batches: new Set(), repushed: null, ci: null, place: null, rebases: 0,
+          bad: false, conflicts: Boolean(e.conflicts),
+          batches: new Set(), repushed: null, ci: null, place: null, rebases: 0, fixing: false,
         });
         break;
       case "admit": {
@@ -487,10 +521,23 @@ class World {
       case "recheck":
         this.queued.delete(e.pr);
         break;
+      case "broken": {
+        const pr = this.prs.get(e.pr);
+        if (pr) pr.bad = true;
+        break;
+      }
+      case "fixed": {
+        const pr = this.prs.get(e.pr);
+        if (pr) pr.bad = false;
+        break;
+      }
       case "rebase": {
         const pr = this.prs.get(e.pr);
         if (!pr) break;
-        pr.place = "rebasing";
+        // Its own CI failed: its author fixes it where it is, held in the
+        // queue under `label`, out checking under `github`.
+        pr.fixing = e.why === "broken";
+        pr.place = pr.fixing ? "fixing" : "rebasing";
         pr.rebases += 1;
         break;
       }
@@ -516,17 +563,22 @@ class World {
       }
       case "repush": {
         const pr = this.prs.get(e.pr);
-        if (pr) pr.repushed = e.t;
+        if (!pr) break;
+        pr.repushed = e.t;
+        pr.fixing = false;
         break;
       }
       case "withdraw":
         this.count.withdrawn += 1;
         this.depart(e.pr, "withdrawn", e.t, {});
+        this.resolveBlocked();
         break;
       case "blocked":
         if (e.final) {
-          this.count.blocked += 1;
-          this.depart(e.pr, "blocked", e.t, { on: e.on });
+          this.count.left_with_base += 1;
+          this.depart(e.pr, "blocked", e.t, { on: e.on, bad: e.bad });
+          this.unresolved.push({ on: e.on, bad: e.bad });
+          this.resolveBlocked();
         } else {
           const pr = this.prs.get(e.pr);
           if (!pr) break;
@@ -584,6 +636,7 @@ class World {
         if (e.justified) this.count.ejected_bad += 1;
         else this.count.ejected_good += 1;
         this.depart(e.pr, "ejected", e.t, { reason: e.reason, justified: e.justified });
+        this.resolveBlocked();
         break;
       }
       case "retire": {
@@ -831,7 +884,7 @@ function drawChip(ctx, world, pr, x, y, now, faded, look) {
   ctx.fillText(String(pr.pr), cx + w / 2, cy + h / 2);
   ctx.textAlign = "left";
   let dx = cx + w - 5;
-  for (const [on, colour] of [[pr.bad, COLOURS.bad], [pr.conflicts, COLOURS.warn]]) {
+  for (const [on, colour] of [[world.bad(pr), COLOURS.bad], [pr.conflicts, COLOURS.warn]]) {
     if (!on) continue;
     ctx.fillStyle = colour;
     ctx.beginPath();
@@ -937,7 +990,7 @@ function drawOutside(ctx, world, hits, now, width, top) {
 }
 
 function drawDeparted(ctx, world, hits, now, width, top) {
-  sectionLabel(ctx, "left the queue — landed, ejected (white ring: an innocent), withdrawn, blocked", 12, top);
+  sectionLabel(ctx, "left the queue — landed, ejected (white ring: an innocent), withdrawn, left with its base", 12, top);
   let x = 12;
   const y = top + 14;
   for (let i = world.departed.length - 1; i >= 0; i -= 1) {
@@ -1008,7 +1061,8 @@ function prText(world, pr) {
   if (pr.state === "queued") {
     if (world.queued.has(pr.pr)) {
       if (world.held(pr)) {
-        lines.push(`held: its own CI has not passed on this head${pr.ci.billed ? " (a re-run billed to the queue)" : ""}`);
+        if (pr.fixing) lines.push("held: its own CI failed; its author is fixing it");
+        else lines.push(`held: its own CI has not passed on this head${pr.ci.billed ? " (a re-run billed to the queue)" : ""}`);
       }
     } else {
       let where = `outside the queue: ${OUTSIDE[pr.place]?.long || "-"}`;
@@ -1017,7 +1071,7 @@ function prText(world, pr) {
     }
   }
   if (pr.rebases) lines.push(`rebased ${pr.rebases} time${pr.rebases === 1 ? "" : "s"}`);
-  const truth = [pr.bad && "bad", pr.conflicts && "conflicts with trunk"].filter(Boolean);
+  const truth = [world.bad(pr) && "broken against trunk", pr.conflicts && "conflicts with trunk"].filter(Boolean);
   lines.push(`truth: ${truth.length ? truth.join(", ") : "good"}`);
   if (pr.state !== "queued") {
     let how = `${pr.state} at ${clockText(pr.left)}`;
@@ -1133,7 +1187,7 @@ const replay = {
       ["outside", world.outside().length], ["running", `${running}/${world.slots.length}`],
       ["runs", c.runs], ["PR CI billed", c.billed_pr_ci_runs], ["landed", c.landed],
       ["ejected bad", c.ejected_bad], ["ejected good", c.ejected_good],
-      ["blocked", c.blocked], ["withdrawn", c.withdrawn],
+      ["withdrawn", c.withdrawn], ["left with base", c.left_with_base],
     ];
     $("counters").replaceChildren(...items.map(([k, v]) => {
       const span = document.createElement("span");

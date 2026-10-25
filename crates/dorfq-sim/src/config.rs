@@ -24,8 +24,13 @@ pub struct SimConfig {
 pub struct WorldConfig {
     /// Arrivals stop after this many hours.
     pub hours: u64,
-    /// The run then drains, and stops at `hours + drain_hours` at the latest.
+    /// The backstop: a replication runs until its world empties, and is cut
+    /// off at `hours + drain_hours` at the latest. Set long; reaching it
+    /// leaves the work still present counted as unfinished.
     pub drain_hours: u64,
+    /// A replication is cut off as stalled `stall_hours` after its last
+    /// landing or ejection while a pull request is present. At least 1.
+    pub stall_hours: u64,
     /// Mean rate of new pull requests. Stacks arrive as a Poisson process
     /// at this rate divided by the mean number of pull requests a stack
     /// brings, growth included.
@@ -45,9 +50,8 @@ pub struct WorldConfig {
     /// children's current heads. The direct children's runs are billed to
     /// the queue. Off, a landed base changes nothing for its stack.
     pub pr_ci_on_base_landed: bool,
-    /// A pull request breaks on its own against trunk.
-    pub p_bad: f64,
-    /// A pair of pull requests whose queue time overlapped break only together.
+    /// A pair of pull requests conflicts: a run holding both unlanded
+    /// fails, and whichever lands first breaks the other against trunk.
     pub p_interact: f64,
     /// A run fails for no reason in the tree.
     pub p_flake: f64,
@@ -262,6 +266,9 @@ impl WorldConfig {
 
     /// Checks every range.
     pub fn validate(&self) -> Result<(), SimConfigError> {
+        if self.stall_hours == 0 {
+            return Err(invalid("world.stall_hours", "must be at least 1"));
+        }
         let longest_run = minutes("ci_minutes", self.ci_minutes)?;
         let longest_pr_ci = minutes("pr_ci_minutes", self.pr_ci_minutes)?;
         let longest_rebase = minutes("rebase_minutes", self.rebase_minutes)?;
@@ -280,7 +287,6 @@ impl WorldConfig {
                 "plus drain_hours and the longest delay must fit the simulator's clock",
             ));
         }
-        probability("p_bad", self.p_bad)?;
         probability("p_interact", self.p_interact)?;
         probability("p_flake", self.p_flake)?;
         probability("p_conflict", self.p_conflict)?;
@@ -302,12 +308,12 @@ pub(crate) mod tests {
     pub(crate) const WORLD: &str = "\
 hours = 48
 drain_hours = 24
+stall_hours = 24
 arrivals_per_hour = 4.0
 ci_minutes = { min = 150, max = 210 }
 pr_ci_minutes = { min = 40, max = 60 }
 rebase_minutes = { min = 15, max = 120 }
 pr_ci_on_base_landed = true
-p_bad = 0.05
 p_interact = 0.002
 p_flake = 0.02
 p_conflict = 0.02
@@ -362,7 +368,8 @@ max_batch = 16
         assert_eq!(config.seed, 1);
         assert_eq!(config.replications, 4);
         assert_eq!(config.world.hours, 168);
-        assert_eq!(config.world.drain_hours, 24);
+        assert_eq!(config.world.drain_hours, 1000);
+        assert_eq!(config.world.stall_hours, 168);
         assert_eq!(config.world.arrivals_per_hour, 0.75);
         assert!(config.world.pr_ci_on_base_landed);
         assert_eq!(config.world.ci_minutes, Minutes { min: 45, max: 120 });
@@ -446,6 +453,10 @@ max_batch = 16
     fn the_busy_world_parses_with_its_five_policies() {
         let config = SimConfig::parse(include_str!("../examples/busy.toml")).unwrap();
         assert_eq!(config.world.arrivals_per_hour, 5.0);
+        assert_eq!(
+            (config.world.drain_hours, config.world.stall_hours),
+            (1000, 168)
+        );
         assert_eq!(config.world.ci_minutes, Minutes { min: 45, max: 120 });
         assert_eq!(
             (config.world.p_flake, config.world.p_interact),
@@ -500,12 +511,8 @@ max_batch = 16
                 };
                 assert_eq!((bayes.lanes, bayes.max_batch), (8, 8));
                 assert_eq!(
-                    (bayes.p_bad, bayes.p_interact, bayes.p_flake),
-                    (
-                        config.world.p_bad,
-                        config.world.p_interact,
-                        config.world.p_flake
-                    )
+                    (bayes.p_interact, bayes.p_flake),
+                    (config.world.p_interact, config.world.p_flake)
                 );
                 (bayes.speculation, bayes.charge, bayes.landing)
             })
@@ -603,9 +610,8 @@ max_batch = 16
     }
 
     #[test]
-    fn a_world_without_flakes_bad_pull_requests_or_interactions_is_legal() {
+    fn a_world_without_flakes_conflicts_or_interactions_is_legal() {
         let world = WORLD
-            .replace("p_bad = 0.05", "p_bad = 0.0")
             .replace("p_interact = 0.002", "p_interact = 0.0")
             .replace("p_flake = 0.02", "p_flake = 0.0")
             .replace("p_conflict = 0.02", "p_conflict = 0.0");
@@ -615,7 +621,6 @@ max_batch = 16
     #[test]
     fn every_validation_error_names_its_field() {
         for (field, value) in [
-            ("p_bad", "1.5"),
             ("p_interact", "-0.1"),
             ("p_flake", "2.0"),
             ("p_conflict", "-1.0"),
@@ -655,6 +660,14 @@ max_batch = 16
     }
 
     #[test]
+    fn a_stall_window_of_zero_is_rejected_naming_it() {
+        let message = rejected(&with("stall_hours", "0"));
+        assert!(message.contains("world.stall_hours"), "{message}");
+        let world = SimConfig::parse(&with("stall_hours", "1")).unwrap().world;
+        assert_eq!(world.stall_hours, 1);
+    }
+
+    #[test]
     fn a_horizon_or_run_beyond_the_clock_is_rejected_by_name() {
         let hours = rejected(&with("hours", "6000000000000000"));
         assert!(hours.contains("world.hours"), "{hours}");
@@ -691,12 +704,18 @@ max_batch = 16
 
     #[test]
     fn unknown_and_missing_fields_are_named() {
-        for unknown in ["speed = 3", "runners = 2", "p_stacked = 0.25"] {
+        for unknown in [
+            "speed = 3",
+            "runners = 2",
+            "p_stacked = 0.25",
+            "p_bad = 0.05",
+        ] {
             let name = unknown.split(' ').next().unwrap();
             let text = file(&format!("{WORLD}{unknown}\n"), POLICIES);
             assert!(rejected(&text).contains(name), "{name}");
         }
         for field in [
+            "stall_hours",
             "pr_ci_minutes",
             "rebase_minutes",
             "pr_ci_on_base_landed",
