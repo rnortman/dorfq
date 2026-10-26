@@ -14,9 +14,9 @@ const REPORT_NOTES = {
     "concurrency GitHub's queue is given in practice. bayes is the status " +
     "quo (eight lanes, max_batch 8); bayes-tree is the tree of futures at " +
     "the same settings. bisect runs at cap 1, the naive queue under dorfq's " +
-    "admission. Every replication drains. Here bayes lands 264 (47 bad and " +
-    "1.5 good ejected, 1.7 runner-hours per landed), bayes-tree 278 (28, " +
-    "0.8, 1.3), bisect 238 (70, 17, 3.1) and github-like 239 (39, 26, 3.2).",
+    "admission. Every replication drains. Here bayes lands 322 (10 bad and " +
+    "0.0 good ejected, 1.0 runner-hours per landed), bayes-tree 325 (9, " +
+    "0.0, 1.0), bisect 270 (24, 22, 2.6) and github-like 277 (6, 23, 2.8).",
 };
 
 // Metric rows, as the command line's table prints them: key and decimals.

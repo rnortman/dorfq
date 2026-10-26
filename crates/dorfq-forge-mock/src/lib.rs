@@ -98,6 +98,9 @@ struct MockPr {
     lifecycle: Lifecycle,
     /// Set when the pull request arrives.
     head: Option<Sha>,
+    /// Trunk changes its head's own CI did not cover: the scenario's at
+    /// arrival, 0 at a re-push, raised by every landing while enqueued.
+    behind: u32,
 }
 
 struct MockBatch {
@@ -130,6 +133,7 @@ impl MockForge {
             .into_iter()
             .map(|(number, spec)| {
                 let pr = MockPr {
+                    behind: spec.behind,
                     spec,
                     lifecycle: Lifecycle::NotArrived,
                     head: None,
@@ -206,6 +210,10 @@ impl MockForge {
             if repushes && lifecycle == Lifecycle::Enqueued {
                 let head = self.mint();
                 self.set_pr(number, Lifecycle::Enqueued, Some(head));
+                self.prs
+                    .get_mut(&number)
+                    .expect("scenario pull request")
+                    .behind = 0;
             }
             if dequeues && lifecycle == Lifecycle::Enqueued {
                 self.set_pr(number, Lifecycle::Withdrawn, None);
@@ -266,6 +274,7 @@ impl MockForge {
                         .expect("an enqueued pull request has a head"),
                     base,
                     status(&pr.spec, base),
+                    pr.behind,
                 );
                 Some(if pr.spec.atomic {
                     snapshot.with_stack(StackPolicy::Atomic)
@@ -453,6 +462,12 @@ impl Forge for MockForge {
             .state = BatchState::Landed { tip: tip.clone() };
         for member in &status.members {
             self.set_pr(member.pr, Lifecycle::Merged, None);
+        }
+        let landed = u32::try_from(status.members.len()).expect("a batch's members fit u32");
+        for pr in self.prs.values_mut() {
+            if pr.lifecycle == Lifecycle::Enqueued {
+                pr.behind += landed;
+            }
         }
         self.ledger.landed(batch);
         for member in &status.members {

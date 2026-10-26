@@ -1,8 +1,10 @@
 The Bayesian scheduler grows a batch from whole units, lowest combined
-chance of failing first; a unit is every pull request that must land
-together, so a large `Atomic` stack at the prior is among the riskiest units
-and is reached late. `grow` in `crates/dorfq-scheduler/src/bayes/policy.rs`
-skips any unit that no longer fits beside the units added ahead of it: one
+chance of failing over its members' mean value first; a unit is every pull
+request that must land together, so a large `Atomic` stack is among the
+riskiest units and is reached late. `w_age` raises a unit's value with the
+hours its members have waited, which moves a waiting unit up the order; it
+does not make the wait measured, and the criterion below stands. `grow` in
+`crates/dorfq-scheduler/src/bayes/policy.rs` skips any unit that no longer fits beside the units added ahead of it: one
 of `max_batch` members or more starts only on an empty batch, and a smaller
 one only while room is left, and only then has to raise the batch's score.
 Under a standing backlog of lower-risk work, not inflow alone, a

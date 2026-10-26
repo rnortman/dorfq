@@ -33,8 +33,11 @@ On the scheduler side there are two real policies beside the stub: `bisect`,
 the conventional pipelined bisect with memory that every number is compared
 to, and `bayes`, which keeps a belief about every queued pull request,
 infers culprits exactly from the runs that failed and passed, and chooses
-batches by expected value. Changes to `bayes`'s algorithm are flags in its
-configuration, each naming the status quo and the alternative:
+batches by expected value; its belief about a pull request starts from how
+far trunk had moved since the pull request's own CI ran, and a pull
+request's value grows with the hours it has waited (`w_age`). Alternatives within
+`bayes`'s algorithm are flags in its configuration, each naming the status
+quo and the alternative so the sweep can carry both:
 `speculation = "chain"` builds one chain of batches to land with culprit
 finders on trunk beside it, and `"tree"` scores, for every batch in flight,
 what to run if it passes and what if it fails, each weighted by that
@@ -59,14 +62,14 @@ current head has passed, so time to land includes it. The queue is billed only f
 it causes by landing part of a stack — the run of each direct child of what
 landed, which under GitHub's admission is every pull request of a stack in
 turn. In the busy example world, a high-velocity team's with batch and PR
-CI of 45 to 120 minutes, `bayes`, the status quo, lands 264 at 1.7
-runner-hours per landed pull request, ejecting 47 bad pull requests and
-1.5 good ones, against 238 for `bisect` at cap 1 (no pooling at all; 70
-bad and 17 good ejected, 3.1 runner-hours per landed) and 239 for
-`github-like` (39 and 26, 3.2). `bayes-tree`, the tree of futures at the
-same settings, lands 278 at 1.3 runner-hours per landed and ejects 28 bad
-pull requests and 0.8 good ones, at a median of 12 hours from a pull
-request breaking to its ejection against `bayes`'s 5.5; see **Simulator
+CI of 45 to 120 minutes, `bayes`, the status quo, lands 322 at 1.0
+runner-hours per landed pull request, ejecting 10 bad pull requests and
+0.0 good ones, against 270 for `bisect` at cap 1 (no pooling at all; 24
+bad and 22 good ejected, 2.6 runner-hours per landed) and 277 for
+`github-like` (6 and 23, 2.8). `bayes-tree`, the tree of futures at the
+same settings, lands 325 at 1.0 runner-hours per landed and ejects 9 bad
+pull requests and 0.0 good ones, at a median of 5.1 hours from a pull
+request breaking to its ejection against `bayes`'s 4.3; see **Simulator
 reports**.
 
 ```sh
@@ -118,8 +121,8 @@ over every point where both have the metric. `--json PATH` writes every replicat
 `--jobs N` caps the threads. Two sweep files ship in
 `crates/dorfq-sim/sweeps/`: `speculation.toml` compares the `bayes` flag
 combinations with each other and with `github-like` over arrival rate, CI
-length, flake and interaction rates, `max_batch`, `lanes` and `run_cost`,
-and `bisect-cap.toml` measures `bisect`'s batch cap in the busy world.
+length, flake rate, `max_batch`, `lanes`, `run_cost`, `w_reject` and
+`w_age`, at an interaction rate of 0.001, and `bisect-cap.toml` measures `bisect`'s batch cap in the busy world.
 
 ## Running against GitHub
 

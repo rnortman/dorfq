@@ -46,16 +46,20 @@ pub struct BayesConfig {
     pub lanes: usize,
     /// Own members of a fresh batch.
     pub max_batch: usize,
-    /// Prior: a pull request fails on its own against trunk.
-    pub p_bad: f64,
-    /// Prior: a pair fails only together; also the per-landing regrowth.
+    /// Prior: a pair fails only together; also the regrowth per pull
+    /// request landed, from which every `Bad` starts and to which every
+    /// alibi returns.
     pub p_interact: f64,
     /// A run fails for no reason.
     pub p_flake: f64,
-    /// One run, in landed-pull-request units.
+    /// One run, in value units, where a fresh pull request is worth 1.
     pub run_cost: f64,
-    /// Resolving a bad pull request, in the same units.
+    /// Resolving a bad pull request, as a multiple of its value.
     pub w_reject: f64,
+    /// What each hour a pull request has waited in the queue adds to its
+    /// value: a pull request queued `h` hours is worth `1 + w_age·h` to
+    /// land, and `w_reject` times that to resolve.
+    pub w_age: f64,
     /// The posterior at which a singled-out cause is ejected.
     // TODO(soft-eject): a second, lower threshold at which the author is told
     // the pull request is probably broken, without an ejection.
@@ -106,21 +110,24 @@ pub enum Charge {
 }
 
 /// What a landing does to the `Bad` belief of every pull request that stays
-/// queued.
+/// queued: the chance it survives the landing unbroken.
 ///
-/// Under `decay`, `p_interact` is the regrowth per landed pull request of
-/// every other belief; under `transfer`, only of those whose pair with the
-/// landed pull request no run has touched.
+/// Under `decay`, `1 − p_interact` per pull request that reached trunk;
+/// under `transfer`, the complement of its pair belief with each one, which
+/// is `1 − p_interact` only for a pair no run has touched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Landing {
-    /// Each queued pull request's `Bad` regrows by one `p_interact` per
-    /// pull request the queue landed.
+    /// Each queued pull request survives each pull request that reached
+    /// trunk, landed by the queue or merged by another hand, with
+    /// probability `1 − p_interact`.
     Decay,
-    /// Each queued pull request's `Bad` absorbs its pair belief with each
-    /// pull request that reached trunk, by the queue or by another hand: the
-    /// prior for an untouched pair, the floor for an alibied one, nothing
-    /// for a stack relative.
+    /// Each queued pull request survives each pull request that reached
+    /// trunk, by the queue or by another hand, with the complement of their
+    /// pair belief: `1 − p_interact` for an untouched pair, all but certain
+    /// for an alibied one, 1 for a stack relative. Landings before the
+    /// scheduler first saw the pull request's head count `1 − p_interact`
+    /// each.
     Transfer,
 }
 
@@ -176,6 +183,17 @@ fn belief(field: &'static str, value: f64) -> Result<(), ConfigError> {
     }
 }
 
+fn non_negative(field: &'static str, value: f64) -> Result<(), ConfigError> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(ConfigError {
+            field,
+            requirement: "must be a finite number, zero or more",
+        })
+    }
+}
+
 fn finite(field: &'static str, value: f64) -> Result<(), ConfigError> {
     if value.is_finite() {
         Ok(())
@@ -216,11 +234,11 @@ impl BayesConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         at_least_one("lanes", self.lanes)?;
         at_least_one("max_batch", self.max_batch)?;
-        belief("p_bad", self.p_bad)?;
         belief("p_interact", self.p_interact)?;
         probability("p_flake", self.p_flake)?;
         finite("run_cost", self.run_cost)?;
         finite("w_reject", self.w_reject)?;
+        non_negative("w_age", self.w_age)?;
         finite("eject_above", self.eject_above)?;
         finite("others_below", self.others_below)?;
         finite("speculate_above", self.speculate_above)?;
@@ -237,7 +255,6 @@ impl BayesConfig {
     /// The model's priors.
     pub(crate) fn priors(&self) -> Priors {
         Priors {
-            p_bad: self.p_bad,
             p_interact: self.p_interact,
             p_flake: self.p_flake,
         }
@@ -260,11 +277,11 @@ mod tests {
 kind = \"bayes\"
 lanes = 2
 max_batch = 24
-p_bad = 0.05
 p_interact = 0.002
 p_flake = 0.02
 run_cost = 0.5
 w_reject = 1.0
+w_age = 0.02
 eject_above = 0.9
 others_below = 0.1
 speculate_above = 0.0
@@ -305,11 +322,11 @@ landing = \"decay\"
             BayesConfig {
                 lanes: 2,
                 max_batch: 24,
-                p_bad: 0.05,
                 p_interact: 0.002,
                 p_flake: 0.02,
                 run_cost: 0.5,
                 w_reject: 1.0,
+                w_age: 0.02,
                 eject_above: 0.9,
                 others_below: 0.1,
                 speculate_above: 0.0,
@@ -397,6 +414,9 @@ landing = \"decay\"
         assert!(message.contains("depth"), "{message}");
         let message = parse(&format!("{BAYES}depth = 3\n")).unwrap_err();
         assert!(message.contains("depth"), "{message}");
+        // `p_bad` is not a key; a configuration that sets it fails.
+        let message = parse(&format!("{BAYES}p_bad = 0.05\n")).unwrap_err();
+        assert!(message.contains("p_bad"), "{message}");
     }
 
     #[test]
@@ -406,6 +426,9 @@ landing = \"decay\"
         let without = BAYES.replace("w_reject = 1.0\n", "");
         let message = parse(&without).unwrap_err();
         assert!(message.contains("w_reject"), "{message}");
+        let without = BAYES.replace("w_age = 0.02\n", "");
+        let message = parse(&without).unwrap_err();
+        assert!(message.contains("w_age"), "{message}");
         let message = parse("lanes = 2\n").unwrap_err();
         assert!(message.contains("kind"), "{message}");
     }
@@ -452,20 +475,18 @@ landing = \"decay\"
                 "p_flake must be strictly between 0 and 1"
             );
         }
-        // A prior at the floor would be read as false from the start.
+        // `p_interact` at the floor would start every belief at what
+        // inference reads as false, and at 1 would make every landing
+        // certain breakage.
         for p in [FLOOR, 1.0] {
-            let error = bayes_with(|c| set!(p_bad = p)(c)).unwrap_err();
+            let error = bayes_with(|c| set!(p_interact = p)(c)).unwrap_err();
             assert_eq!(
                 error.to_string(),
-                format!("p_bad must be above the belief floor {FLOOR:e} and below 1")
-            );
-            assert_eq!(
-                bayes_with(|c| set!(p_interact = p)(c)).unwrap_err().field,
-                "p_interact"
+                format!("p_interact must be above the belief floor {FLOOR:e} and below 1")
             );
         }
         // Just inside each open interval is accepted.
-        assert_eq!(bayes_with(|c| set!(p_bad = FLOOR * 1.01)(c)), Ok(()));
+        assert_eq!(bayes_with(|c| set!(p_interact = FLOOR * 1.01)(c)), Ok(()));
         assert_eq!(bayes_with(|c| set!(p_interact = 1.0 - 1e-9)(c)), Ok(()));
         assert_eq!(bayes_with(|c| set!(p_flake = 1e-9)(c)), Ok(()));
         assert_eq!(bayes_with(|c| set!(p_flake = 1.0 - 1e-9)(c)), Ok(()));
@@ -486,6 +507,15 @@ landing = \"decay\"
         );
         assert_eq!(field(set!(speculate_above = f64::NAN)), "speculate_above");
         assert_eq!(field(set!(eject_above = f64::INFINITY)), "eject_above");
+        // A pull request's value never falls with age; zero is no age term.
+        for w in [-1e-9, f64::NAN, f64::INFINITY] {
+            let error = bayes_with(|c| set!(w_age = w)(c)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "w_age must be a finite number, zero or more"
+            );
+        }
+        assert_eq!(bayes_with(set!(w_age = 0.0)), Ok(()));
     }
 
     #[test]

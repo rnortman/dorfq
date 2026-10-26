@@ -44,6 +44,9 @@ impl Node {
 
     /// The chance a batch started on the node now lands: the node becomes
     /// trunk and every batch already on it fails.
+    // TODO(bayes-joint-path-pass): the node's `p` and its siblings' chances
+    // multiply per-batch pass chances as if independent; batches whose trees
+    // share a failed run are not.
     fn weight(&self) -> f64 {
         self.p * self.siblings.iter().map(|q| 1.0 - q).product::<f64>()
     }
@@ -351,7 +354,7 @@ impl Bayes {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{members, params};
+    use super::super::test_support::{informative, members, params};
     use super::*;
     use crate::test_support::*;
     use crate::{BayesConfig, Charge, Speculation};
@@ -604,15 +607,16 @@ mod tests {
         step(&mut bayes, &observation(prs.clone(), vec![failed]));
         let inference = Inference::of(&bayes.model).unwrap();
         let stacks = Stacks::new(&observation(prs, vec![]));
-        assert_eq!(
-            bayes.suspects(
-                &inference,
-                &stacks,
-                &members(&[2, 3]),
-                &BTreeSet::from([PrNumber(1)])
-            ),
-            vec![members(&[2]), members(&[3])]
+        // 1's closure cannot run here, so it is passed over and 2 and 3 are
+        // the two most probable `Bad` suspects whose closures can.
+        let sets = bayes.suspects(
+            &inference,
+            &stacks,
+            &members(&[2, 3]),
+            &BTreeSet::from([PrNumber(1)]),
         );
+        assert_eq!(sets, vec![members(&[2]), members(&[3]), members(&[2, 3])]);
+        informative(&bayes.model, &inference, &sets);
     }
 
     #[test]
@@ -627,28 +631,29 @@ mod tests {
         assert_eq!(plan.start, vec![start(1, trunk(), &[1, 2, 3])]);
     }
 
-    /// A scheduler of `speculation` at belief 0.002 whose evidence is two
+    /// A scheduler of `speculation` at beliefs one landing above the floor,
+    /// whose evidence is two
     /// chains of `n` failed pairs, over 1..=n+1 and 101..=n+101, each held
     /// for review, with `n + 1` and 101 ready: each chain resolves alone,
     /// and a failure of {n + 1, 101} would join them into one that does not.
     fn two_clusters(speculation: Speculation, n: u64) -> (Bayes, Observation) {
         let mut bayes = Bayes::new(BayesConfig {
             speculation,
-            p_bad: 0.002,
             ..params()
         });
         let mut prs: Vec<_> = (1..=n)
             .chain(102..=n + 101)
-            .map(|k| held(k, Hold::Review))
+            .map(|k| stale(held(k, Hold::Review), 1))
             .collect();
-        prs.extend([ready(n + 1), ready(101)]);
+        prs.extend([stale(ready(n + 1), 1), stale(ready(101), 1)]);
         let input = observation(prs, vec![]);
-        bayes.model.sync(&input.prs, &BTreeSet::new());
+        bayes.model.sync(&input.prs, &BTreeSet::new(), 0);
+        bayes.age(&input);
         for r in 1..=n {
-            bayes.model.failed(BatchId(r), &members(&[r, r + 1]));
+            bayes.model.failed(BatchId(r), &members(&[r, r + 1]), 0);
             bayes
                 .model
-                .failed(BatchId(100 + r), &members(&[100 + r, 101 + r]));
+                .failed(BatchId(100 + r), &members(&[100 + r, 101 + r]), 0);
         }
         (bayes, input)
     }
@@ -691,12 +696,14 @@ mod tests {
 
     #[test]
     fn evidence_too_improbable_to_resolve_is_a_scheduler_error_under_the_tree_too() {
-        let mut bayes = tree(|p| p.p_bad = 0.002);
-        let prs: Vec<u64> = (1..=12).collect();
-        let input = observation(ready_all(&prs), vec![]);
-        bayes.model.sync(&input.prs, &BTreeSet::new());
+        let mut bayes = tree(|_| {});
+        let prs = (1..=12).map(|n| stale(ready(n), 1)).collect();
+        let input = observation(prs, vec![]);
+        bayes.model.sync(&input.prs, &BTreeSet::new(), 0);
         for r in 1..=11 {
-            bayes.model.failed(BatchId(100 + r), &members(&[r, r + 1]));
+            bayes
+                .model
+                .failed(BatchId(100 + r), &members(&[r, r + 1]), 0);
         }
         let error = bayes.step(&input).unwrap_err();
         assert!(error.to_string().contains("cannot be resolved"), "{error}");

@@ -407,11 +407,11 @@ max_batch = 16
         let bayes = |speculation, charge| BayesConfig {
             lanes: 2,
             max_batch: 16,
-            p_bad: 0.05,
-            p_interact: 0.002,
+            p_interact: 0.001,
             p_flake: 0.02,
             run_cost: 0.5,
             w_reject: 1.0,
+            w_age: 0.02,
             eject_above: 0.9,
             others_below: 0.1,
             speculate_above: 0.0,
@@ -460,7 +460,7 @@ max_batch = 16
         assert_eq!(config.world.ci_minutes, Minutes { min: 45, max: 120 });
         assert_eq!(
             (config.world.p_flake, config.world.p_interact),
-            (0.03, 0.005)
+            (0.03, 0.001)
         );
         assert!(config.world.pr_ci_on_base_landed);
         assert_eq!(config.world.stack_sizes.len(), 12);
@@ -510,6 +510,7 @@ max_batch = 16
                     panic!("{p:?}");
                 };
                 assert_eq!((bayes.lanes, bayes.max_batch), (8, 8));
+                assert_eq!(bayes.w_age, 0.02);
                 assert_eq!(
                     (bayes.p_interact, bayes.p_flake),
                     (config.world.p_interact, config.world.p_flake)

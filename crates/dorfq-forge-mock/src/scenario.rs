@@ -30,6 +30,8 @@ pub(crate) struct PrSpec {
     pub(crate) atomic: bool,
     pub(crate) mergeable: bool,
     pub(crate) own_ci: OwnCi,
+    /// Trunk changes its first head's own CI did not cover when it arrives.
+    pub(crate) behind: u32,
     pub(crate) bad: bool,
     pub(crate) breaks_with: BTreeSet<PrNumber>,
     pub(crate) conflicts_with: BTreeSet<PrNumber>,
@@ -60,6 +62,8 @@ struct RawPr {
     mergeable: bool,
     #[serde(default)]
     own_ci: OwnCi,
+    #[serde(default)]
+    behind: u32,
     #[serde(default)]
     bad: bool,
     #[serde(default)]
@@ -189,6 +193,7 @@ impl Scenario {
                     atomic: pr.atomic,
                     mergeable: pr.mergeable,
                     own_ci: pr.own_ci,
+                    behind: pr.behind,
                     bad: pr.bad,
                     breaks_with: BTreeSet::new(),
                     conflicts_with: BTreeSet::new(),
@@ -270,6 +275,7 @@ mod tests {
                 atomic: false,
                 mergeable: true,
                 own_ci: OwnCi::Passed,
+                behind: 0,
                 bad: false,
                 breaks_with: BTreeSet::new(),
                 conflicts_with: BTreeSet::new(),
@@ -292,6 +298,7 @@ mod tests {
             atomic = true
             mergeable = false
             own_ci = "failed"
+            behind = 3
             bad = true
             breaks_with = [2]
             conflicts_with = [3]
@@ -312,6 +319,7 @@ mod tests {
         assert!(one.atomic);
         assert!(!one.mergeable);
         assert_eq!(one.own_ci, OwnCi::Failed);
+        assert_eq!(one.behind, 3);
         assert!(one.bad);
         assert_eq!(one.repush_at, Some(4));
         assert_eq!(one.dequeue_at, Some(5));

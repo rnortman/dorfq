@@ -13,7 +13,8 @@ use std::rc::Rc;
 use dorfq_core::{PrNumber, Sha};
 
 use crate::api::{
-    ApiError, CheckResult, Commit, GitHubApi, Merge, PrDetail, PrSummary, RefEntry, RefUpdate,
+    ApiError, CheckResult, Commit, Compare, CompareStatus, GitHubApi, Merge, PrDetail, PrSummary,
+    RefEntry, RefUpdate,
 };
 use crate::branch;
 
@@ -419,6 +420,23 @@ impl GitHubApi for FakeGitHub {
     fn is_ancestor(&mut self, ancestor: &Sha, descendant: &Sha) -> Result<bool, ApiError> {
         self.enter("is_ancestor", format!("{ancestor} {descendant}"))?;
         Ok(self.state().history(descendant).contains(ancestor))
+    }
+
+    fn compare(&mut self, base: &Sha, head: &Sha) -> Result<Compare, ApiError> {
+        self.enter("compare", format!("{base} {head}"))?;
+        let state = self.state();
+        let (of_base, of_head) = (state.history(base), state.history(head));
+        let status = match (of_head.contains(base), of_base.contains(head)) {
+            (true, true) => CompareStatus::Identical,
+            (true, false) => CompareStatus::Ahead,
+            (false, true) => CompareStatus::Behind,
+            (false, false) => CompareStatus::Diverged,
+        };
+        let ahead_by = of_head.difference(&of_base).count();
+        Ok(Compare {
+            status,
+            ahead_by: u32::try_from(ahead_by).expect("a fake history fits u32"),
+        })
     }
 
     fn list_open_prs(&mut self) -> Result<Vec<PrSummary>, ApiError> {

@@ -377,7 +377,7 @@ fn the_document_carries_schema_axes_points_and_cells() {
 }
 
 /// Each bayes column's settings at a point, flags aside.
-fn bayes_settings(config: &SimConfig) -> Vec<(usize, usize, f64, f64, f64, f64)> {
+fn bayes_settings(config: &SimConfig) -> Vec<(usize, usize, f64, f64, f64, f64, f64)> {
     config
         .policy
         .iter()
@@ -389,6 +389,7 @@ fn bayes_settings(config: &SimConfig) -> Vec<(usize, usize, f64, f64, f64, f64)>
                 b.p_interact,
                 b.run_cost,
                 b.w_reject,
+                b.w_age,
             )),
             SchedulerConfig::Bisect { .. } | SchedulerConfig::AllAtOnce {} => None,
         })
@@ -410,7 +411,7 @@ fn the_shipped_speculation_sweep_runs_four_bayes_variants_at_like_settings() {
         ]
     );
     assert_eq!(sweep.baseline, "bayes-chain");
-    assert_eq!(sweep.points.len(), 384);
+    assert_eq!(sweep.points.len(), 576);
     let busy = SimConfig::parse(include_str!("../../examples/busy.toml")).unwrap();
     assert_eq!(sweep.base.world, busy.world);
     let flags: Vec<_> = sweep
@@ -433,6 +434,7 @@ fn the_shipped_speculation_sweep_runs_four_bayes_variants_at_like_settings() {
     );
     let mut max_batches = Vec::new();
     let mut w_rejects = Vec::new();
+    let mut w_ages = Vec::new();
     let mut ci = Vec::new();
     for point in &sweep.points {
         let world = &point.config.world;
@@ -442,6 +444,9 @@ fn the_shipped_speculation_sweep_runs_four_bayes_variants_at_like_settings() {
         }
         if !w_rejects.contains(&settings[0].5) {
             w_rejects.push(settings[0].5);
+        }
+        if !w_ages.contains(&settings[0].6) {
+            w_ages.push(settings[0].6);
         }
         if !ci.contains(&world.ci_minutes) {
             ci.push(world.ci_minutes);
@@ -463,6 +468,7 @@ fn the_shipped_speculation_sweep_runs_four_bayes_variants_at_like_settings() {
     }
     assert_eq!(max_batches, [16, 30]);
     assert_eq!(w_rejects, [1.0, 10.0]);
+    assert_eq!(w_ages, [0.0, 0.02, 0.1]);
     assert_eq!(
         ci,
         [Minutes { min: 45, max: 120 }, Minutes { min: 90, max: 120 }]

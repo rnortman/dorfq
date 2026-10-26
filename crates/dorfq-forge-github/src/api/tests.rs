@@ -405,6 +405,30 @@ fn compare_status_maps_to_ancestry() {
 }
 
 #[test]
+fn compare_decodes_status_and_ahead_by() {
+    let (mut api, _) = client(vec![route(
+        "GET",
+        &format!("/compare/{A}...{B}"),
+        ok(json!({ "status": "diverged", "ahead_by": 7, "behind_by": 2 })),
+    )]);
+    assert_eq!(
+        api.compare(&sha(A), &sha(B)).unwrap(),
+        Compare {
+            status: CompareStatus::Diverged,
+            ahead_by: 7
+        }
+    );
+    let (mut api, _) = client(vec![route(
+        "GET",
+        &format!("/compare/{A}...{B}"),
+        ok(json!({ "status": "ahead" })),
+    )]);
+    let error = api.compare(&sha(A), &sha(B)).unwrap_err();
+    assert!(!is_transient(&error));
+    assert!(error.to_string().contains("ahead_by"), "{error}");
+}
+
+#[test]
 fn compare_not_found_is_permanent() {
     let (mut api, _) = client(vec![route(
         "GET",

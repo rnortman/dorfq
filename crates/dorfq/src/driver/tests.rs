@@ -103,19 +103,21 @@ impl Scheduler for Stumped {
 }
 
 fn busy_observation() -> Observation {
-    let pr = PrSnapshot::new(PrNumber(1), sha(2), PrBase::Trunk, PrStatus::Ready);
+    let pr = PrSnapshot::new(PrNumber(1), sha(2), PrBase::Trunk, PrStatus::Ready, 0);
     let holds = BTreeSet::from([Hold::OwnCiPending, Hold::MergeabilityUnknown]);
     let held = PrSnapshot::new(
         PrNumber(2),
         sha(4),
         PrBase::Pr(PrNumber(1)),
         PrStatus::Waiting(holds),
+        0,
     );
     let conflicting = PrSnapshot::new(
         PrNumber(3),
         sha(5),
         PrBase::Trunk,
         PrStatus::Conflicting(ConflictWith::Trunk),
+        3,
     );
     let batch = BatchStatus::new(
         BatchId(1),
