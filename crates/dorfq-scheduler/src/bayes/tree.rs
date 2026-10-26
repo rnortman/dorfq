@@ -44,7 +44,7 @@ impl Node {
 
     /// The chance a batch started on the node now lands: the node becomes
     /// trunk and every batch already on it fails.
-    // TODO(bayes-joint-path-pass): the node's `p` and its siblings' chances
+    // TODO(bayes-landing-term): the node's `p` and its siblings' chances
     // multiply per-batch pass chances as if independent; batches whose trees
     // share a failed run are not.
     fn weight(&self) -> f64 {
@@ -357,7 +357,7 @@ mod tests {
     use super::super::test_support::{informative, members, params};
     use super::*;
     use crate::test_support::*;
-    use crate::{BayesConfig, Charge, Speculation};
+    use crate::{BayesConfig, Speculation};
     use dorfq_core::{BatchId, Hold, Scheduler};
 
     /// A tree scheduler at [`params`] with `edit` applied.
@@ -384,7 +384,6 @@ mod tests {
         let mut bayes = tree(|p| {
             p.lanes = 1;
             p.max_batch = 4;
-            p.charge = Charge::Full;
         });
         let plan = step(&mut bayes, &observation(ready_all(&prs), vec![]));
         assert_eq!(plan.start, vec![start(1, trunk(), &[1, 2, 3, 4])]);

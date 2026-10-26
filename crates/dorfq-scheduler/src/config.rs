@@ -70,10 +70,6 @@ pub struct BayesConfig {
     pub speculate_above: f64,
     /// How batches beyond the first are chosen.
     pub speculation: Speculation,
-    /// How `run_cost` enters a candidate's score.
-    pub charge: Charge,
-    /// What a landing does to the beliefs about what stays queued.
-    pub landing: Landing,
 }
 
 /// How the scheduler chooses batches beyond the first.
@@ -92,43 +88,6 @@ pub enum Speculation {
     /// each older batch on the same node failing, and a batch whose node
     /// dies, or whose chance of landing falls to zero, is cancelled.
     Tree,
-}
-
-/// How a run's cost enters the score of a candidate whose base stands with
-/// probability `p_node`.
-///
-/// `speculate_above` is a threshold on the score each variant gives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Charge {
-    /// `p_node · (EV − run_cost)`: the cost shrinks with the chance the
-    /// base stands.
-    Discounted,
-    /// `p_node · EV − run_cost`: a run occupies its lane whether or not its
-    /// base stands, so the cost is paid in full.
-    Full,
-}
-
-/// What a landing does to the `Bad` belief of every pull request that stays
-/// queued: the chance it survives the landing unbroken.
-///
-/// Under `decay`, `1 − p_interact` per pull request that reached trunk;
-/// under `transfer`, the complement of its pair belief with each one, which
-/// is `1 − p_interact` only for a pair no run has touched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Landing {
-    /// Each queued pull request survives each pull request that reached
-    /// trunk, landed by the queue or merged by another hand, with
-    /// probability `1 − p_interact`.
-    Decay,
-    /// Each queued pull request survives each pull request that reached
-    /// trunk, by the queue or by another hand, with the complement of their
-    /// pair belief: `1 − p_interact` for an untouched pair, all but certain
-    /// for an alibied one, 1 for a stack relative. Landings before the
-    /// scheduler first saw the pull request's head count `1 − p_interact`
-    /// each.
-    Transfer,
 }
 
 /// A parameter outside its range.
@@ -286,8 +245,6 @@ eject_above = 0.9
 others_below = 0.1
 speculate_above = 0.0
 speculation = \"chain\"
-charge = \"discounted\"
-landing = \"decay\"
 ";
 
     fn bayes() -> BayesConfig {
@@ -331,8 +288,6 @@ landing = \"decay\"
                 others_below: 0.1,
                 speculate_above: 0.0,
                 speculation: Speculation::Chain,
-                charge: Charge::Discounted,
-                landing: Landing::Decay,
             }
         );
         assert_eq!(SchedulerConfig::Bayes(bayes()).validate(), Ok(()));
@@ -345,58 +300,31 @@ landing = \"decay\"
             other => panic!("{other:?}"),
         };
         let tree = with("speculation = \"chain\"", "speculation = \"tree\"");
-        assert_eq!(
-            (tree.speculation, tree.charge, tree.landing),
-            (Speculation::Tree, Charge::Discounted, Landing::Decay)
-        );
-        let full = with("charge = \"discounted\"", "charge = \"full\"");
-        assert_eq!((full.charge, full.landing), (Charge::Full, Landing::Decay));
-        let transfer = with("landing = \"decay\"", "landing = \"transfer\"");
-        assert_eq!(
-            (transfer.charge, transfer.landing),
-            (Charge::Discounted, Landing::Transfer)
-        );
+        assert_eq!(tree.speculation, Speculation::Tree);
     }
 
     #[test]
     fn a_flag_with_an_unknown_variant_or_missing_is_rejected() {
-        for (field, line, variants) in [
-            (
-                "speculation",
-                "speculation = \"chain\"\n",
-                "`chain` or `tree`",
-            ),
-            (
-                "charge",
-                "charge = \"discounted\"\n",
-                "`discounted` or `full`",
-            ),
-            ("landing", "landing = \"decay\"\n", "`decay` or `transfer`"),
-        ] {
-            // Inside the `kind`-tagged table the error names the variants
-            // the flag accepts, not the field.
-            let message = parse(&BAYES.replace(line, &format!("{field} = \"on\"\n"))).unwrap_err();
-            assert!(
-                message.contains("unknown variant `on`") && message.contains(variants),
-                "{message}"
-            );
-            let message = parse(&BAYES.replace(line, "")).unwrap_err();
-            assert!(message.contains(field), "{message}");
-        }
+        let line = "speculation = \"chain\"\n";
+        // Inside the `kind`-tagged table the error names the variants the
+        // flag accepts, not the field.
+        let message = parse(&BAYES.replace(line, "speculation = \"on\"\n")).unwrap_err();
+        assert!(
+            message.contains("unknown variant `on`") && message.contains("`chain` or `tree`"),
+            "{message}"
+        );
+        let message = parse(&BAYES.replace(line, "")).unwrap_err();
+        assert!(message.contains("speculation"), "{message}");
     }
 
     #[test]
     fn a_bayes_config_round_trips_through_toml_with_its_flags() {
         let config = SchedulerConfig::Bayes(BayesConfig {
             speculation: Speculation::Tree,
-            charge: Charge::Full,
-            landing: Landing::Transfer,
             ..bayes()
         });
         let text = toml::to_string(&config).unwrap();
         assert!(text.contains("speculation = \"tree\""), "{text}");
-        assert!(text.contains("charge = \"full\""), "{text}");
-        assert!(text.contains("landing = \"transfer\""), "{text}");
         assert_eq!(parse(&text).unwrap(), config);
     }
 
@@ -414,9 +342,16 @@ landing = \"decay\"
         assert!(message.contains("depth"), "{message}");
         let message = parse(&format!("{BAYES}depth = 3\n")).unwrap_err();
         assert!(message.contains("depth"), "{message}");
-        // `p_bad` is not a key; a configuration that sets it fails.
-        let message = parse(&format!("{BAYES}p_bad = 0.05\n")).unwrap_err();
-        assert!(message.contains("p_bad"), "{message}");
+        // Retired keys are not keys; a configuration that sets one fails.
+        for line in [
+            "p_bad = 0.05",
+            "charge = \"discounted\"",
+            "landing = \"decay\"",
+        ] {
+            let message = parse(&format!("{BAYES}{line}\n")).unwrap_err();
+            let key = line.split(' ').next().unwrap();
+            assert!(message.contains(key), "{message}");
+        }
     }
 
     #[test]

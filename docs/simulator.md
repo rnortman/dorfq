@@ -63,7 +63,7 @@ worse, `(B+ W- /N)`, over every point where both have the metric.
 
 Two sweep files ship in `crates/dorfq-sim/sweeps/`:
 
-- `speculation.toml` compares the `bayes` flag combinations with each other
+- `speculation.toml` compares the `bayes` speculation modes with each other
   and with `github-like` over arrival rate, CI length, flake rate,
   `max_batch`, `lanes`, `run_cost`, `w_reject` and `w_age`.
 - `bisect-cap.toml` runs `bisect` over its batch cap in the busy scenario's

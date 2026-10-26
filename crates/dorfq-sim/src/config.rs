@@ -303,7 +303,7 @@ impl WorldConfig {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use dorfq_scheduler::{BayesConfig, Charge, Landing, Speculation};
+    use dorfq_scheduler::{BayesConfig, Speculation};
 
     pub(crate) const WORLD: &str = "\
 hours = 48
@@ -403,7 +403,7 @@ max_batch = 16
                 Admission::Label
             ]
         );
-        let bayes = |speculation, charge| BayesConfig {
+        let bayes = |speculation| BayesConfig {
             lanes: 2,
             max_batch: 16,
             p_interact: 0.001,
@@ -415,8 +415,6 @@ max_batch = 16
             others_below: 0.1,
             speculate_above: 0.0,
             speculation,
-            charge,
-            landing: Landing::Decay,
         };
         assert_eq!(
             policies,
@@ -435,13 +433,10 @@ max_batch = 16
                         max_batch: 8
                     }
                 ),
-                (
-                    "bayes",
-                    &SchedulerConfig::Bayes(bayes(Speculation::Chain, Charge::Discounted))
-                ),
+                ("bayes", &SchedulerConfig::Bayes(bayes(Speculation::Chain))),
                 (
                     "bayes-tree",
-                    &SchedulerConfig::Bayes(bayes(Speculation::Tree, Charge::Full))
+                    &SchedulerConfig::Bayes(bayes(Speculation::Tree))
                 ),
             ]
         );
@@ -503,16 +498,10 @@ max_batch = 16
                     (bayes.p_interact, bayes.p_flake),
                     (config.world.p_interact, config.world.p_flake)
                 );
-                (bayes.speculation, bayes.charge, bayes.landing)
+                bayes.speculation
             })
             .collect();
-        assert_eq!(
-            flags,
-            [
-                (Speculation::Chain, Charge::Discounted, Landing::Decay),
-                (Speculation::Tree, Charge::Full, Landing::Decay)
-            ]
-        );
+        assert_eq!(flags, [Speculation::Chain, Speculation::Tree]);
     }
 
     #[test]

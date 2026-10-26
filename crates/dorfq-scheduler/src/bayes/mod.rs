@@ -21,11 +21,8 @@
 //! sets every pair it exercised to a floor that inference treats as false.
 //! A pull request's own CI passing on its head is an alibi for its `Bad`
 //! alone, against the trunk that run started on. Each landing since a
-//! cleared position may have broken the pull request: under
-//! `landing = "decay"` with probability `p_interact` per pull request that
-//! reached trunk; under `"transfer"` with its pair belief with each, which is
-//! the prior for a pair no run touched, the floor for an alibied pair and
-//! nothing for a stack relative.
+//! cleared position may have broken the pull request, with probability
+//! `p_interact` per pull request that reached trunk.
 //!
 //! A failing run is evidence. A failed run is read at the trunk it started
 //! on: it blames a pull request only if its cleared position is behind that
@@ -104,7 +101,7 @@ impl Bayes {
         Bayes {
             params,
             ids: Ids::new(),
-            model: Model::new(params.priors(), params.landing),
+            model: Model::new(params.priors()),
             finders: BTreeSet::new(),
             trees: BTreeMap::new(),
             untested: BTreeMap::new(),

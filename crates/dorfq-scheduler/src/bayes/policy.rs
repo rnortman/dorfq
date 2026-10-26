@@ -12,7 +12,7 @@ use super::Bayes;
 use super::infer::{Inference, RunPosteriors, Unresolved};
 use super::model::Cause;
 use crate::stacks::{Footing, Stacks};
-use crate::{Charge, Ejections, Member, Speculation, is_pending};
+use crate::{Ejections, Member, Speculation, is_pending};
 
 /// What a step does with one tracked batch.
 pub(super) enum Fate {
@@ -74,7 +74,9 @@ fn singled_out(
 
 /// The pull request ejected for a singled-out cause.
 // TODO(bayes-pair-eject-timing): a pair singled out while both are queued
-// ejects the newer at once, before either is broken against trunk.
+// ejects the newer at once, before either is broken against trunk; one
+// candidate is to never eject on a pair and let the older's landing turn the
+// run's blame onto the newer.
 fn culprit(cause: Cause) -> PrNumber {
     match cause {
         Cause::Bad(pr) => pr,
@@ -158,7 +160,7 @@ impl Bayes {
             }
             tree.retain(|member| !landed.contains(member));
         }
-        // TODO(quality-trunk-position-counter-held-twice): the trunk position
+        // TODO(trunk-position-ownership): the trunk position
         // is kept here and again in the model, which `sync` sets from this one.
         self.position += i64::try_from(landed.len()).expect("landings fit i64");
         self.model.sync(
@@ -277,8 +279,9 @@ impl Bayes {
 
     /// The score of a batch of `members` on a node whose tree beyond trunk is
     /// `below` and which stands with probability `p_node`: its value,
-    /// `p·V(B) + (1 − p)·R` for `V(B)` its members' values, weighted by `p_node`, less `run_cost` as
-    /// [`Charge`] places it. Under [`Speculation::Tree`] a failure whose
+    /// `p·V(B) + (1 − p)·R` for `V(B)` its members' values, weighted by
+    /// `p_node`, less `run_cost` in full: a run occupies its lane whether or
+    /// not its base stands. Under [`Speculation::Tree`] a failure whose
     /// consequence cannot be resolved counts `R = 0`; under `Chain` it is
     /// the error.
     pub(super) fn score(
@@ -294,18 +297,15 @@ impl Bayes {
             Err(_) if self.params.speculation == Speculation::Tree => 0.0,
             resolution => resolution?,
         };
-        // TODO(bayes-finder-valuation): the landing term credits a batch whose
+        // TODO(bayes-landing-term): the landing term credits a batch whose
         // pass will not land — a chain finder while a chain batch holds trunk
         // — with its members' full value.
         let landing: f64 = members.iter().map(|&(pr, _)| self.value(pr)).sum();
         let value = p * landing + (1.0 - p) * resolution;
-        // TODO(bayes-joint-path-pass): `p_node · p` treats the node standing
+        // TODO(bayes-landing-term): `p_node · p` treats the node standing
         // and this batch passing as independent; batches whose trees share a
         // failed run are not.
-        Ok(match self.params.charge {
-            Charge::Discounted => p_node * (value - self.params.run_cost),
-            Charge::Full => p_node * value - self.params.run_cost,
-        })
+        Ok(p_node * value - self.params.run_cost)
     }
 
     /// Grows a batch on a node from `units`, in order, while its score
@@ -390,9 +390,10 @@ impl Bayes {
             // searched one pair per finder, in rank order; cross-subset
             // finders would locate the failing pair in logarithmically many
             // runs.
-            // TODO(trunk-broken-probe): every chain finder runs on trunk;
-            // after a flaky pass landed a bad pull request, every one of them
-            // fails and each singles out an innocent suspect.
+            // TODO(trunk-broken-probe): every suspect batch runs on trunk or
+            // above it; after a pass that missed a real break landed a bad
+            // pull request, every one of them fails and each singles out an
+            // innocent suspect.
             let mut sets: Vec<Vec<Member>> = Vec::new();
             let mut counted = 0;
             let mut bads: Vec<PrNumber> = Vec::new();
@@ -572,8 +573,8 @@ mod tests {
     use super::super::model::FLOOR;
     use super::super::test_support::{bad, informative, members, pair, params, prior};
     use super::*;
+    use crate::BayesConfig;
     use crate::test_support::*;
-    use crate::{BayesConfig, Landing};
     use dorfq_core::{Departure, LandRefusal, PrSnapshot, Timestamp, Withdrawal};
 
     fn bayes() -> Bayes {
@@ -998,16 +999,9 @@ mod tests {
     }
 
     #[test]
-    fn a_landing_or_a_merge_regrows_a_survivor_once_under_either_mode() {
-        let transferring = || {
-            Bayes::new(BayesConfig {
-                landing: Landing::Transfer,
-                ..params()
-            })
-        };
-        // 1 lands by the queue: under transfer Bad(2) takes the pair's prior
-        // once.
-        let mut queue = transferring();
+    fn a_landing_or_a_merge_regrows_a_survivor_once() {
+        // 1 lands by the queue: Bad(2) regrows by one landing.
+        let mut queue = bayes();
         step(&mut queue, &observation(ready_all(&[1, 2]), vec![]));
         let batch = batch(1, trunk(), &[1], BatchState::Landed { tip: tip(1) });
         let mut input = observation(ready_after(&[2], 1), vec![batch]);
@@ -1016,7 +1010,7 @@ mod tests {
         step(&mut queue, &input);
         let regrown = 1.0 - (1.0 - prior()) * 0.998;
         assert!((belief(&queue, bad(2)) - regrown).abs() < 1e-15);
-        // 1 merged by another hand: the same, under either mode.
+        // 1 merged by another hand: the same.
         let merged = |mut bayes: Bayes| {
             step(&mut bayes, &observation(ready_all(&[1, 2]), vec![]));
             let mut input = observation(ready_after(&[2], 1), vec![]);
@@ -1025,7 +1019,6 @@ mod tests {
             step(&mut bayes, &input);
             belief(&bayes, bad(2))
         };
-        assert!((merged(transferring()) - regrown).abs() < 1e-15);
         assert!((merged(bayes()) - regrown).abs() < 1e-15);
     }
 
@@ -1341,26 +1334,19 @@ mod tests {
     }
 
     #[test]
-    fn a_full_charge_keeps_an_extension_off_an_unlikely_root() {
+    fn an_extension_is_kept_off_an_unlikely_root() {
         // A pending root of ten at the prior passes about half the time; one
         // fresh pull request could extend it.
-        let charged = |charge| {
-            Bayes::new(BayesConfig {
-                run_cost: 0.6,
-                charge,
-                ..params()
-            })
-        };
+        let mut full = Bayes::new(BayesConfig {
+            run_cost: 0.6,
+            ..params()
+        });
         let root: Vec<u64> = (1..=10).collect();
         let prs: Vec<u64> = (1..=11).collect();
         let input = observation(
             ready_all(&prs),
             vec![testing(1, trunk(), &root, CiStatus::Pending)],
         );
-        let mut discounted = charged(Charge::Discounted);
-        let plan = step(&mut discounted, &input);
-        assert_eq!(plan.start, vec![start(2, tip(1), &[11])]);
-        let mut full = charged(Charge::Full);
         assert_eq!(step(&mut full, &input), Plan::default());
 
         let inference = Inference::of(&full.model).unwrap();
@@ -1373,15 +1359,11 @@ mod tests {
             .unwrap();
         let value = p + (1.0 - p) * r;
         assert!(p_end < 0.6 && value > 0.6, "{p_end} {value}");
-        let score = |bayes: &Bayes| {
-            bayes
-                .score(&inference, &extension, &root, p_end, &none)
-                .unwrap()
-        };
-        assert!((score(&discounted) - p_end * (value - 0.6)).abs() < 1e-12);
-        assert!(score(&discounted) > 0.0);
-        assert!((score(&full) - (p_end * value - 0.6)).abs() < 1e-12);
-        assert!(score(&full) < 0.0);
+        let score = full
+            .score(&inference, &extension, &root, p_end, &none)
+            .unwrap();
+        assert!((score - (p_end * value - 0.6)).abs() < 1e-12);
+        assert!(score < 0.0);
     }
 
     #[test]
@@ -1598,8 +1580,11 @@ mod tests {
         assert!(plan.land.is_empty());
         assert_eq!(plan.retire, ids(&[3]));
         assert_eq!(belief(&bayes, bad(2)), 0.0);
-        // 2, cleared, joins the chain.
-        assert_eq!(plan.start, vec![start(4, tip(2), &[2])]);
+        // 2, cleared, does not extend the pending {1}: the root, which
+        // failed with 2, stands at about 0.29 and {2} on it passes at about
+        // 0.95 (as the next test pins), so the extension scores about
+        // 0.29 · 0.95 − 0.5 < 0; and with 1 in flight no finder can run.
+        assert_eq!(plan.start, vec![]);
     }
 
     #[test]
@@ -1934,7 +1919,6 @@ mod tests {
                 p_interact: 0.001,
                 w_age: 0.02,
                 speculation,
-                charge: Charge::Full,
                 ..params()
             });
             let unit: Vec<u64> = (25..=31).collect();
@@ -2089,7 +2073,6 @@ mod tests {
         Bayes::new(BayesConfig {
             max_batch: 16,
             w_age: 0.02,
-            charge: Charge::Full,
             ..params()
         })
     }

@@ -7,7 +7,7 @@ use dorfq_core::PrNumber;
 use super::infer::Inference;
 use super::model::{Cause, Model, Priors};
 use crate::test_support::{BEHIND, ready_all, sha};
-use crate::{BayesConfig, Charge, Landing, Member, Speculation};
+use crate::{BayesConfig, Member, Speculation};
 
 pub(super) fn priors() -> Priors {
     Priors {
@@ -19,7 +19,7 @@ pub(super) fn priors() -> Priors {
 /// The belief a pull request from [`crate::test_support`]'s builders starts
 /// at: [`BEHIND`] landings past its cleared position at [`priors`].
 pub(super) fn prior() -> f64 {
-    Model::new(priors(), Landing::Decay).regrown(i64::from(BEHIND))
+    Model::new(priors()).regrown(i64::from(BEHIND))
 }
 
 /// The scheduler's parameters at [`priors`], every flag at the status quo.
@@ -37,15 +37,13 @@ pub(super) fn params() -> BayesConfig {
         others_below: 0.1,
         speculate_above: 0.0,
         speculation: Speculation::Chain,
-        charge: Charge::Discounted,
-        landing: Landing::Decay,
     }
 }
 
 /// A model at [`priors`] holding `prs` at their original heads, at trunk
 /// position 0.
 pub(super) fn model(prs: &[u64]) -> Model {
-    let mut model = Model::new(priors(), Landing::Decay);
+    let mut model = Model::new(priors());
     model.sync(&ready_all(prs), &BTreeSet::new(), 0);
     model
 }
