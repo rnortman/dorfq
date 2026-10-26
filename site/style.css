@@ -26,6 +26,9 @@ body {
 
 code { font-family: var(--mono); font-size: 0.92em; }
 
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
 .top {
   display: flex;
   flex-wrap: wrap;
@@ -121,6 +124,17 @@ h2 .sub { color: var(--muted); font-weight: normal; font-size: 0.95rem; margin-l
 
 .baseline-card { border-style: dashed; }
 
+.lede { color: var(--muted); margin: 0 0 0.5rem; max-width: 75rem; }
+
+.own ul { margin: 0; padding-left: 1.2rem; }
+.own li { margin: 0.2rem 0; }
+
+.glossary-wrap { margin-top: 0.75rem; }
+.glossary-wrap summary { cursor: pointer; color: var(--muted); margin-bottom: 0.5rem; }
+.glossary { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 0.3rem 1rem; margin: 0; font-size: 0.88rem; max-width: 75rem; }
+.glossary dt { color: var(--text); }
+.glossary dd { margin: 0; color: var(--muted); }
+
 .table-wrap summary { cursor: pointer; color: var(--muted); margin-bottom: 0.5rem; }
 .scroll { overflow-x: auto; }
 
@@ -211,7 +225,7 @@ footer { color: var(--muted); font-size: 0.85rem; padding: 1rem 2rem 2rem; max-w
   display: block;
   box-sizing: border-box;
   width: 100%;
-  height: 28rem;
+  height: 18rem;
   margin: 0 0 0.75rem;
   padding: 0.75rem 1rem;
   resize: vertical;
@@ -226,3 +240,21 @@ footer { color: var(--muted); font-size: 0.85rem; padding: 1rem 2rem 2rem; max-w
 #playground textarea:focus { outline: none; border-color: var(--accent); }
 #playground .status { white-space: pre-wrap; }
 button:disabled { cursor: default; opacity: 0.5; }
+
+/* The home page: one centred column of text. */
+.home-top, .home-main, .home-footer { max-width: 44rem; margin: 0 auto; padding-left: 1.5rem; padding-right: 1.5rem; }
+.home-top { padding-top: 4rem; padding-bottom: 1.5rem; border-bottom: 1px solid var(--line); }
+.home-top h1 { margin: 0; font-size: 2.6rem; letter-spacing: 0.02em; font-family: var(--mono); font-weight: 600; }
+.home-top .tagline { font-size: 1.1rem; margin-top: 0.35rem; }
+.home-nav { display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem; margin-top: 1.25rem; font-size: 0.95rem; }
+.home-main { padding-bottom: 2rem; }
+.home .prose { background: none; border: 0; border-radius: 0; padding: 0; margin-top: 2.25rem; }
+.home .prose h2 { font-size: 1.05rem; text-transform: lowercase; letter-spacing: 0.04em; color: var(--muted); font-weight: 600; margin-bottom: 0.5rem; }
+.home .prose p, .home .prose li { line-height: 1.65; }
+.home .prose ul { padding-left: 1.2rem; }
+.home .prose li { margin: 0.3rem 0; }
+.sim-card { display: block; margin-top: 2.5rem; padding: 1.1rem 1.25rem; background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px; color: var(--text); }
+.sim-card:hover { text-decoration: none; border-color: var(--accent); }
+.sim-card-title { display: block; font-size: 1.15rem; font-weight: 600; color: var(--accent); margin-bottom: 0.3rem; }
+.sim-card-text { display: block; color: var(--muted); }
+.home-footer { padding-top: 1rem; padding-bottom: 3rem; border-top: 1px solid var(--line); }

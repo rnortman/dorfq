@@ -1,33 +1,44 @@
-// The dorfq simulator report: the comparison table with headlines against
-// the `github-like` column, and a replay of each policy's first
-// replication. Reads the documents `dorfq-sim run --json` writes.
+// The dorfq simulation page: the comparison table with headlines against
+// the `github-like` column, a playground, and a replay of each policy's
+// first replication. Reads the documents `dorfq-sim run --json` writes.
 "use strict";
 
 const SCHEMA = 4;
 const BASELINE = "github-like";
 const DEFAULT_REPORT = "busy";
+const DEFAULT_REPLAY_POLICY = "bayes";
 
-// Fixed text shown beside a named report's world.
-const REPORT_NOTES = {
-  busy:
-    "dorfq's columns share eight lanes; github-like runs on sixteen, the " +
-    "concurrency GitHub's queue is given in practice. bayes is the status " +
-    "quo (eight lanes, max_batch 8); bayes-tree is the tree of futures at " +
-    "the same settings. bisect runs at cap 1, the naive queue under dorfq's " +
-    "admission. Every replication drains. Here bayes lands 322 (10 bad and " +
-    "0.0 good ejected, 1.0 runner-hours per landed), bayes-tree 325 (9, " +
-    "0.0, 1.0), bisect 270 (24, 22, 2.6) and github-like 277 (6, 23, 2.8).",
-};
-
-// Metric rows, as the command line's table prints them: key and decimals.
+// Metric rows, as the command line's table prints them: key, decimals, and
+// a one-line definition for the rows whose name does not say what they are.
+// The definitions restate the field comments on `Metrics` in
+// crates/dorfq-sim/src/metrics.rs and change with them.
 const ROWS = [
-  ["arrived", 1], ["ever_bad", 1], ["landed", 1], ["ejected_bad", 1], ["ejected_good", 1],
-  ["withdrawn", 1], ["left_with_base", 1], ["unfinished", 1], ["rebases", 1], ["runs", 1],
-  ["cancelled_runs", 1],
-  ["mean_batch_size", 2], ["billed_pr_ci_runs", 1], ["runner_hours", 1], ["billed_pr_ci_hours", 1],
-  ["runner_hours_per_landed", 2], ["wasted_fraction", 3], ["land_p50_hours", 2], ["land_p95_hours", 2],
-  ["reject_p50_hours", 2], ["reject_p95_hours", 2], ["detect_p50_hours", 2],
-  ["detect_p95_hours", 2], ["ended_hours", 1], ["cut_off", 2], ["stalled", 2],
+  ["arrived", 1, null],
+  ["ever_bad", 1, "pull requests that were broken against trunk at some point"],
+  ["landed", 1, null],
+  ["ejected_bad", 1, "pull requests ejected, directly or with an ejected base, while broken against trunk"],
+  ["ejected_good", 1, "pull requests ejected, directly or with an ejected base, while not broken against trunk"],
+  ["withdrawn", 1, "pull requests withdrawn from the queue, directly or with a withdrawn base"],
+  ["left_with_base", 1, "pull requests that left because their base left without landing; also counted under the base's exit"],
+  ["unfinished", 1, "pull requests still open when the replication ended"],
+  ["rebases", 1, null],
+  ["runs", 1, "batch runs started, cancelled ones included"],
+  ["cancelled_runs", 1, "batch runs stopped because their batch was retired"],
+  ["mean_batch_size", 2, null],
+  ["billed_pr_ci_runs", 1, "pull requests' own CI runs the queue caused by landing their base without them"],
+  ["runner_hours", 1, "runner time of batch runs and billed PR CI runs: finished and cancelled runs' time, plus the time so far of runs still going when the replication ended; other PR CI is not in it"],
+  ["billed_pr_ci_hours", 1, "the part of runner_hours spent on billed PR CI runs"],
+  ["runner_hours_per_landed", 2, null],
+  ["wasted_fraction", 3, "share of batch runner time spent on runs that ended without landing: failed, cancelled, refused, or passed on a dead base; runs still going when the replication ended are not waste, and PR CI is in neither side"],
+  ["land_p50_hours", 2, null],
+  ["land_p95_hours", 2, null],
+  ["reject_p50_hours", 2, null],
+  ["reject_p95_hours", 2, null],
+  ["detect_p50_hours", 2, "median hours from a pull request becoming broken, or arriving broken, to its justified ejection"],
+  ["detect_p95_hours", 2, "95th-percentile hours from a pull request becoming broken, or arriving broken, to its justified ejection"],
+  ["ended_hours", 1, null],
+  ["cut_off", 2, "share of replications that ended before the queue emptied"],
+  ["stalled", 2, "share of replications ended by the stall detector: no landing or ejection for stall_hours"],
 ];
 
 // Headline deltas against the baseline; lower is better for every one.
@@ -54,6 +65,7 @@ async function fetchJson(path) {
 }
 
 async function boot() {
+  renderGlossary();
   $("file-input").addEventListener("change", onFile);
   let names;
   try {
@@ -87,7 +99,6 @@ async function boot() {
 function offerPicker(message) {
   setStatus(SERVED ? message : `${message} ${PLAYGROUND_NEEDS_HTTP}`, false);
   $("report-select").hidden = true;
-  $("file-label").hidden = false;
 }
 
 async function loadNamed(name) {
@@ -170,9 +181,6 @@ function renderComparison(doc) {
   $("comparison").hidden = false;
   $("report-name").textContent = doc.name;
   $("config-text").textContent = doc.config_text;
-  const note = REPORT_NOTES[doc.name];
-  $("report-note").hidden = !note;
-  $("report-note").textContent = note || "";
 
   const headlines = $("headlines");
   headlines.replaceChildren();
@@ -264,9 +272,11 @@ function renderTable(doc, baseline) {
     head.append(th);
   }
   const body = table.createTBody();
-  for (const [key, decimals] of ROWS) {
+  for (const [key, decimals, meaning] of ROWS) {
     const row = body.insertRow();
-    row.insertCell().textContent = key;
+    const name = row.insertCell();
+    name.textContent = key;
+    if (meaning) name.title = meaning;
     for (const policy of doc.policies) {
       const cell = row.insertCell();
       if (policy === baseline) cell.className = "base";
@@ -287,6 +297,18 @@ function renderTable(doc, baseline) {
       cell.className = "error";
       cell.textContent = `${errors.length}: ${errors[0].error}`;
     }
+  }
+}
+
+function renderGlossary() {
+  const glossary = $("glossary");
+  for (const [key, , meaning] of ROWS) {
+    if (!meaning) continue;
+    const term = document.createElement("dt");
+    term.append(Object.assign(document.createElement("code"), { textContent: key }));
+    const definition = document.createElement("dd");
+    definition.textContent = meaning;
+    glossary.append(term, definition);
   }
 }
 
@@ -1120,7 +1142,8 @@ const replay = {
       switcher.append(b);
     }
     const keep = traced.find((p) => p.name === this.policy);
-    this.select(keep ? keep.name : traced[0].name);
+    const preferred = traced.find((p) => p.name === DEFAULT_REPLAY_POLICY);
+    this.select((keep ?? preferred ?? traced[0]).name);
   },
 
   world() {

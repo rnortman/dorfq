@@ -462,7 +462,7 @@ mod tests {
         assert_eq!(document["name"], "sim");
         assert_eq!(document["config_text"], text);
         assert_eq!(document["config"]["seed"], 1);
-        assert_eq!(document["config"]["policy"][0]["kind"], "all-at-once");
+        assert_eq!(document["config"]["policy"][0]["kind"], "bisect");
         let floor = &document["policies"][0];
         assert_eq!(floor["name"], "floor");
         assert_eq!(floor["replications"][0]["metrics"]["landed"], 4);

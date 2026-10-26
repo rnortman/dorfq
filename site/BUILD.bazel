@@ -1,9 +1,8 @@
 load(":wasm.bzl", "wasm_module")
 
-# The report site's data: each shipped simulator example run through
+# The simulation page's data: each shipped simulator example run through
 # `dorfq-sim run --json`, plus the index the page reads to list them. The
-# page itself (index.html, app.js, style.css, sim-worker.js) is static and
-# has no build.
+# static files (site/*.html, *.js, *.css) have no build.
 # TODO(test-site-app-js-untested-against-report-schema): nothing checks that
 # app.js parses or that the fields it reads exist in these documents.
 #

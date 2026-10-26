@@ -9,8 +9,8 @@ which needs the Actions: write permission. The `bayes` scheduler under
 GitHub it pays for every cancelled batch's full run until this is done.
 Done means: `retire` of a `Testing { Pending }` batch cancels every
 in-progress run on its tip before deleting the refs, the fake models runs
-and their cancellation, the README's permission lists gain Actions: write
-under both credentials, and `make live-test` exercises it once. Deferred
+and their cancellation, the permission lists in docs/running-on-github.md
+gain Actions: write under both credentials, and `make live-test` exercises it once. Deferred
 because it is forge design: a permission every installation must add, a
 fake that models runs, and what to do when a cancel is refused. The
 `TODO(github-retire-cancels-run)` comment sits in `GitHubForge::retire` in

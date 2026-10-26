@@ -397,7 +397,6 @@ max_batch = 16
         assert_eq!(
             admissions,
             [
-                Admission::Label,
                 Admission::Github,
                 Admission::Label,
                 Admission::Label,
@@ -422,7 +421,6 @@ max_batch = 16
         assert_eq!(
             policies,
             [
-                ("all-at-once", &SchedulerConfig::AllAtOnce {}),
                 (
                     "github-like",
                     &SchedulerConfig::Bisect {
@@ -450,7 +448,7 @@ max_batch = 16
     }
 
     #[test]
-    fn the_busy_world_parses_with_its_five_policies() {
+    fn the_busy_world_parses_with_its_four_policies() {
         let config = SimConfig::parse(include_str!("../examples/busy.toml")).unwrap();
         assert_eq!(config.world.arrivals_per_hour, 5.0);
         assert_eq!(
@@ -471,7 +469,6 @@ max_batch = 16
         assert_eq!(
             admissions,
             [
-                Admission::Label,
                 Admission::Github,
                 Admission::Label,
                 Admission::Label,
@@ -479,31 +476,22 @@ max_batch = 16
             ]
         );
         let names: Vec<&str> = config.policy.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["github-like", "bisect", "bayes", "bayes-tree"]);
         assert_eq!(
-            names,
-            [
-                "all-at-once",
-                "github-like",
-                "bisect",
-                "bayes",
-                "bayes-tree"
-            ]
-        );
-        assert_eq!(
-            config.policy[1].scheduler,
+            config.policy[0].scheduler,
             SchedulerConfig::Bisect {
                 lanes: 16,
                 max_batch: 1
             }
         );
         assert_eq!(
-            config.policy[2].scheduler,
+            config.policy[1].scheduler,
             SchedulerConfig::Bisect {
                 lanes: 8,
                 max_batch: 1
             }
         );
-        let flags: Vec<_> = config.policy[3..]
+        let flags: Vec<_> = config.policy[2..]
             .iter()
             .map(|p| {
                 let SchedulerConfig::Bayes(bayes) = p.scheduler else {
@@ -541,7 +529,7 @@ max_batch = 16
         let config = SimConfig::parse(include_str!("../examples/sim.toml")).unwrap();
         let value = serde_json::to_value(&config).unwrap();
         assert_eq!(
-            value["policy"][1],
+            value["policy"][0],
             serde_json::json!({
                 "name": "github-like", "admission": "github",
                 "kind": "bisect", "lanes": 16, "max_batch": 1

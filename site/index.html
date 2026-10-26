@@ -3,111 +3,73 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>dorfq — simulator report</title>
+  <title>dorfq — a merge queue for large monorepos</title>
+  <meta name="description" content="A merge queue for large monorepos with long CI and high PR velocity.">
   <link rel="stylesheet" href="style.css">
 </head>
-<body>
-  <header class="top">
-    <div class="brand">
-      <h1>dorfq</h1>
-      <p class="tagline">a merge queue that pools pull requests into batched CI runs — measured in simulation</p>
-    </div>
-    <nav class="pick">
-      <label>report
-        <select id="report-select" aria-label="report"></select>
-      </label>
-      <label class="file" id="file-label" hidden>
-        open a report document
-        <input type="file" id="file-input" accept=".json,application/json">
-      </label>
+<body class="home">
+  <header class="home-top">
+    <h1>dorfq</h1>
+    <p class="tagline">A merge queue for large monorepos with long CI and high PR velocity.</p>
+    <nav class="home-nav">
+      <a href="simulation.html">Simulation results</a>
+      <a href="https://github.com/rnortman/dorfq">Source</a>
+      <a href="https://github.com/rnortman/dorfq/blob/main/docs/running-on-github.md">Run it</a>
+      <a href="https://github.com/rnortman/dorfq/blob/main/LICENSE">License</a>
     </nav>
   </header>
 
-  <main>
-    <p id="status" class="status" role="status"></p>
-
-    <section id="comparison" hidden>
-      <h2>How it compares <span class="sub" id="report-name"></span></h2>
-      <p class="note" id="report-note" hidden></p>
-      <div class="headlines" id="headlines"></div>
-      <details class="table-wrap" open>
-        <summary>every metric — mean over replications [min–max]</summary>
-        <div class="scroll"><table id="metrics"></table></div>
-      </details>
-      <details class="params">
-        <summary>parameters — the configuration this report ran with</summary>
-        <pre id="config-text"></pre>
-      </details>
+  <main class="home-main">
+    <section class="prose">
+      <h2>What it does</h2>
+      <p>DorfQ (Dorfman + queue, after Robert Dorfman's pooled testing) pools
+        queued pull requests into batched CI runs, so one passing run lands
+        many changes. When a batch fails, it infers the culprit from what
+        failed instead of bisecting blind. It lands only the exact tree that
+        passed CI, by fast-forwarding trunk.</p>
+      <p>Every belief is probabilistic. It reasons about false positives,
+        false negatives and infrastructure flakes, and runs speculative
+        batches when the expected value exceeds the cost.</p>
+      <p>Its state lives in git, in refs like <code>refs/dorfq/…</code>; there
+        is no database, and it reconstructs its state from the repository on
+        restart. Deploying it is running a single binary with access to your
+        GitHub installation and bot credentials.</p>
     </section>
 
-    <section id="replay" hidden>
-      <h2>Replay <span class="sub">replication 0 — every policy sees the same arrivals at the same times</span></h2>
-      <div class="controls">
-        <div class="policies" id="policy-switch" role="radiogroup" aria-label="policy"></div>
-        <button id="play" type="button" aria-label="play">▶</button>
-        <label>speed
-          <select id="speed">
-            <option value="600">10 min/s</option>
-            <option value="1800">30 min/s</option>
-            <option value="3600" selected>1 h/s</option>
-            <option value="10800">3 h/s</option>
-            <option value="28800">8 h/s</option>
-          </select>
-        </label>
-        <span class="clock" id="clock">t = 0</span>
-      </div>
-      <input type="range" id="scrubber" min="0" max="0" value="0" step="1" aria-label="time">
-      <div class="counters" id="counters"></div>
-      <div class="stage" id="stage">
-        <div class="canvas-wrap">
-          <canvas id="canvas"></canvas>
-          <div class="tooltip" id="tooltip" hidden></div>
-        </div>
-        <aside class="log">
-          <h3>events</h3>
-          <ol id="log"></ol>
-        </aside>
-      </div>
-      <p class="legend">
-        <span class="sw running"></span>running
-        <span class="sw passed"></span>passed
-        <span class="sw failed"></span>failed
-        <span class="sw flake"></span>failed on a flake
-        <span class="sw cancelled"></span>cancelled
-        &nbsp;·&nbsp; chips: <span class="chip-k idle">7</span> queued
-        <span class="chip-k held">7</span> held until its own CI passes
-        <span class="chip-k outside">7</span> outside the queue (PR CI, rebasing, out with base, waiting for base)
-        <span class="chip-k busy">7</span> in a batch
-        <span class="chip-k atomic">7</span> lands only with its stack
-        <span class="dot bad"></span>broken against trunk (hidden truth)
-        <span class="dot conflict"></span>conflicts with trunk
-      </p>
+    <section class="prose">
+      <h2>Is it for you</h2>
+      <p>GitHub's built-in queue and the bisecting Bors variants hold up at a
+        few pull requests an hour with ten-minute CI and few flakes. At 20+
+        pull requests an hour, CI that sometimes takes three hours, and a
+        flake rate above a fraction of a percent, they fall over. DorfQ is
+        built for the latter.</p>
+      <ul>
+        <li>Once it accepts a pull request, it owns it until it lands or is
+          handed back. Nobody babysits the queue.</li>
+        <li>Stacks and trees of pull requests are native, landed atomically
+          or split as each stack says.</li>
+        <li>It models CI cost directly, and speculates only when the expected
+          value exceeds it.</li>
+      </ul>
     </section>
 
-    <section id="playground" hidden>
-      <h2>Playground <span class="sub">edit the parameters and run the simulator in your browser</span></h2>
-      <p class="note" id="playground-offline" hidden>
-        The playground needs this page served over HTTP: opened from a file,
-        the browser will not start its worker or load its WebAssembly.
-      </p>
-      <textarea id="playground-text" spellcheck="false" aria-label="simulation file"></textarea>
-      <div class="controls">
-        <button id="playground-run" type="button">run</button>
-        <button id="playground-cancel" type="button" disabled>cancel</button>
-        <button id="playground-download" type="button" disabled>download</button>
-        <span class="status" id="playground-status" role="status"></span>
-      </div>
+    <section class="prose">
+      <h2>Status</h2>
+      <p>DorfQ runs as its own merge queue. GitHub is the only forge
+        supported; the forge interface is abstracted for others. Operational
+        and developer tooling is still thin.</p>
     </section>
+
+    <a class="sim-card" href="simulation.html">
+      <span class="sim-card-title">Simulation results →</span>
+      <span class="sim-card-text">Every scheduler and an approximation of
+        GitHub's merge queue on the same simulated arrivals: the metrics, a
+        replay of each run, and a playground for your own scenario.</span>
+    </a>
   </main>
 
-  <footer>
-    Generated by <code>dorfq-sim run --json</code> from the examples in
-    <code>crates/dorfq-sim/examples/</code>. The hidden truths — which pull
-    requests are broken against trunk, which runs flaked — are the simulator's; a real queue
-    never sees them. The playground runs the same simulator, compiled to
-    WebAssembly, in your browser.
+  <footer class="home-footer">
+    Apache-2.0 · <a href="https://github.com/rnortman/dorfq">github.com/rnortman/dorfq</a>
   </footer>
-
-  <script src="app.js"></script>
 </body>
 </html>

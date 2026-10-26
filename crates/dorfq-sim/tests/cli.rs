@@ -23,7 +23,7 @@ fn the_example_runs_and_prints_every_policy_and_the_cost_metric() {
     assert!(output.status.success(), "dorfq-sim run: {output:?}");
     let table = stdout(&output);
     let header = table.lines().next().expect("a header");
-    for name in ["all-at-once", "bisect"] {
+    for name in ["github-like", "bisect"] {
         assert!(header.contains(name), "no column {name} in {header:?}");
     }
     assert!(table.contains("runner_hours_per_landed"), "{table}");
@@ -58,13 +58,7 @@ fn json_writes_the_document_and_still_prints_the_table() {
         document.starts_with(r#"{"schema":4,"name":"sim","config":"#),
         "{document:.80}"
     );
-    for name in [
-        "all-at-once",
-        "github-like",
-        "bisect",
-        "bayes",
-        "bayes-tree",
-    ] {
+    for name in ["github-like", "bisect", "bayes", "bayes-tree"] {
         let column = format!(r#"{{"name":"{name}","replications":[{{"metrics":"#);
         assert!(document.contains(&column), "no policy {name}");
     }
@@ -133,7 +127,7 @@ fn sweep_prints_the_grid_and_the_summary_and_writes_the_document() {
         .lines()
         .find(|l| l.starts_with("against github-like"))
         .unwrap_or_else(|| panic!("no summary in {text}"));
-    for name in ["all-at-once", "bisect", "bayes"] {
+    for name in ["bisect", "bayes"] {
         assert!(summary.contains(name), "no column {name} in {summary:?}");
     }
     let document = fs::read_to_string(&out).expect("the document is written");

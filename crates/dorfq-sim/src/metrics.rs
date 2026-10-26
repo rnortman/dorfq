@@ -110,6 +110,8 @@ pub struct PrCiRecord {
 }
 
 /// One replication's summary; `None` where the set it summarises is empty.
+/// The simulation page's glossary (`ROWS` in `site/app.js`) restates these
+/// field comments and changes with them.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Metrics {
     pub arrived: usize,
