@@ -5,8 +5,8 @@
   fast-forwarding trunk once their required checks pass; authors are told
   each step in a pull request comment. Queue state lives in the repository
   itself, so a restarted queue picks up where it left off. See
-  `crates/dorfq/examples/github.toml` and "Running against GitHub" in the
-  README. Example systemd units, user and system, are in
+  `crates/dorfq/examples/github.toml` and `docs/running-on-github.md`.
+  Example systemd units, user and system, are in
   `crates/dorfq/examples/systemd/`.
 - Operators should know that the queue label is the landing authority:
   anyone who can apply it (Triage role included) lands the pull request at
@@ -36,20 +36,19 @@
   and to reject, wasted runner time, false ejections. Two policies at one
   seed see the same arrivals and truths. `make sim` runs it; the shipped
   example is `crates/dorfq-sim/examples/sim.toml`.
-- Scheduler configuration (`[scheduler]`, `kind = "all-at-once" | "bisect" |
-  "bayes"`) now lives in the scheduler crate and is shared by `dorfq` and the
-  simulator; out-of-range parameters are rejected by name.
+- Scheduler configuration (`[scheduler]`, `kind = "bisect" | "bayes"`) now
+  lives in the scheduler crate and is shared by `dorfq` and the simulator;
+  out-of-range parameters are rejected by name.
 - `dorfq run --config <path>`: the first end-to-end loop. It reads a TOML
   configuration naming a forge (the service hosting the repository and its
   pull requests) and a scheduler (the part that decides what to batch, land
   or eject), then repeatedly asks the forge what has changed and carries out
   the scheduler's plan. `--exit-when-idle` stops once there is nothing left
   to do. Running `dorfq` with no subcommand is now a usage error.
-- Only stand-ins exist on either side so far: a deliberately simple
-  `all-at-once` scheduler that tests every ready pull request in one batch
-  and ejects them all if it fails, and an in-memory `mock` forge that plays
-  a scripted scenario. Try it with the shipped example,
-  `crates/dorfq/examples/mock.toml`.
+- Only stand-ins exist on either side so far: a placeholder scheduler that
+  tests every ready pull request in one batch and ejects them all if it
+  fails, and an in-memory `mock` forge that plays a scripted scenario. Try
+  it with the shipped example, `crates/dorfq/examples/mock.toml`.
 - The contract between scheduler and forge (`dorfq-core`) is fixed, so the
   two sides can now be developed independently. Its rules are written down
   in `crates/dorfq-core`.

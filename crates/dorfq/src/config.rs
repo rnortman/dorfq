@@ -416,6 +416,7 @@ tick_millis = 60000
                 ..
             }
         ));
+        assert!(matches!(config.scheduler, SchedulerConfig::Bayes(_)));
     }
 
     #[test]

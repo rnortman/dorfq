@@ -4,13 +4,9 @@
 #   make sim ARGS="run --config $PWD/crates/dorfq-sim/examples/busy.toml"
 #
 # dorfq's columns share eight lanes; github-like runs on sixteen, the
-# concurrency GitHub's queue is given in practice. bayes is the status quo,
-# at eight lanes and max_batch 8; bayes-tree is the tree of futures at the
-# same settings, so the two differ only in their flags. Bisect runs at cap
-# 1 on eight lanes, the naive queue under dorfq's admission. Every
-# replication drains. Here, bayes lands 322 (10 bad and 0.0 good ejected,
-# 1.0 runner-hours per landed), bayes-tree 325 (9, 0.0, 1.0), bisect 270
-# (24, 22, 2.6) and github-like 277 (6, 23, 2.8).
+# concurrency GitHub's queue is given in practice. bayes and bayes-tree run
+# at eight lanes and max_batch 8 and differ only in their flags. bisect runs
+# at cap 1 on eight lanes: the pipelined queue under dorfq's admission.
 
 seed = 1                   # master seed; every replication's streams derive from it
 replications = 4           # independent runs per policy, each from its own seed; the table shows their mean [min–max]
@@ -35,12 +31,6 @@ stack_growth_sizes = [3, 2, 1]   # relative weights of that burst bringing 1, 2 
 stack_growth_minutes = { min = 30, max = 480 }   # uniform delay from a stack's arrival to that second burst
 p_atomic = 0.2                # a stack lands only whole
 
-# What pooling costs with no failure response at all.
-[[policy]]
-name = "all-at-once"         # the column's name in the table and on the page
-admission = "label"          # dorfq's: in the queue from arrival, held until its own CI passes
-kind = "all-at-once"         # the scheduler: one batch of everything ready, and on failure eject every member
-
 # GitHub's merge queue, approximately: each pull request built on top of
 # the ones ahead of it, at the concurrency GitHub's queue is given in
 # practice; a failed one is removed once everything ahead of it passed,
@@ -53,7 +43,7 @@ kind = "bisect"              # the scheduler: pipelined batches, a failed one sp
 lanes = 16                   # most batches in flight at once
 max_batch = 1                # most pull requests one batch may hold
 
-# The pipelined bisect at its best measured cap here: no pooling.
+# The pipelined bisect under dorfq's admission, at cap 1: no pooling.
 [[policy]]
 name = "bisect"              # the column's name in the table and on the page
 admission = "label"          # dorfq's: in the queue from arrival, held until its own CI passes
@@ -61,8 +51,8 @@ kind = "bisect"              # the scheduler: pipelined batches, a failed one sp
 lanes = 8                    # most batches in flight at once
 max_batch = 1                # most pull requests one batch may hold
 
-# The Bayesian scheduler at the status-quo flags, which measured best:
-# one chain of batches built to land, with culprit finders beside it.
+# The Bayesian scheduler with chain speculation: one chain of batches built
+# to land, with culprit finders beside it.
 [[policy]]
 name = "bayes"               # the column's name in the table and on the page
 admission = "label"          # dorfq's: in the queue from arrival, held until its own CI passes
