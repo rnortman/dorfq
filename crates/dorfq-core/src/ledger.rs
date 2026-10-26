@@ -665,6 +665,7 @@ mod tests {
             base: PrBase::Trunk,
             status: PrStatus::Ready,
             stack: StackPolicy::Splittable,
+            behind: 0,
         }
     }
 

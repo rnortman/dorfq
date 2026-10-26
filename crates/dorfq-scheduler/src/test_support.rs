@@ -22,13 +22,29 @@ pub(crate) fn tip(id: u64) -> Sha {
     sha(2000 + id)
 }
 
-/// A pull request on trunk at its original head, with `status`.
+/// The staleness every builder below reports, unless it says otherwise:
+/// the landings since the pull request's own CI started.
+pub(crate) const BEHIND: u32 = 25;
+
+/// A pull request on trunk at its original head, with `status`, at
+/// [`BEHIND`].
 pub(crate) fn pr(number: u64, status: PrStatus) -> PrSnapshot {
-    PrSnapshot::new(PrNumber(number), sha(number), PrBase::Trunk, status)
+    PrSnapshot::new(PrNumber(number), sha(number), PrBase::Trunk, status, BEHIND)
 }
 
 pub(crate) fn ready(number: u64) -> PrSnapshot {
     pr(number, PrStatus::Ready)
+}
+
+/// `pr`, reporting `behind` landings since its own CI started.
+pub(crate) fn stale(mut pr: PrSnapshot, behind: u32) -> PrSnapshot {
+    pr.behind = behind;
+    pr
+}
+
+/// A ready pull request whose own CI ran against the current trunk.
+pub(crate) fn fresh(number: u64) -> PrSnapshot {
+    stale(ready(number), 0)
 }
 
 /// A pull request the forge holds for `hold`.
@@ -60,6 +76,15 @@ pub(crate) fn atomic_stacked(number: u64, base: u64) -> PrSnapshot {
 
 pub(crate) fn ready_all(numbers: &[u64]) -> Vec<PrSnapshot> {
     numbers.iter().map(|&n| ready(n)).collect()
+}
+
+/// [`ready_all`], after `landings` more landings than [`BEHIND`]: what a
+/// forge reports once trunk has moved under them.
+pub(crate) fn ready_after(numbers: &[u64], landings: u32) -> Vec<PrSnapshot> {
+    numbers
+        .iter()
+        .map(|&n| stale(ready(n), BEHIND + landings))
+        .collect()
 }
 
 /// A pull request re-pushed to a head no batch was built with.

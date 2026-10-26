@@ -23,6 +23,11 @@
 //!    facts. Effects return `Ok(())`; their consequences appear in the next
 //!    observation. A forge keeps a batch in [`Observation::batches`] from
 //!    [`Forge::start_batch`] until [`Forge::retire`], whatever its state.
+//!    What a pull request's own CI covered is the forge's to report,
+//!    through [`PrSnapshot::behind`], which grows with every change to
+//!    trunk whether or not the queue made it: a scheduler counts the
+//!    landings it observes, and `behind` is the only fact it has about the
+//!    trunk changes it did not.
 //!    *Enforced by* the types (an effect returns `Result<(), ForgeError>`)
 //!    and each forge's tests, which observe a batch after every effect
 //!    until it is retired.
@@ -328,17 +333,31 @@ pub struct PrSnapshot {
     /// Whether its ancestors may land without it. Default
     /// [`StackPolicy::Splittable`].
     pub stack: StackPolicy,
+    /// Trunk changes the latest own-CI run on this head did not cover: the
+    /// pull requests that reached trunk after the trunk that run started
+    /// against. Grows by every change to trunk while the head and its run
+    /// stand; falls when a newer own-CI run starts on the same head. A forge
+    /// that cannot tell what a run covered reports the changes since the
+    /// head's merge base with trunk, which is never fewer.
+    pub behind: u32,
 }
 
 impl PrSnapshot {
     /// A `PrSnapshot` with the given fields.
-    pub fn new(number: PrNumber, head: Sha, base: PrBase, status: PrStatus) -> PrSnapshot {
+    pub fn new(
+        number: PrNumber,
+        head: Sha,
+        base: PrBase,
+        status: PrStatus,
+        behind: u32,
+    ) -> PrSnapshot {
         PrSnapshot {
             number,
             head,
             base,
             status,
             stack: StackPolicy::Splittable,
+            behind,
         }
     }
 
@@ -925,10 +944,11 @@ mod tests {
             sha.clone(),
             PrBase::Pr(PrNumber(2)),
             status.clone(),
+            7,
         );
         assert_eq!(
-            (pr.number, &pr.head, pr.base, &pr.status),
-            (PrNumber(3), &sha, PrBase::Pr(PrNumber(2)), &status)
+            (pr.number, &pr.head, pr.base, &pr.status, pr.behind),
+            (PrNumber(3), &sha, PrBase::Pr(PrNumber(2)), &status, 7)
         );
         assert_eq!(pr.stack, StackPolicy::Splittable);
         let atomic = pr.clone().with_stack(StackPolicy::Atomic);

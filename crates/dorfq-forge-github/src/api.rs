@@ -34,6 +34,9 @@ pub trait GitHubApi {
     fn merge(&mut self, base_branch: &str, head: &Sha, message: &str) -> Result<Merge, ApiError>;
     /// True when `descendant` is `ancestor` or has it in its history.
     fn is_ancestor(&mut self, ancestor: &Sha, descendant: &Sha) -> Result<bool, ApiError>;
+    /// How `head` stands to `base`, and the commits `head` has that `base`
+    /// does not.
+    fn compare(&mut self, base: &Sha, head: &Sha) -> Result<Compare, ApiError>;
     /// Every open pull request in the repository.
     fn list_open_prs(&mut self) -> Result<Vec<PrSummary>, ApiError>;
     fn get_pr(&mut self, number: PrNumber) -> Result<PrDetail, ApiError>;
@@ -85,6 +88,27 @@ pub enum Merge {
     NothingToMerge,
     /// Git refused the merge.
     Conflict,
+}
+
+/// Two commits compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compare {
+    pub status: CompareStatus,
+    /// Commits in the head's history that are not in the base's.
+    pub ahead_by: u32,
+}
+
+/// Where the head of a comparison stands to its base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareStatus {
+    /// The same commit.
+    Identical,
+    /// The head has the base in its history.
+    Ahead,
+    /// The base has the head in its history.
+    Behind,
+    /// Neither has the other.
+    Diverged,
 }
 
 /// An open pull request, as the list endpoint reports it.
@@ -624,16 +648,18 @@ impl GitHubApi for RestClient {
     }
 
     fn is_ancestor(&mut self, ancestor: &Sha, descendant: &Sha) -> Result<bool, ApiError> {
-        let path = format!("/compare/{ancestor}...{descendant}");
+        let compared = self.compare(ancestor, descendant)?;
+        Ok(matches!(
+            compared.status,
+            CompareStatus::Identical | CompareStatus::Ahead
+        ))
+    }
+
+    fn compare(&mut self, base: &Sha, head: &Sha) -> Result<Compare, ApiError> {
+        let path = format!("/compare/{base}...{head}");
         let what = format!("GET {path}");
         let compared: CompareJson = decode(&what, self.json_call(Method::Get, &path, None)?)?;
-        match compared.status.as_str() {
-            "identical" | "ahead" => Ok(true),
-            "behind" | "diverged" => Ok(false),
-            other => Err(permanent(format!(
-                "{what}: unknown compare status {other:?}"
-            ))),
-        }
+        compare_of(&what, compared)
     }
 
     fn list_open_prs(&mut self) -> Result<Vec<PrSummary>, ApiError> {
@@ -1057,6 +1083,26 @@ struct CommitJson {
 #[derive(Deserialize)]
 struct CompareJson {
     status: String,
+    ahead_by: u32,
+}
+
+/// A compare response as a [`Compare`]; an unknown status is permanent.
+fn compare_of(what: &str, compared: CompareJson) -> Result<Compare, ApiError> {
+    let status = match compared.status.as_str() {
+        "identical" => CompareStatus::Identical,
+        "ahead" => CompareStatus::Ahead,
+        "behind" => CompareStatus::Behind,
+        "diverged" => CompareStatus::Diverged,
+        other => {
+            return Err(permanent(format!(
+                "{what}: unknown compare status {other:?}"
+            )));
+        }
+    };
+    Ok(Compare {
+        status,
+        ahead_by: compared.ahead_by,
+    })
 }
 
 #[derive(Deserialize)]

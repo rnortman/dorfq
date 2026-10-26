@@ -1119,3 +1119,30 @@ fn landing_a_parent_without_its_atomic_tip_is_permanent() {
         }
     );
 }
+
+#[test]
+fn behind_starts_from_the_scenario_grows_by_each_landing_and_resets_at_a_repush() {
+    let (mut forge, _) = forge(
+        "ci_ticks = 1\n[[pr]]\nnumber = 1\n[[pr]]\nnumber = 2\nbehind = 4\n\
+         [[pr]]\nnumber = 3\nbehind = 1\nrepush_at = 3\n\
+         [[pr]]\nnumber = 4\narrives_at = 3\nbehind = 2\n",
+    );
+    let behind = |o: &Observation| -> Vec<(u64, u32)> {
+        o.prs.iter().map(|p| (p.number.0, p.behind)).collect()
+    };
+    let first = forge.observe().unwrap();
+    assert_eq!(behind(&first), [(1, 0), (2, 4), (3, 1)]);
+    forge.start_batch(&start(1, &first.trunk, &[1, 2])).unwrap();
+    let decided = forge.observe().unwrap();
+    assert!(matches!(
+        state(&decided, 1),
+        BatchState::Testing {
+            ci: CiStatus::Passed,
+            ..
+        }
+    ));
+    forge.land(BatchId(1)).unwrap();
+    assert_eq!(behind(&forge.observe().unwrap()), [(3, 3)]);
+    // 3's re-push runs its own CI on today's trunk; 4 arrives with its own.
+    assert_eq!(behind(&forge.observe().unwrap()), [(3, 0), (4, 2)]);
+}

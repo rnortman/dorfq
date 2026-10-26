@@ -17,8 +17,9 @@ ratios were measured before the simulator modelled breakage against
 trunk, when `ejected_bad` also counted a pull request whose conflicting
 partner was merely queued, and the replications were cut off at a fixed
 drain. A pull request left queued costs the objective nothing. Two things to
-price, each as a flag measured by that sweep: a cost in the objective per
-pull request per hour it waits in the queue; and `w_reject`, which prices
+price, each as a flag measured by that sweep: `w_age`, a value per hour
+waited, shipped; the sweep has it as an axis and at `[0.02, 0.1]` the
+criterion was not met; and `w_reject`, which prices
 a resolution at one landing against a fresh batch's several. Done means a
 flag under which the tree is better than the chain on `ejected_bad` and
 on `ended_hours` at more than half of the compared points, as that sweep's

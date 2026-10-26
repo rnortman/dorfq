@@ -56,6 +56,15 @@
 //! process that dies between the moves and the fast-forward leaves them on
 //! trunk.
 //!
+//! # Staleness
+//!
+//! GitHub's checks on a head do not say what trunk the run merged with, so a
+//! pull request's [`PrSnapshot::behind`] is the commits trunk has that its
+//! head does not: the changes since the head's merge base with trunk, read
+//! fresh at every observation. It counts commits, not pull requests, so it
+//! overstates by the commits each landing brings; and it does not fall when
+//! a check re-runs on the same head.
+//!
 //! # Recovery
 //!
 //! [`GitHubForge`]'s `observe` reads every tracked batch back from its record
@@ -455,7 +464,14 @@ impl GitHubForge {
                     head_branch: summary.head_branch.clone(),
                 },
             );
-            prs.push(PrSnapshot::new(number, summary.head.clone(), base, status));
+            let behind = self.api.compare(&summary.head, &trunk)?.ahead_by;
+            prs.push(PrSnapshot::new(
+                number,
+                summary.head.clone(),
+                base,
+                status,
+                behind,
+            ));
         }
 
         prs.sort_by_key(|pr| pr.number);

@@ -86,6 +86,8 @@ struct SimPr {
     own: SplitMix64,
     /// Its own CI on its current head, from the request to the run's end.
     ci: Option<Run>,
+    /// The world's `landed_count` when its latest own-CI run started.
+    ci_landed: usize,
     /// Why the queue does not see it while it is in the world; `None` when
     /// it does.
     out: Option<Out>,
@@ -146,6 +148,8 @@ pub struct World {
     batches: BTreeMap<BatchId, SimBatch>,
     commits: BTreeMap<Sha, Commit>,
     trunk: Sha,
+    /// Pull requests landed so far.
+    landed_count: usize,
     next_commit: u64,
     next_pr: u64,
     events: BTreeMap<EventKey, Event>,
@@ -200,6 +204,7 @@ impl World {
             batches: BTreeMap::new(),
             commits: BTreeMap::from([(trunk.clone(), root)]),
             trunk,
+            landed_count: 0,
             next_commit: 2,
             next_pr: 1,
             events: BTreeMap::new(),
@@ -442,6 +447,13 @@ impl World {
         trunk_tree.sort();
         if trunk_tree != landed {
             return Err("trunk's tree is not the landed set".to_owned());
+        }
+        if self.landed_count != landed.len() {
+            return Err(format!(
+                "{} landings counted, {} pull requests landed",
+                self.landed_count,
+                landed.len()
+            ));
         }
         let batches = self.batches.values().map(|b| &b.run);
         let prs = self.prs.values().filter_map(|p| p.ci.as_ref());
@@ -767,6 +779,7 @@ impl World {
             withdraw: None,
             own: SplitMix64::new(key),
             ci: None,
+            ci_landed: self.landed_count,
             out: None,
         };
         let conflicts = pr.conflicts_with_trunk;
@@ -936,6 +949,7 @@ impl World {
         });
         let run = self.pr_ci_runs.len() - 1;
         p.ci = Some(Run::Running { run, done });
+        p.ci_landed = self.landed_count;
         self.note(|t| TraceEvent::PrCi {
             t,
             pr: pr.0,
@@ -1092,7 +1106,10 @@ impl World {
                     Some(b) if self.prs[&b].enqueued() => PrBase::Pr(b),
                     _ => PrBase::Trunk,
                 };
-                let snapshot = PrSnapshot::new(p.record.number, p.head.clone(), base, status);
+                let behind = u32::try_from(self.landed_count - p.ci_landed)
+                    .expect("a run's untested landings fit u32");
+                let snapshot =
+                    PrSnapshot::new(p.record.number, p.head.clone(), base, status, behind);
                 if p.atomic {
                     snapshot.with_stack(StackPolicy::Atomic)
                 } else {
@@ -1235,6 +1252,7 @@ impl Forge for World {
         }
         debug_assert_eq!(self.check_landed(&status.members), Ok(()));
         self.trunk = tip;
+        self.landed_count += status.members.len();
         self.last_progress = self.now;
         self.note(|t| TraceEvent::Land {
             t,

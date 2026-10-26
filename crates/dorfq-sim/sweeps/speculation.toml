@@ -4,12 +4,12 @@
 #
 # The bayes columns differ only in their flags; every policy axis names all
 # four, so at each point they run at the same lanes, max_batch, run_cost,
-# w_reject and priors. github-like is fixed at the concurrency GitHub's
+# w_reject, w_age and priors. github-like is fixed at the concurrency GitHub's
 # queue is given in practice and is named by the world axes alone. The summary reads every
 # column against bayes-chain, the status quo; the grid rows show, point by
 # point, where the best bayes beats github-like and where it does not.
 #
-# 384 points, five columns, two replications: 7,680 simulations.
+# 576 points, five columns, two replications: 5,760 simulations.
 
 seed = 1                   # master seed; every replication's streams derive from it
 replications = 2           # independent runs per policy and point, each from its own seed
@@ -24,7 +24,7 @@ ci_minutes = { min = 45, max = 120 }   # uniform duration of a batch's CI run (s
 pr_ci_minutes = { min = 45, max = 120 }   # uniform duration of a pull request's own CI run (swept with ci_minutes)
 rebase_minutes = { min = 15, max = 120 }   # uniform delay from a rebase becoming necessary to the author's push of it
 pr_ci_on_base_landed = true   # the repository re-runs a pull request's own CI when its base lands
-p_interact = 0.005         # a pair conflicts: a run with both fails; whichever lands first breaks the other (swept)
+p_interact = 0.001         # a pair conflicts: a run with both fails; whichever lands first breaks the other (swept)
 p_flake = 0.03             # a run fails for no reason in the tree (swept)
 p_conflict = 0.02          # a stack arrives with its root conflicting against trunk
 repush_per_hour = 0.02     # per open pull request, the rate at which its author pushes a new head
@@ -50,11 +50,11 @@ admission = "label"
 kind = "bayes"
 lanes = 8
 max_batch = 16
-p_bad = 0.05  # prior: broken against trunk at arrival; the world's own rate is 0, and every landing adds p_interact
-p_interact = 0.005
+p_interact = 0.001
 p_flake = 0.03
 run_cost = 0.5
 w_reject = 1.0
+w_age = 0.02
 eject_above = 0.9
 others_below = 0.1
 speculate_above = 0.0
@@ -69,11 +69,11 @@ admission = "label"
 kind = "bayes"
 lanes = 8
 max_batch = 16
-p_bad = 0.05  # prior: broken against trunk at arrival; the world's own rate is 0, and every landing adds p_interact
-p_interact = 0.005
+p_interact = 0.001
 p_flake = 0.03
 run_cost = 0.5
 w_reject = 1.0
+w_age = 0.02
 eject_above = 0.9
 others_below = 0.1
 speculate_above = 0.0
@@ -88,11 +88,11 @@ admission = "label"
 kind = "bayes"
 lanes = 8
 max_batch = 16
-p_bad = 0.05  # prior: broken against trunk at arrival; the world's own rate is 0, and every landing adds p_interact
-p_interact = 0.005
+p_interact = 0.001
 p_flake = 0.03
 run_cost = 0.5
 w_reject = 1.0
+w_age = 0.02
 eject_above = 0.9
 others_below = 0.1
 speculate_above = 0.0
@@ -107,11 +107,11 @@ admission = "label"
 kind = "bayes"
 lanes = 8
 max_batch = 16
-p_bad = 0.05  # prior: broken against trunk at arrival; the world's own rate is 0, and every landing adds p_interact
-p_interact = 0.005
+p_interact = 0.001
 p_flake = 0.03
 run_cost = 0.5
 w_reject = 1.0
+w_age = 0.02
 eject_above = 0.9
 others_below = 0.1
 speculate_above = 0.0
@@ -146,7 +146,7 @@ keys = [
     "policy.bayes-tree.p_interact",
     "policy.bayes-tree-transfer.p_interact",
 ]
-values = [0.002, 0.02]
+values = [0.001]   # one value: the interaction rate the grid is read at, off the busy world's
 
 [[axis]]
 keys = [
@@ -183,3 +183,12 @@ keys = [
     "policy.bayes-tree-transfer.w_reject",
 ]
 values = [1.0, 10.0]
+
+[[axis]]
+keys = [
+    "policy.bayes-chain.w_age",
+    "policy.bayes-full.w_age",
+    "policy.bayes-tree.w_age",
+    "policy.bayes-tree-transfer.w_age",
+]
+values = [0.0, 0.02, 0.1]

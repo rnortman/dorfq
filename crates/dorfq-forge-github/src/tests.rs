@@ -3289,3 +3289,42 @@ fn an_ejected_child_is_told_to_rebase_onto_its_base() {
         "{last}"
     );
 }
+
+fn behind(observation: &Observation) -> Vec<(u64, u32)> {
+    observation
+        .prs
+        .iter()
+        .map(|p| (p.number.0, p.behind))
+        .collect()
+}
+
+#[test]
+fn behind_is_the_commits_trunk_has_that_the_head_does_not() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    fake.advance_trunk();
+    fake.advance_trunk();
+    let head = fake.open_pr(2);
+    passed(&fake, &head);
+    fake.state().comments.insert(2, vec![marker("queued")]);
+    let (mut forge, _) = forge(&fake);
+    let compares = fake.calls_to(&["compare"]).len();
+    let observation = forge.observe().unwrap();
+    assert_eq!(behind(&observation), [(1, 2), (2, 0)]);
+    // One compare per enqueued pull request.
+    assert_eq!(fake.calls_to(&["compare"]).len() - compares, 2);
+
+    // The queue lands 2: trunk gains its head and the batch's merge.
+    forge.start_batch(&start(1, &fake.trunk(), &[2])).unwrap();
+    let tip = fake.get(&batch_ref(1)).expect("published");
+    passed(&fake, &tip);
+    forge.observe().unwrap();
+    forge.land(BatchId(1)).unwrap();
+    assert_eq!(behind(&forge.observe().unwrap()), [(1, 4)]);
+
+    // A re-push onto today's trunk covers it.
+    let pushed = fake.commit(&[fake.trunk()]);
+    fake.push(1, &pushed);
+    passed(&fake, &pushed);
+    assert_eq!(behind(&forge.observe().unwrap()), [(1, 0)]);
+}

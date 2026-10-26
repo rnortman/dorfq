@@ -57,11 +57,11 @@ fn bayes() -> SchedulerConfig {
     SchedulerConfig::Bayes(BayesConfig {
         lanes: 2,
         max_batch: 24,
-        p_bad: 0.05,
         p_interact: 0.002,
         p_flake: 0.02,
         run_cost: 0.5,
         w_reject: 1.0,
+        w_age: 0.0,
         eject_above: 0.9,
         others_below: 0.1,
         speculate_above: 0.0,

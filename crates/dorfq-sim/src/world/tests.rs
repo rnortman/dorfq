@@ -2420,3 +2420,52 @@ fn under_github_an_enqueued_pull_request_with_a_fix_pending_breaks_check_places(
     let message = w.check_invariants().unwrap_err();
     assert!(message.contains("pr 1 is enqueued unchecked"), "{message}");
 }
+
+fn behind(o: &Observation, pr: u64) -> u32 {
+    let p = o.prs.iter().find(|p| p.number == PrNumber(pr));
+    p.expect("observed").behind
+}
+
+#[test]
+fn behind_counts_the_landings_since_each_own_ci_run_started() {
+    let mut w = pr_ci_world(20);
+    let p = add(&mut w, false, 1);
+    let q = add(&mut w, false, 2);
+    let child = add(&mut w, false, 3);
+    let d = add(&mut w, false, 4);
+    stack(&mut w, child, p, false);
+    w.advance_to(1200);
+    let o = w.observe().unwrap();
+    assert!(o.prs.iter().all(|p| p.behind == 0));
+    land_now(&mut w, 1, &[q]);
+    let o = w.observe().unwrap();
+    assert_eq!([behind(&o, p), behind(&o, child), behind(&o, d)], [1, 1, 1]);
+    // A push's run starts against today's trunk.
+    w.fire(Event::Repush(PrNumber(d)));
+    assert_eq!(behind(&w.observe().unwrap(), d), 0);
+    // The base's landing re-runs the child's own CI on its head.
+    land_now(&mut w, 2, &[p]);
+    let o = w.observe().unwrap();
+    assert_eq!((behind(&o, child), behind(&o, d)), (0, 1));
+    assert_eq!(status(&o, child), pending());
+    assert_eq!(w.landed_count, 2);
+    assert_eq!(w.check_invariants(), Ok(()));
+    w.landed_count += 1;
+    let message = w.check_invariants().unwrap_err();
+    assert_eq!(message, "3 landings counted, 2 pull requests landed");
+}
+
+#[test]
+fn under_github_a_pull_request_appears_behind_by_the_landings_during_its_run() {
+    let mut w = admitting(Admission::Github, 30, 0);
+    let q = add(&mut w, false, 1);
+    w.advance_to(30 * 60);
+    let p = add(&mut w, false, 2);
+    assert_eq!(observed(&w.observe().unwrap()), [q]);
+    land_now(&mut w, 1, &[q]);
+    w.advance_to(60 * 60);
+    let o = w.observe().unwrap();
+    assert_eq!(observed(&o), [p]);
+    assert_eq!(behind(&o, p), 1);
+    assert_eq!(w.check_invariants(), Ok(()));
+}

@@ -15,6 +15,7 @@
   `speculation.toml` runs the four `bayes` flag combinations (the status-quo
   chain, the chain with `charge = "full"`, the tree, and the tree with
   `landing = "transfer"`) and a `github-like` column over arrival rate, CI
-  length, flake and interaction rates, `max_batch`, `lanes` and `run_cost`;
+  length, flake rate, `max_batch`, `lanes`, `run_cost`, `w_reject` and
+  `w_age`, at an interaction rate of 0.001;
   `bisect-cap.toml` runs `bisect`'s batch cap at two capacities in the busy
   example's world.

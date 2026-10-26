@@ -2,12 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use dorfq_core::{BatchId, PrNumber, PrSnapshot, Sha};
+use dorfq_core::{BatchId, Hold, PrNumber, PrSnapshot, PrStatus, Sha};
 
 use crate::{Landing, ancestors, bases};
 
-/// The belief an alibi leaves: inference treats a cause at the floor as
-/// false, and decay can raise it again.
+/// The belief an alibi leaves a pair, which inference treats as false; and
+/// the complement of the cap on every belief, which keeps inference's
+/// `ln(1 − p)` finite.
 pub(crate) const FLOOR: f64 = 1e-6;
 
 /// The most failed runs the evidence keeps; the oldest goes first.
@@ -53,30 +54,60 @@ impl Cause {
 /// The prior probabilities the model starts from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Priors {
-    /// A pull request fails on its own against trunk.
-    pub(crate) p_bad: f64,
-    /// A pair fails only together; also the per-landing regrowth.
+    /// A pair fails only together; also the chance a landing breaks a
+    /// queued pull request that no run has tested with it.
     pub(crate) p_interact: f64,
     /// A run fails for no reason in the tree.
     pub(crate) p_flake: f64,
 }
 
-/// A run that failed, with the causes its tree exercised.
+/// A run that failed, with the causes its tree exercised and the trunk
+/// position it started on, credited with its own tree's landings since.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FailedRun {
     pub(crate) batch: BatchId,
     pub(crate) exercised: BTreeSet<Cause>,
+    pub(crate) at: i64,
 }
 
-/// One belief per queued pull request, materialised pairs, and the failed
-/// runs that are evidence about them.
+/// A queued pull request at the head the model holds.
+#[derive(Debug, Clone, PartialEq)]
+struct Held {
+    head: Sha,
+    /// The trunk position of its latest alibi: the trunk it is known good
+    /// against.
+    cleared: i64,
+    /// The trunk position at which the model first saw this head.
+    arrived: i64,
+    /// Under [`Landing::Transfer`], for each observation past `cleared`
+    /// that landed something, the position after it and the chance this
+    /// pull request survived its landings.
+    regrowth: Vec<(i64, f64)>,
+}
+
+impl Held {
+    /// Moves the cleared position to `at` if that is further along.
+    fn clear(&mut self, at: i64) {
+        self.cleared = self.cleared.max(at);
+        let cleared = self.cleared;
+        self.regrowth.retain(|&(q, _)| q > cleared);
+    }
+}
+
+/// One cleared position per queued pull request, materialised pairs, and
+/// the failed runs that are evidence about them.
+///
+/// Positions count the pull requests that reached trunk since the scheduler
+/// started; one cleared before that is at a negative position.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Model {
     pub(crate) priors: Priors,
-    /// What a landing does to the beliefs of what stays queued.
+    /// What a landing does to the pull requests that stay queued.
     landing: Landing,
-    /// Each queued pull request's head and its `Bad` belief.
-    bad: BTreeMap<PrNumber, (Sha, f64)>,
+    /// The trunk position as of the latest observation.
+    position: i64,
+    /// Each queued pull request the model holds.
+    bad: BTreeMap<PrNumber, Held>,
     /// Pairs a failed run exercised, with their belief.
     pairs: BTreeMap<Cause, f64>,
     /// Failed runs, oldest first.
@@ -90,6 +121,7 @@ impl Model {
         Model {
             priors,
             landing,
+            position: 0,
             bad: BTreeMap::new(),
             pairs: BTreeMap::new(),
             evidence: VecDeque::new(),
@@ -97,19 +129,24 @@ impl Model {
         }
     }
 
-    /// Aligns the beliefs with the queued pull requests: a new one starts at
-    /// the prior, and a re-pushed one is reset as a new one. A pull request
-    /// no longer at the head the model holds leaves every pair; its causes
+    /// Aligns the model with the queued pull requests at trunk `position`.
+    /// A new one, or a re-pushed one, is cleared at the trunk its own CI ran
+    /// on, [`PrSnapshot::behind`] pull requests back; one whose own CI has
+    /// passed on its head is cleared there if that is further along: the
+    /// run is an alibi against the trunk it started on. A pull request no
+    /// longer at the head the model holds leaves every pair; its causes
     /// leave every run if it is in `landed`, and otherwise every run that
-    /// exercised one of them leaves with it. `landed` is what reached trunk,
-    /// by the queue or by another hand. The bases of `prs` replace the stack
-    /// relation the model holds. Under [`Landing::Transfer`], first, every
-    /// pull request the model holds takes into its `Bad` belief its
-    /// pair belief with each one in `landed`, judged by the stack relation
-    /// held before this observation: once one of a pair is trunk, the pair
+    /// exercised one of them leaves with it. `landed` is what reached
+    /// trunk, by the queue or by another hand. The bases of `prs` replace
+    /// the stack relation the model holds. Under [`Landing::Transfer`],
+    /// first, every pull request the model holds and not in `landed` records
+    /// the chance it survived these landings, the product of its pair
+    /// beliefs' complements with each, judged by the stack relation held
+    /// before this observation: once one of a pair is trunk, the pair
     /// failing is the other failing on trunk.
-    pub(crate) fn sync(&mut self, prs: &[PrSnapshot], landed: &BTreeSet<PrNumber>) {
-        if self.landing == Landing::Transfer {
+    pub(crate) fn sync(&mut self, prs: &[PrSnapshot], landed: &BTreeSet<PrNumber>, position: i64) {
+        self.position = position;
+        if self.landing == Landing::Transfer && !landed.is_empty() {
             self.transfer(landed);
         }
         let base = bases(prs);
@@ -121,7 +158,7 @@ impl Model {
         let gone: Vec<PrNumber> = self
             .bad
             .iter()
-            .filter(|(pr, (head, _))| current.get(pr) != Some(&head))
+            .filter(|(pr, held)| current.get(pr) != Some(&&held.head))
             .map(|(pr, _)| *pr)
             .collect();
         for pr in gone {
@@ -136,16 +173,31 @@ impl Model {
             self.pairs.retain(|cause, _| !cause.involves(pr));
             self.bad.remove(&pr);
         }
-        for (pr, head) in current {
-            self.bad
-                .entry(pr)
-                .or_insert_with(|| (head.clone(), self.priors.p_bad));
+        // TODO(bayes-unobserved-trunk-change): `behind` is read here at
+        // first sight and afterwards only as an alibi (`clear` is a `max`);
+        // a rise on an unchanged head — a trunk change the queue did not
+        // make — never moves a cleared position back, and the trunk
+        // position counts only observed departures, so a pull request
+        // cleared at the current trunk cannot be blamed for anything that
+        // breaks it after that.
+        for pr in prs {
+            let own = position - i64::from(pr.behind);
+            let held = self.bad.entry(pr.number).or_insert_with(|| Held {
+                head: pr.head.clone(),
+                cleared: own,
+                arrived: position,
+                regrowth: Vec::new(),
+            });
+            if own_ci_passed(&pr.status) {
+                held.clear(own);
+            }
         }
         self.prune();
     }
 
     /// Each pull request the model holds, other than those in `landed`,
-    /// takes in its pair belief with each of `landed`, up to `1 − FLOOR`.
+    /// records at the current position the chance it survived them: the
+    /// product of `1 − ` its pair belief with each.
     fn transfer(&mut self, landed: &BTreeSet<PrNumber>) {
         let survive: Vec<(PrNumber, f64)> = self
             .bad
@@ -160,8 +212,8 @@ impl Model {
             })
             .collect();
         for (pr, survive) in survive {
-            if let Some((_, p)) = self.bad.get_mut(&pr) {
-                *p = (1.0 - (1.0 - *p) * survive).min(1.0 - FLOOR);
+            if let Some(held) = self.bad.get_mut(&pr) {
+                held.regrowth.push((self.position, survive));
             }
         }
     }
@@ -179,7 +231,7 @@ impl Model {
     pub(crate) fn exercised(&self, tree: &[(PrNumber, Sha)]) -> BTreeSet<Cause> {
         let known: Vec<PrNumber> = tree
             .iter()
-            .filter(|(pr, head)| self.bad.get(pr).is_some_and(|(h, _)| h == head))
+            .filter(|(pr, head)| self.bad.get(pr).is_some_and(|held| held.head == *head))
             .map(|(pr, _)| *pr)
             .collect();
         let mut causes: BTreeSet<Cause> = known.iter().map(|&pr| Cause::Bad(pr)).collect();
@@ -191,13 +243,66 @@ impl Model {
         causes
     }
 
-    /// A run over `tree` passed: every cause it exercised is set to the floor.
-    pub(crate) fn passed(&mut self, tree: &[(PrNumber, Sha)]) {
+    /// The chance that `k` landings, each breaking with `p_interact`, broke
+    /// a pull request: 0 for no landing, up to `1 − FLOOR`.
+    pub(crate) fn regrown(&self, k: i64) -> f64 {
+        (1.0 - (1.0 - self.priors.p_interact).powf(k.max(0) as f64)).min(1.0 - FLOOR)
+    }
+
+    /// The chance that nothing reaching trunk in positions `(a, b]` broke
+    /// queued pull request `pr`: 1 when `a ≥ b`. Under [`Landing::Decay`]
+    /// every landing counts `1 − p_interact`; under [`Landing::Transfer`]
+    /// each landing observation counts what it recorded, and each landing
+    /// before the model first saw the head `1 − p_interact`.
+    pub(crate) fn survive(&self, pr: PrNumber, a: i64, b: i64) -> f64 {
+        if a >= b {
+            return 1.0;
+        }
+        match self.landing {
+            Landing::Decay => 1.0 - self.regrown(b - a),
+            Landing::Transfer => {
+                let held = &self.bad[&pr];
+                let recorded: f64 = held
+                    .regrowth
+                    .iter()
+                    .filter(|&&(q, _)| a < q && q <= b)
+                    .map(|&(_, survive)| survive)
+                    .product();
+                recorded * (1.0 - self.regrown(held.arrived.min(b) - a))
+            }
+        }
+    }
+
+    /// The chance that something reaching trunk in positions `(a, b]` broke
+    /// queued pull request `pr`, up to `1 − FLOOR`.
+    pub(crate) fn broken_between(&self, pr: PrNumber, a: i64, b: i64) -> f64 {
+        match self.landing {
+            Landing::Decay => self.regrown(b - a),
+            Landing::Transfer => (1.0 - self.survive(pr, a, b)).min(1.0 - FLOOR),
+        }
+    }
+
+    /// The trunk position as of the latest observation.
+    pub(crate) fn position(&self) -> i64 {
+        self.position
+    }
+
+    /// The position queued pull request `pr` is cleared at, if the model
+    /// holds it.
+    pub(crate) fn cleared(&self, pr: PrNumber) -> Option<i64> {
+        self.bad.get(&pr).map(|held| held.cleared)
+    }
+
+    /// A run over `tree` passed, started on the trunk at position `covered`
+    /// credited with its tree's landings since: every `Bad` it exercised is
+    /// cleared there unless a newer alibi cleared it further along, and
+    /// every pair it exercised is set to the floor.
+    pub(crate) fn passed(&mut self, tree: &[(PrNumber, Sha)], covered: i64) {
         for cause in self.exercised(tree) {
             match cause {
                 Cause::Bad(pr) => {
-                    if let Some((_, p)) = self.bad.get_mut(&pr) {
-                        *p = FLOOR;
+                    if let Some(held) = self.bad.get_mut(&pr) {
+                        held.clear(covered);
                     }
                 }
                 Cause::Pair(..) => {
@@ -210,39 +315,36 @@ impl Model {
         self.prune();
     }
 
-    /// Batch `batch` failed over `tree`: the run joins the evidence, and the
-    /// pairs it exercised that were not yet materialised start at the prior.
-    pub(crate) fn failed(&mut self, batch: BatchId, tree: &[(PrNumber, Sha)]) {
+    /// Batch `batch` failed over `tree`, started at position `at`: the run
+    /// joins the evidence, and the pairs it exercised that were not yet
+    /// materialised start at the prior.
+    pub(crate) fn failed(&mut self, batch: BatchId, tree: &[(PrNumber, Sha)], at: i64) {
         let exercised = self.exercised(tree);
         for cause in &exercised {
             if let Cause::Pair(..) = cause {
                 self.pairs.entry(*cause).or_insert(self.priors.p_interact);
             }
         }
-        self.evidence.push_back(FailedRun { batch, exercised });
+        self.evidence.push_back(FailedRun {
+            batch,
+            exercised,
+            at,
+        });
         while self.evidence.len() > MAX_EVIDENCE {
             self.evidence.pop_front();
         }
         self.prune();
     }
 
-    /// `landed` pull requests reached trunk: every other queued pull
-    /// request's `Bad` belief regrows by one interaction chance per landing,
-    /// up to `1 − FLOOR`, so inference's `ln(1 − p)` stays finite.
-    pub(crate) fn decay(&mut self, landed: &BTreeSet<PrNumber>) {
-        let survive = (1.0 - self.priors.p_interact).powi(landed.len() as i32);
-        for (pr, (_, p)) in &mut self.bad {
-            if !landed.contains(pr) {
-                *p = (1.0 - (1.0 - *p) * survive).min(1.0 - FLOOR);
-            }
-        }
-    }
-
-    /// The belief in `cause`: a pair not materialised is at the prior; a
-    /// pull request not queued, and a pair within one stack, are not causes.
+    /// The belief in `cause` now: for `Bad`, the chance a landing since its
+    /// cleared position broke it; a pair not materialised is at the prior;
+    /// a pull request not queued, and a pair within one stack, are not
+    /// causes.
     pub(crate) fn belief(&self, cause: Cause) -> f64 {
         match cause {
-            Cause::Bad(pr) => self.bad.get(&pr).map_or(0.0, |(_, p)| *p),
+            Cause::Bad(pr) => self.bad.get(&pr).map_or(0.0, |held| {
+                self.broken_between(pr, held.cleared, self.position)
+            }),
             Cause::Pair(i, j) => {
                 if self.bad.contains_key(&i) && self.bad.contains_key(&j) && !self.related(i, j) {
                     self.pairs
@@ -261,19 +363,29 @@ impl Model {
         &self.evidence
     }
 
-    /// The causes of `run` above the floor.
+    /// Whether `cause` could have failed a run started at position `at`:
+    /// a `Bad` cleared before that trunk, or a pair above the floor.
+    fn blames(&self, cause: Cause, at: i64) -> bool {
+        match cause {
+            Cause::Bad(pr) => self.cleared(pr).is_some_and(|cleared| cleared < at),
+            Cause::Pair(..) => self.belief(cause) > FLOOR,
+        }
+    }
+
+    /// The causes of `run` that could have failed it.
     pub(crate) fn effective<'a>(&'a self, run: &'a FailedRun) -> impl Iterator<Item = Cause> + 'a {
         run.exercised
             .iter()
             .copied()
-            .filter(|&cause| self.belief(cause) > FLOOR)
+            .filter(|&cause| self.blames(cause, run.at))
     }
 
-    /// The causes above the floor that a failed run over `tree` would blame.
+    /// The causes a run over `tree` started now would blame, were it to
+    /// fail.
     pub(crate) fn would_blame(&self, tree: &[(PrNumber, Sha)]) -> BTreeSet<Cause> {
         self.exercised(tree)
             .into_iter()
-            .filter(|&cause| self.belief(cause) > FLOOR)
+            .filter(|&cause| self.blames(cause, self.position))
             .collect()
     }
 
@@ -289,11 +401,26 @@ impl Model {
     }
 }
 
+/// Whether the forge reports the pull request's own CI passed on its head:
+/// ready, or held for something other than its own CI. A conflicting pull
+/// request's own CI is not reported.
+fn own_ci_passed(status: &PrStatus) -> bool {
+    match status {
+        PrStatus::Ready => true,
+        PrStatus::Waiting(holds) => {
+            !holds.contains(&Hold::OwnCiPending) && !holds.contains(&Hold::OwnCiFailed)
+        }
+        PrStatus::Conflicting(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{bad, members, model, pair, priors};
+    use super::super::test_support::{bad, members, model, pair, prior, priors};
     use super::*;
-    use crate::test_support::{ready, ready_all, repushed, stacked};
+    use crate::test_support::{
+        BEHIND, fresh, held, pr, ready, ready_after, ready_all, repushed, stacked, stale,
+    };
     use dorfq_core::PrBase;
 
     fn batches(model: &Model) -> Vec<u64> {
@@ -304,10 +431,22 @@ mod tests {
         BTreeSet::new()
     }
 
+    fn landing(prs: &[u64]) -> BTreeSet<PrNumber> {
+        prs.iter().copied().map(PrNumber).collect()
+    }
+
+    fn effective(model: &Model, run: usize) -> BTreeSet<Cause> {
+        model.effective(&model.evidence()[run]).collect()
+    }
+
+    fn close(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-15, "{a} against {b}");
+    }
+
     #[test]
     fn new_pull_requests_start_at_the_prior_and_pairs_at_theirs() {
         let model = model(&[1, 2]);
-        assert_eq!(model.belief(bad(1)), 0.05);
+        assert_eq!(model.belief(bad(1)), prior());
         assert_eq!(model.belief(pair(2, 1)), 0.002);
         assert_eq!(model.belief(bad(3)), 0.0);
         assert_eq!(model.belief(pair(1, 3)), 0.0);
@@ -324,55 +463,179 @@ mod tests {
     #[test]
     fn a_run_exercises_every_member_and_every_pair_of_its_tree() {
         let mut model = model(&[1, 2, 3]);
-        model.sync(&[ready_all(&[1, 3]), vec![repushed(2)]].concat(), &none());
+        model.sync(
+            &[ready_all(&[1, 3]), vec![repushed(2)]].concat(),
+            &none(),
+            0,
+        );
         // 2's batch head is gone, and 4 is not queued.
         let causes = model.exercised(&members(&[1, 2, 3, 4]));
         assert_eq!(causes, BTreeSet::from([bad(1), bad(3), pair(1, 3)]));
     }
 
     #[test]
-    fn alibi_sets_every_exercised_cause_to_the_floor() {
+    fn survival_is_per_landing_under_decay_and_recorded_under_transfer() {
+        let decay = model(&[1]);
+        let one = PrNumber(1);
+        close(decay.survive(one, -3, 2), 0.998f64.powi(5));
+        assert_eq!(decay.survive(one, 2, 2), 1.0);
+        assert_eq!(decay.survive(one, 3, 2), 1.0);
+        close(decay.regrown(3), 1.0 - decay.survive(one, 0, 3));
+        assert_eq!(decay.regrown(0), 0.0);
+        assert_eq!(decay.regrown(i64::from(u32::MAX)), 1.0 - FLOOR);
+
+        // Under transfer: two landings before 1 arrived at 0, then one
+        // observation landing 2 and 3 at position 2, and one landing 4,
+        // 1's stack relative, at 3.
+        let mut transfer = Model::new(priors(), Landing::Transfer);
+        transfer.sync(&ready_all(&[1, 2, 3]), &none(), 0);
+        transfer.sync(&ready_after(&[1], 2), &landing(&[2, 3]), 2);
+        transfer.sync(&[stale(ready(1), BEHIND + 2), stacked(4, 1)], &none(), 2);
+        transfer.sync(&[stale(ready(1), BEHIND + 3)], &landing(&[4]), 3);
+        close(transfer.survive(one, -2, 0), 0.998 * 0.998);
+        close(transfer.survive(one, 0, 2), 0.998 * 0.998);
+        close(transfer.survive(one, 1, 3), 0.998 * 0.998);
+        assert_eq!(transfer.survive(one, 2, 3), 1.0);
+        close(transfer.survive(one, -1, 3), 0.998f64.powi(3));
+    }
+
+    #[test]
+    fn a_pull_request_is_cleared_at_the_trunk_its_own_ci_ran_on() {
+        let mut model = Model::new(priors(), Landing::Decay);
+        model.sync(&[fresh(1), stale(ready(2), 7), ready(3)], &none(), 10);
+        assert_eq!(model.cleared(PrNumber(2)), Some(3));
+        close(model.belief(bad(2)), 1.0 - 0.998f64.powi(7));
+        assert_eq!(model.belief(bad(3)), prior());
+        // Cleared against the current trunk: no cause at all.
+        assert_eq!(model.belief(bad(1)), 0.0);
+        assert!(model.would_blame(&members(&[1])).is_empty());
+        // A re-push starts again at the new head's staleness.
+        model.sync(&[fresh(1), stale(repushed(2), 2), ready(3)], &none(), 10);
+        assert_eq!(model.cleared(PrNumber(2)), Some(8));
+    }
+
+    #[test]
+    fn a_passing_own_ci_run_on_the_same_head_moves_the_cleared_position_forward() {
+        let mut model = model(&[1, 2, 3, 4, 5]);
+        let prs = |first: PrSnapshot| {
+            let mut prs = vec![first];
+            prs.extend((2..=5).map(|n| stale(ready(n), 3)));
+            prs
+        };
+        // Pending, failed or conflicting: no run passed, nothing moves.
+        for status in [
+            PrStatus::Waiting(BTreeSet::from([Hold::OwnCiPending])),
+            PrStatus::Waiting(BTreeSet::from([Hold::OwnCiFailed])),
+            PrStatus::Conflicting(dorfq_core::ConflictWith::Trunk),
+        ] {
+            let mut waiting = model.clone();
+            waiting.sync(&prs(stale(pr(1, status.clone()), 3)), &none(), 0);
+            assert_eq!(waiting.cleared(PrNumber(1)), Some(-25), "{status:?}");
+            assert_eq!(waiting.cleared(PrNumber(2)), Some(-3), "{status:?}");
+        }
+        // Held for review, its own CI passed: moved like a ready one.
+        model.passed(&members(&[5]), 0);
+        model.sync(&prs(stale(held(1, Hold::Review), 3)), &none(), 0);
+        assert_eq!(model.cleared(PrNumber(1)), Some(-3));
+        assert_eq!(model.cleared(PrNumber(4)), Some(-3));
+        // A newer batch alibi already covered more: never back.
+        assert_eq!(model.cleared(PrNumber(5)), Some(0));
+        // Staleness that grows with the landings moves nothing.
+        model.sync(
+            &(1..=4).map(|n| stale(ready(n), 4)).collect::<Vec<_>>(),
+            &none(),
+            1,
+        );
+        assert_eq!(model.cleared(PrNumber(4)), Some(-3));
+        assert_eq!(model.belief(bad(4)), model.regrown(4));
+    }
+
+    #[test]
+    fn an_alibi_clears_every_exercised_cause() {
         let mut model = model(&[1, 2, 3]);
-        model.failed(BatchId(1), &members(&[1, 2, 3]));
-        model.passed(&members(&[1, 2]));
-        assert_eq!(model.belief(bad(1)), FLOOR);
-        assert_eq!(model.belief(bad(2)), FLOOR);
+        model.failed(BatchId(1), &members(&[1, 2, 3]), 0);
+        model.passed(&members(&[1, 2]), 0);
+        assert_eq!(model.belief(bad(1)), 0.0);
+        assert_eq!(model.belief(bad(2)), 0.0);
         assert_eq!(model.belief(pair(1, 2)), FLOOR);
-        assert_eq!(model.belief(bad(3)), 0.05);
+        assert_eq!(model.belief(bad(3)), prior());
         assert_eq!(model.belief(pair(1, 3)), 0.002);
-        let run = &model.evidence()[0];
-        let effective: Vec<Cause> = model.effective(run).collect();
-        assert_eq!(effective, vec![bad(3), pair(1, 3), pair(2, 3)]);
+        assert_eq!(
+            effective(&model, 0),
+            BTreeSet::from([bad(3), pair(1, 3), pair(2, 3)])
+        );
+    }
+
+    #[test]
+    fn an_alibi_from_a_moved_trunk_clears_at_its_covered_position_but_floors_pairs() {
+        let mut model = model(&[1, 2, 3]);
+        model.failed(BatchId(1), &members(&[1, 2, 3]), 0);
+        model.sync(&ready_after(&[1, 2, 3], 2), &none(), 2);
+        model.passed(&members(&[1, 2]), 0);
+        assert_eq!(model.cleared(PrNumber(1)), Some(0));
+        close(model.belief(bad(1)), model.regrown(2));
+        close(model.belief(bad(2)), model.regrown(2));
+        assert_eq!(model.belief(pair(1, 2)), FLOOR);
+        close(model.belief(bad(3)), model.regrown(i64::from(BEHIND) + 2));
+        // An older alibi never moves a newer one back.
+        model.passed(&members(&[1]), -4);
+        assert_eq!(model.cleared(PrNumber(1)), Some(0));
+    }
+
+    #[test]
+    fn an_alibi_after_a_failure_stops_it_blaming_and_no_landing_restores_the_blame() {
+        // 41, 42 and 43 on trunk; {41, 42, 43} fails at position 0 with each
+        // five landings behind; 41 then passes alone, covered at 0.
+        let prs = |landings: u32| -> Vec<PrSnapshot> {
+            [41, 42, 43]
+                .iter()
+                .map(|&n| stale(ready(n), 5 + landings))
+                .collect()
+        };
+        let mut model = Model::new(priors(), Landing::Decay);
+        model.sync(&prs(0), &none(), 0);
+        model.failed(BatchId(1), &members(&[41, 42, 43]), 0);
+        model.passed(&members(&[41]), 0);
+        // A singleton exercises no pair: the pairs stay at the prior.
+        let blamed = BTreeSet::from([bad(42), bad(43), pair(41, 42), pair(41, 43), pair(42, 43)]);
+        assert_eq!(effective(&model, 0), blamed);
+        model.sync(&prs(3), &landing(&[7, 8, 9]), 3);
+        assert_eq!(effective(&model, 0), blamed);
+        assert_eq!(
+            model.would_blame(&members(&[41])),
+            BTreeSet::from([bad(41)])
+        );
+        close(model.belief(bad(41)), model.regrown(3));
+    }
+
+    #[test]
+    fn a_failed_singleton_of_a_pull_request_cleared_against_its_trunk_is_a_flake() {
+        let mut model = Model::new(priors(), Landing::Decay);
+        model.sync(&[fresh(1)], &none(), 4);
+        model.failed(BatchId(1), &members(&[1]), 4);
+        assert!(model.evidence().is_empty());
     }
 
     #[test]
     fn an_alibi_does_not_materialise_a_pair() {
         let mut model = model(&[1, 2]);
-        model.passed(&members(&[1, 2]));
+        model.passed(&members(&[1, 2]), 0);
         // Not materialised, so still the prior for a pair never seen failing.
         assert_eq!(model.belief(pair(1, 2)), 0.002);
     }
 
     #[test]
-    fn decay_after_a_landing_of_k_raises_every_other_belief() {
-        let mut model = model(&[1, 2, 3, 4]);
-        model.passed(&members(&[4]));
-        model.decay(&BTreeSet::from([PrNumber(1), PrNumber(2)]));
-        let survive = 0.998f64 * 0.998;
-        assert_eq!(model.belief(bad(1)), 0.05);
-        assert!((model.belief(bad(3)) - (1.0 - 0.95 * survive)).abs() < 1e-15);
-        assert!((model.belief(bad(4)) - (1.0 - (1.0 - FLOOR) * survive)).abs() < 1e-15);
-        assert!(model.belief(bad(4)) > FLOOR);
-    }
-
-    #[test]
     fn a_repush_resets_the_belief_and_takes_its_runs_with_it() {
         let mut model = model(&[1, 2, 3]);
-        model.failed(BatchId(1), &members(&[1, 2, 3]));
-        model.failed(BatchId(2), &members(&[1, 3]));
-        model.passed(&members(&[2]));
-        model.sync(&[ready_all(&[1, 3]), vec![repushed(2)]].concat(), &none());
-        assert_eq!(model.belief(bad(2)), 0.05);
+        model.failed(BatchId(1), &members(&[1, 2, 3]), 0);
+        model.failed(BatchId(2), &members(&[1, 3]), 0);
+        model.passed(&members(&[2]), 0);
+        model.sync(
+            &[ready_all(&[1, 3]), vec![repushed(2)]].concat(),
+            &none(),
+            0,
+        );
+        assert_eq!(model.belief(bad(2)), prior());
         assert_eq!(model.belief(pair(1, 2)), 0.002);
         assert_eq!(batches(&model), vec![2]);
     }
@@ -380,8 +643,8 @@ mod tests {
     #[test]
     fn a_failed_run_materialises_its_pairs_at_the_prior() {
         let mut model = model(&[1, 2, 3]);
-        model.failed(BatchId(1), &members(&[1, 2]));
-        model.passed(&members(&[1, 2, 3]));
+        model.failed(BatchId(1), &members(&[1, 2]), 0);
+        model.passed(&members(&[1, 2, 3]), 0);
         // Materialised by the failure, so the pass reached it.
         assert_eq!(model.belief(pair(1, 2)), FLOOR);
         // Never in a failed run: the pass left it unmaterialised.
@@ -391,12 +654,12 @@ mod tests {
     #[test]
     fn a_run_whose_effective_set_empties_leaves() {
         let mut model = model(&[1, 2, 3]);
-        model.failed(BatchId(1), &members(&[1, 2]));
-        model.failed(BatchId(2), &members(&[2, 3]));
-        model.passed(&members(&[1, 2]));
+        model.failed(BatchId(1), &members(&[1, 2]), 0);
+        model.failed(BatchId(2), &members(&[2, 3]), 0);
+        model.passed(&members(&[1, 2]), 0);
         assert_eq!(batches(&model), vec![2]);
-        // 3's landing strips its causes, leaving only the floored Bad(2).
-        model.sync(&ready_all(&[1, 2]), &BTreeSet::from([PrNumber(3)]));
+        // 3's landing strips its causes, leaving only the cleared Bad(2).
+        model.sync(&ready_after(&[1, 2], 1), &landing(&[3]), 1);
         assert_eq!(batches(&model), Vec::<u64>::new());
     }
 
@@ -404,18 +667,18 @@ mod tests {
     fn a_landing_strips_its_causes_and_any_other_departure_takes_its_runs() {
         let failed = || {
             let mut model = model(&[1, 2, 3]);
-            model.failed(BatchId(1), &members(&[1, 2]));
-            model.failed(BatchId(2), &members(&[1, 3]));
-            model.failed(BatchId(3), &members(&[2, 3]));
+            model.failed(BatchId(1), &members(&[1, 2]), 0);
+            model.failed(BatchId(2), &members(&[1, 3]), 0);
+            model.failed(BatchId(3), &members(&[2, 3]), 0);
             model
         };
         let mut withdrawn = failed();
-        withdrawn.sync(&ready_all(&[2, 3]), &none());
+        withdrawn.sync(&ready_all(&[2, 3]), &none(), 0);
         assert_eq!(batches(&withdrawn), vec![3]);
         assert_eq!(withdrawn.belief(bad(1)), 0.0);
 
         let mut landed = failed();
-        landed.sync(&ready_all(&[2, 3]), &BTreeSet::from([PrNumber(1)]));
+        landed.sync(&ready_after(&[2, 3], 1), &landing(&[1]), 1);
         let exercised: Vec<BTreeSet<Cause>> = landed
             .evidence()
             .iter()
@@ -436,7 +699,7 @@ mod tests {
         // 3 on 2 on 1, and 4 on trunk.
         let prs = vec![ready(1), stacked(2, 1), stacked(3, 2), ready(4)];
         let mut model = Model::new(priors(), Landing::Decay);
-        model.sync(&prs, &none());
+        model.sync(&prs, &none(), 0);
         assert!(model.related(PrNumber(1), PrNumber(3)));
         assert!(model.related(PrNumber(3), PrNumber(2)));
         assert!(!model.related(PrNumber(3), PrNumber(4)));
@@ -453,7 +716,7 @@ mod tests {
             ])
         );
         assert_eq!(model.belief(pair(1, 3)), 0.0);
-        model.failed(BatchId(1), &members(&[1, 2, 3]));
+        model.failed(BatchId(1), &members(&[1, 2, 3]), 0);
         assert_eq!(model.belief(pair(1, 2)), 0.0);
         assert_eq!(
             model.would_blame(&members(&[1, 2, 3])),
@@ -464,16 +727,13 @@ mod tests {
         // stack, and 1 is no longer anything's ancestor.
         let mut retargeted = stacked(2, 1);
         retargeted.base = PrBase::Trunk;
-        model.sync(
-            &[retargeted, stacked(3, 2), ready(4)],
-            &BTreeSet::from([PrNumber(1)]),
-        );
+        model.sync(&[retargeted, stacked(3, 2), ready(4)], &landing(&[1]), 1);
         assert!(!model.related(PrNumber(1), PrNumber(2)));
         assert!(model.related(PrNumber(2), PrNumber(3)));
     }
 
     #[test]
-    fn decay_stops_below_one() {
+    fn a_belief_stops_below_one() {
         let mut model = Model::new(
             Priors {
                 p_interact: 0.5,
@@ -481,13 +741,14 @@ mod tests {
             },
             Landing::Decay,
         );
-        model.sync(&ready_all(&[1, 2, 3]), &none());
-        for _ in 0..60 {
-            model.decay(&BTreeSet::from([PrNumber(9)]));
-        }
+        model.sync(
+            &(1..=3).map(|n| stale(ready(n), 60)).collect::<Vec<_>>(),
+            &none(),
+            0,
+        );
         assert_eq!(model.belief(bad(1)), 1.0 - FLOOR);
-        model.failed(BatchId(1), &members(&[1, 2]));
-        model.failed(BatchId(2), &members(&[2, 3]));
+        model.failed(BatchId(1), &members(&[1, 2]), 0);
+        model.failed(BatchId(2), &members(&[2, 3]), 0);
         let inference = super::super::infer::Inference::of(&model).unwrap();
         for n in 1..=3 {
             let p = inference.posterior(&model, bad(n));
@@ -498,25 +759,20 @@ mod tests {
     /// A model at [`priors`] under `transfer`, holding `prs`.
     fn transferring(prs: &[PrSnapshot]) -> Model {
         let mut model = Model::new(priors(), Landing::Transfer);
-        model.sync(prs, &none());
+        model.sync(prs, &none(), 0);
         model
-    }
-
-    fn landing(prs: &[u64]) -> BTreeSet<PrNumber> {
-        prs.iter().copied().map(PrNumber).collect()
     }
 
     #[test]
     fn transfer_regrows_an_untouched_pair_exactly_as_decay_does() {
         let mut decayed = model(&[1, 2, 3, 4]);
-        decayed.passed(&members(&[4]));
-        decayed.decay(&landing(&[1, 2]));
+        decayed.passed(&members(&[4]), 0);
+        decayed.sync(&ready_after(&[3, 4], 2), &landing(&[1, 2]), 2);
         let mut transferred = transferring(&ready_all(&[1, 2, 3, 4]));
-        transferred.passed(&members(&[4]));
-        transferred.sync(&ready_all(&[3, 4]), &landing(&[1, 2]));
+        transferred.passed(&members(&[4]), 0);
+        transferred.sync(&ready_after(&[3, 4], 2), &landing(&[1, 2]), 2);
         for n in [3, 4] {
-            let (d, t) = (decayed.belief(bad(n)), transferred.belief(bad(n)));
-            assert!((d - t).abs() < 1e-15, "{n}: {d} {t}");
+            close(decayed.belief(bad(n)), transferred.belief(bad(n)));
         }
         assert_eq!(transferred.belief(bad(1)), 0.0);
     }
@@ -526,26 +782,25 @@ mod tests {
         let mut model = transferring(&ready_all(&[1, 2, 3]));
         // The failure materialises every pair at the prior; the pass alibis
         // 1, 2 and their pair.
-        model.failed(BatchId(1), &members(&[1, 2, 3]));
-        model.passed(&members(&[1, 2]));
-        model.sync(&ready_all(&[2, 3]), &landing(&[1]));
-        let floor_twice = 1.0 - (1.0 - FLOOR) * (1.0 - FLOOR);
-        assert!((model.belief(bad(2)) - floor_twice).abs() < 1e-15);
+        model.failed(BatchId(1), &members(&[1, 2, 3]), 0);
+        model.passed(&members(&[1, 2]), 0);
+        model.sync(&ready_after(&[2, 3], 1), &landing(&[1]), 1);
+        assert!((model.belief(bad(2)) - FLOOR).abs() < 1e-15);
         // Pair (1, 3) held the prior, so 3 regrows by it.
-        assert!((model.belief(bad(3)) - (1.0 - 0.95 * 0.998)).abs() < 1e-15);
+        close(model.belief(bad(3)), 1.0 - (1.0 - prior()) * 0.998);
     }
 
     #[test]
     fn transfer_leaves_a_child_whose_base_landed_and_a_repushed_one_alone() {
         // 2 on 1, and 3 on trunk.
         let mut model = transferring(&[ready(1), stacked(2, 1), ready(3)]);
-        let mut retargeted = stacked(2, 1);
+        let mut retargeted = stale(stacked(2, 1), BEHIND + 1);
         retargeted.base = PrBase::Trunk;
-        model.sync(&[retargeted, repushed(3)], &landing(&[1]));
+        model.sync(&[retargeted, repushed(3)], &landing(&[1]), 1);
         // The child's own CI tested it on its base, so nothing transfers.
-        assert!((model.belief(bad(2)) - 0.05).abs() < 1e-15);
-        // A re-pushed pull request starts again at the prior.
-        assert_eq!(model.belief(bad(3)), 0.05);
+        close(model.belief(bad(2)), prior());
+        // A re-pushed pull request starts again at its own staleness.
+        close(model.belief(bad(3)), prior());
     }
 
     #[test]
@@ -558,8 +813,8 @@ mod tests {
             Landing::Transfer,
         );
         let prs: Vec<u64> = (1..=40).collect();
-        model.sync(&ready_all(&prs), &none());
-        model.sync(&ready_all(&[40]), &landing(&prs[..39]));
+        model.sync(&ready_all(&prs), &none(), 0);
+        model.sync(&ready_after(&[40], 39), &landing(&prs[..39]), 39);
         assert_eq!(model.belief(bad(40)), 1.0 - FLOOR);
     }
 
@@ -567,7 +822,7 @@ mod tests {
     fn evidence_keeps_the_newest_64_runs() {
         let mut model = model(&[1, 2]);
         for id in 1..=70 {
-            model.failed(BatchId(id), &members(&[1, 2]));
+            model.failed(BatchId(id), &members(&[1, 2]), 0);
         }
         assert_eq!(model.evidence().len(), MAX_EVIDENCE);
         assert_eq!(batches(&model), (7..=70).collect::<Vec<_>>());
