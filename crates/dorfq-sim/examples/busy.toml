@@ -5,7 +5,7 @@
 #
 # dorfq's columns share eight lanes; github-like runs on sixteen, the
 # concurrency GitHub's queue is given in practice. bayes and bayes-tree run
-# at eight lanes and max_batch 8 and differ only in their flags. bisect runs
+# at eight lanes and max_batch 8 and differ only in `speculation`. bisect runs
 # at cap 1 on eight lanes: the pipelined queue under dorfq's admission.
 
 seed = 1                   # master seed; every replication's streams derive from it
@@ -68,8 +68,6 @@ eject_above = 0.9          # posterior at which a singled-out cause is ejected
 others_below = 0.1         # a run singles a cause out when every other cause in it is below this
 speculate_above = 0.0      # a candidate starts when its score exceeds this
 speculation = "chain"      # one chain of batches built to land, culprit finders on trunk; "tree" scores every node's branches
-charge = "discounted"      # run_cost weighed by the chance the batch's base stands; "full" charges it whole
-landing = "decay"          # a landing regrows every other belief by p_interact; "transfer" by each pair's belief
 
 # The tree of futures at the same settings: for every batch in flight,
 # what to run if it passes and if it fails, weighed by each future's chance.
@@ -88,5 +86,3 @@ eject_above = 0.9          # posterior at which a singled-out cause is ejected
 others_below = 0.1         # a run singles a cause out when every other cause in it is below this
 speculate_above = 0.0      # a candidate starts when its net score exceeds this
 speculation = "tree"       # for every batch in flight, what to run if it passes and if it fails, weighted by each future's chance; "chain" builds one chain
-charge = "full"            # run_cost charged whole whatever the chance the batch's base stands; "discounted" weighs it by that chance
-landing = "decay"          # a landing regrows every other belief by p_interact; "transfer" by each pair's belief

@@ -262,7 +262,7 @@ impl Solved {
             let cuts: Vec<i64> = cuts.iter().copied().collect();
             for w in cuts.windows(2) {
                 let (a, b) = (w[0], w[1]);
-                belief.insert(Var::Seg(x, a, b), model.broken_between(x, a, b));
+                belief.insert(Var::Seg(x, a, b), model.regrown(b - a));
             }
         }
         let sets: Vec<BTreeSet<Var>> = all[all.len() - read..]
@@ -500,7 +500,6 @@ mod tests {
     use super::super::model::Priors;
     use super::super::test_support::{bad, members, model, pair, prior, priors};
     use super::*;
-    use crate::Landing;
     use crate::test_support::{ready, stacked, stale};
     use dorfq_core::{BatchId, PrSnapshot};
 
@@ -884,7 +883,7 @@ mod tests {
             p_interact,
             ..priors()
         };
-        let mut model = Model::new(priors, Landing::Decay);
+        let mut model = Model::new(priors);
         let snapshots: Vec<_> = prs
             .iter()
             .enumerate()
@@ -1006,7 +1005,7 @@ mod tests {
         let prs = |landings: u32| -> Vec<PrSnapshot> {
             (1..=3).map(|n| stale(ready(n), 5 + landings)).collect()
         };
-        let mut model = Model::new(priors(), Landing::Decay);
+        let mut model = Model::new(priors());
         model.sync(&prs(0), &BTreeSet::new(), 0);
         model.failed(BatchId(1), &members(&[1, 2]), 0);
         model.sync(&prs(4), &BTreeSet::new(), 4);
@@ -1055,7 +1054,7 @@ mod tests {
         let prs = |landings: u32| -> Vec<PrSnapshot> {
             (41..=45).map(|n| stale(ready(n), 5 + landings)).collect()
         };
-        let mut model = Model::new(priors(), Landing::Decay);
+        let mut model = Model::new(priors());
         model.sync(&prs(0), &BTreeSet::new(), 0);
         model.failed(BatchId(1), &members(&[41, 42, 43, 44, 45]), 0);
         model.passed(&members(&[41]), 0);

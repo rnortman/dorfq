@@ -234,9 +234,10 @@ impl Scheduler for Bisect {
                         .map(|m| (m.pr, m.head.clone()))
                         .collect();
                     let reason = EjectReason::BatchFailed { batch: batch.id };
-                    // TODO(trunk-broken-probe): a flaky pass that landed a
-                    // bad pull request breaks trunk, after which every
-                    // singleton fails here and an innocent is ejected.
+                    // A pass that missed a real break lands a bad pull
+                    // request and breaks trunk, after which every singleton
+                    // fails here and an innocent is ejected; that is the
+                    // bisecting baseline's limit and is kept.
                     if let [single] = members.as_slice() {
                         if queued(single) {
                             ejections.eject(single.0, reason);

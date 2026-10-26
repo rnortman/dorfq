@@ -1,15 +1,16 @@
-# The four bayes variants against each other, and GitHub's queue beside
-# them, over the world and policy parameters that matter most. Run it with:
+# The two bayes speculation modes against each other, and GitHub's queue
+# beside them, over the world and policy parameters that matter most. Run it
+# with:
 #   make sweep ARGS="--config $PWD/crates/dorfq-sim/sweeps/speculation.toml"
 #
-# The bayes columns differ only in their flags; every policy axis names all
-# four, so at each point they run at the same lanes, max_batch, run_cost,
+# The bayes columns differ only in `speculation`; every policy axis names
+# both, so at each point they run at the same lanes, max_batch, run_cost,
 # w_reject, w_age and priors. github-like is fixed at the concurrency GitHub's
 # queue is given in practice and is named by the world axes alone. The summary reads every
 # column against bayes-chain, the status quo; the grid rows show, point by
 # point, where the best bayes beats github-like and where it does not.
 #
-# 576 points, five columns, two replications: 5,760 simulations.
+# 576 points, three columns, two replications: 3,456 simulations.
 
 seed = 1                   # master seed; every replication's streams derive from it
 replications = 2           # independent runs per policy and point, each from its own seed
@@ -59,27 +60,6 @@ eject_above = 0.9
 others_below = 0.1
 speculate_above = 0.0
 speculation = "chain"
-charge = "discounted"
-landing = "decay"
-
-# The chain with run_cost charged whole.
-[[policy]]
-name = "bayes-full"
-admission = "label"
-kind = "bayes"
-lanes = 8
-max_batch = 16
-p_interact = 0.001
-p_flake = 0.03
-run_cost = 0.5
-w_reject = 1.0
-w_age = 0.02
-eject_above = 0.9
-others_below = 0.1
-speculate_above = 0.0
-speculation = "chain"
-charge = "full"
-landing = "decay"
 
 # The tree of futures.
 [[policy]]
@@ -97,27 +77,6 @@ eject_above = 0.9
 others_below = 0.1
 speculate_above = 0.0
 speculation = "tree"
-charge = "full"
-landing = "decay"
-
-# The tree of futures with belief transfer at landing.
-[[policy]]
-name = "bayes-tree-transfer"
-admission = "label"
-kind = "bayes"
-lanes = 8
-max_batch = 16
-p_interact = 0.001
-p_flake = 0.03
-run_cost = 0.5
-w_reject = 1.0
-w_age = 0.02
-eject_above = 0.9
-others_below = 0.1
-speculate_above = 0.0
-speculation = "tree"
-charge = "full"
-landing = "transfer"
 
 [[axis]]
 keys = ["world.arrivals_per_hour"]
@@ -132,9 +91,7 @@ labels = ["ci-45-120", "ci-90-120"]
 keys = [
     "world.p_flake",
     "policy.bayes-chain.p_flake",
-    "policy.bayes-full.p_flake",
     "policy.bayes-tree.p_flake",
-    "policy.bayes-tree-transfer.p_flake",
 ]
 values = [0.01, 0.05]
 
@@ -142,53 +99,41 @@ values = [0.01, 0.05]
 keys = [
     "world.p_interact",
     "policy.bayes-chain.p_interact",
-    "policy.bayes-full.p_interact",
     "policy.bayes-tree.p_interact",
-    "policy.bayes-tree-transfer.p_interact",
 ]
 values = [0.001]   # one value: the interaction rate the grid is read at, off the busy world's
 
 [[axis]]
 keys = [
     "policy.bayes-chain.max_batch",
-    "policy.bayes-full.max_batch",
     "policy.bayes-tree.max_batch",
-    "policy.bayes-tree-transfer.max_batch",
 ]
 values = [16, 30]
 
 [[axis]]
 keys = [
     "policy.bayes-chain.lanes",
-    "policy.bayes-full.lanes",
     "policy.bayes-tree.lanes",
-    "policy.bayes-tree-transfer.lanes",
 ]
 values = [4, 8]
 
 [[axis]]
 keys = [
     "policy.bayes-chain.run_cost",
-    "policy.bayes-full.run_cost",
     "policy.bayes-tree.run_cost",
-    "policy.bayes-tree-transfer.run_cost",
 ]
 values = [0.5, 2.0]
 
 [[axis]]
 keys = [
     "policy.bayes-chain.w_reject",
-    "policy.bayes-full.w_reject",
     "policy.bayes-tree.w_reject",
-    "policy.bayes-tree-transfer.w_reject",
 ]
 values = [1.0, 10.0]
 
 [[axis]]
 keys = [
     "policy.bayes-chain.w_age",
-    "policy.bayes-full.w_age",
     "policy.bayes-tree.w_age",
-    "policy.bayes-tree-transfer.w_age",
 ]
 values = [0.0, 0.02, 0.1]

@@ -6,7 +6,7 @@ use dorfq_core::{
 };
 
 use super::*;
-use dorfq_scheduler::{BayesConfig, Charge, Landing, Speculation};
+use dorfq_scheduler::{BayesConfig, Speculation};
 
 /// The shipped example configuration.
 const EXAMPLE: &str = include_str!("../examples/sim.toml");
@@ -66,20 +66,16 @@ fn bayes() -> SchedulerConfig {
         others_below: 0.1,
         speculate_above: 0.0,
         speculation: Speculation::Chain,
-        charge: Charge::Discounted,
-        landing: Landing::Decay,
     })
 }
 
-/// [`bayes`] with every flag at its alternative to the status quo.
-fn bayes_flagged() -> SchedulerConfig {
+/// [`bayes`] under `speculation = "tree"`.
+fn bayes_tree() -> SchedulerConfig {
     let SchedulerConfig::Bayes(config) = bayes() else {
         unreachable!()
     };
     SchedulerConfig::Bayes(BayesConfig {
         speculation: Speculation::Tree,
-        charge: Charge::Full,
-        landing: Landing::Transfer,
         ..config
     })
 }
@@ -634,7 +630,7 @@ fn every_policy_drains_a_stacking_world_under_churn_under_either_admission() {
                 (a, SchedulerConfig::AllAtOnce {}),
                 (a, bisect()),
                 (a, bayes()),
-                (a, bayes_flagged()),
+                (a, bayes_tree()),
             ]
         })
     {
@@ -738,7 +734,7 @@ fn with_no_re_run_on_a_landed_base_nothing_is_billed_and_every_policy_drains() {
             SchedulerConfig::AllAtOnce {},
             bisect(),
             bayes(),
-            bayes_flagged(),
+            bayes_tree(),
         ] {
             for seed in 1..=2 {
                 let mut events = Vec::new();
@@ -852,7 +848,7 @@ fn every_policy_runs_cleanly_under_repushes_and_withdrawals() {
             SchedulerConfig::AllAtOnce {},
             bisect(),
             bayes(),
-            bayes_flagged(),
+            bayes_tree(),
         ] {
             for admission in [Admission::Label, Admission::Github] {
                 let (_, m) = replicate_cleanly(&config, admission, &scheduler, seed);

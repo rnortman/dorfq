@@ -75,7 +75,7 @@
 //! |---|---|---|
 //! | `started` | any | nothing: a build that died; its branches and record are deleted |
 //! | `testing <tip>` | at `<tip>` | `Testing { tip, ci }` |
-//! | `conflict …` | absent | `Conflict { pr, with }`; a leftover build or probe branch is deleted |
+//! | `conflict …` | absent | `Conflict { pr, with }` |
 //! | `landing <tip>` | at `<tip>` | `Landed { tip }` if `<tip>` is in trunk's history, else `Testing { tip, ci }` |
 //! | `landed <tip>` | any | `Landed { tip }` |
 //! | `refused <tip> …` | any | `LandRefused { tip, reason }` |
@@ -464,12 +464,9 @@ impl GitHubForge {
                     head_branch: summary.head_branch.clone(),
                 },
             );
-            // TODO(github-behind-every-tick): asks GitHub every tick for
-            // what the queue's own landings already determine.
-            // TODO(github-behind-counts-commits): counts commits, not
-            // merge commits.
-            // TODO(github-behind-tested-trunk): always the merge base; the
-            // estimate of the trunk own CI tested should be configurable.
+            // TODO(trunk-position-ownership): one `compare` per enqueued
+            // pull request per observation, in commits, from the merge base,
+            // for what the queue's own landings mostly determine.
             let behind = self.api.compare(&summary.head, &trunk)?.ahead_by;
             prs.push(PrSnapshot::new(
                 number,
@@ -593,12 +590,6 @@ impl GitHubForge {
                          building and was never published",
                         id.0
                     )));
-                }
-                // TODO(efficiency-conflict-recovery-reads-for-unreachable-leftovers)
-                for leftover in [branch(&build_branch(id)), branch(&probe_branch(id))] {
-                    if self.api.get_ref(&leftover)?.is_some() {
-                        self.api.delete_ref(&leftover)?;
-                    }
                 }
                 BatchState::Conflict { pr, with }
             }
@@ -1163,7 +1154,9 @@ fn enqueued_bases(
     settings: &Settings,
     landed: &BTreeSet<PrNumber>,
 ) -> BTreeMap<PrNumber, PrBase> {
-    // TODO(security-label-grants-unreviewed-landing-on-any-later-head)
+    // TODO(security-label-grants-unreviewed-landing-on-any-later-head):
+    // eligibility should follow GitHub's own verdict on the head; see the
+    // entry.
     let labelled: Vec<&PrSummary> = listed
         .values()
         .filter(|s| s.labels.contains(&settings.label))

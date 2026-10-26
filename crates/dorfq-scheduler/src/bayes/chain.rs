@@ -149,7 +149,7 @@ impl Bayes {
                 .map(|m| (m.pr, m.head.clone()))
                 .collect();
             if crate::is_pending(&batch.state) {
-                // TODO(bayes-joint-path-pass): pending batches whose trees
+                // TODO(bayes-landing-term): pending batches whose trees
                 // share a failed run do not pass independently.
                 p_end *= self.p_pass(inference, &members, &below);
             }
@@ -192,7 +192,7 @@ impl Bayes {
             });
         }
         for members in self.suspects(inference, &stacks, &pool, &BTreeSet::new()) {
-            // TODO(bayes-finder-valuation): a finder is scored at `p_node = 1`
+            // TODO(bayes-landing-term): a finder is scored at `p_node = 1`
             // with its members' full landing value, as though its pass lands;
             // under load a passed finder is retired, not landed (above), and
             // the score has no term for what the pass teaches.

@@ -467,7 +467,7 @@ fn a_moved_or_missing_batch_branch_is_permanent() {
 }
 
 #[test]
-fn a_conflict_record_is_a_conflict_and_leftover_branches_are_deleted() {
+fn a_conflict_record_is_a_conflict_and_stray_branches_are_left_alone() {
     let fake = FakeGitHub::new();
     fake.open_pr(1);
     fake.open_pr(2);
@@ -491,14 +491,18 @@ fn a_conflict_record_is_a_conflict_and_leftover_branches_are_deleted() {
             with: ConflictWith::Pr(PrNumber(1))
         }
     );
-    assert_eq!(fake.get(&branch("dorfq/build/5")), None);
-    assert_eq!(fake.get(&branch("dorfq/probe/5")), None);
+    // A branch no record points at is never read, and never deleted.
+    assert_eq!(fake.get(&branch("dorfq/build/5")), Some(base.clone()));
+    assert_eq!(fake.get(&branch("dorfq/probe/5")), Some(base));
     assert!(fake.get("refs/dorfq/batches/5").is_some());
-
-    // With nothing left over, a later observation deletes nothing.
-    let deletes = fake.calls_to(&["delete_ref"]).len();
-    forge.observe().unwrap();
-    assert_eq!(fake.calls_to(&["delete_ref"]).len(), deletes);
+    assert_eq!(fake.calls_to(&["delete_ref"]), Vec::<String>::new());
+    let reads = fake.calls_to(&["get_ref"]);
+    assert!(
+        reads
+            .iter()
+            .all(|c| !c.contains("dorfq/build/5") && !c.contains("dorfq/probe/5")),
+        "{reads:?}"
+    );
 }
 
 #[test]

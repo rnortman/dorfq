@@ -51,8 +51,9 @@ help:
 # the config) the clippy and rustfmt aspects over every Rust target. The tree scan runs last: it is the backstop
 # that sees the whole tracked tree. Every tool is pinned in MODULE.bazel and
 # fetched by checksum, so no lane can skip.
-# TODO(dependency-audit-lane): add a license and advisory audit of the Rust
-# dependency graph, run through Bazel.
+# TODO(dependency-audit-lane): a license and advisory audit of the Rust
+# dependency graph, through Bazel, as its own target run by a nightly CI job
+# — never by `check`.
 .PHONY: check
 check:
 	$(SCRUB) init --check

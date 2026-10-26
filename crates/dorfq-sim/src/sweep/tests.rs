@@ -1,4 +1,4 @@
-use dorfq_scheduler::{Charge, Landing, SchedulerConfig, Speculation};
+use dorfq_scheduler::{SchedulerConfig, Speculation};
 
 use super::*;
 use crate::config::Minutes;
@@ -397,19 +397,10 @@ fn bayes_settings(config: &SimConfig) -> Vec<(usize, usize, f64, f64, f64, f64, 
 }
 
 #[test]
-fn the_shipped_speculation_sweep_runs_four_bayes_variants_at_like_settings() {
+fn the_shipped_speculation_sweep_runs_both_bayes_variants_at_like_settings() {
     let sweep = SweepConfig::parse(include_str!("../../sweeps/speculation.toml")).unwrap();
     let names: Vec<&str> = sweep.base.policy.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(
-        names,
-        [
-            "github-like",
-            "bayes-chain",
-            "bayes-full",
-            "bayes-tree",
-            "bayes-tree-transfer"
-        ]
-    );
+    assert_eq!(names, ["github-like", "bayes-chain", "bayes-tree"]);
     assert_eq!(sweep.baseline, "bayes-chain");
     assert_eq!(sweep.points.len(), 576);
     let busy = SimConfig::parse(include_str!("../../examples/busy.toml")).unwrap();
@@ -419,19 +410,11 @@ fn the_shipped_speculation_sweep_runs_four_bayes_variants_at_like_settings() {
         .policy
         .iter()
         .filter_map(|p| match &p.scheduler {
-            SchedulerConfig::Bayes(b) => Some((b.speculation, b.charge, b.landing)),
+            SchedulerConfig::Bayes(b) => Some(b.speculation),
             SchedulerConfig::Bisect { .. } | SchedulerConfig::AllAtOnce {} => None,
         })
         .collect();
-    assert_eq!(
-        flags,
-        [
-            (Speculation::Chain, Charge::Discounted, Landing::Decay),
-            (Speculation::Chain, Charge::Full, Landing::Decay),
-            (Speculation::Tree, Charge::Full, Landing::Decay),
-            (Speculation::Tree, Charge::Full, Landing::Transfer),
-        ]
-    );
+    assert_eq!(flags, [Speculation::Chain, Speculation::Tree]);
     let mut max_batches = Vec::new();
     let mut w_rejects = Vec::new();
     let mut w_ages = Vec::new();
@@ -451,7 +434,7 @@ fn the_shipped_speculation_sweep_runs_four_bayes_variants_at_like_settings() {
         if !ci.contains(&world.ci_minutes) {
             ci.push(world.ci_minutes);
         }
-        assert_eq!(settings.len(), 4);
+        assert_eq!(settings.len(), 2);
         assert!(settings.iter().all(|s| *s == settings[0]), "{settings:?}");
         assert_eq!(
             (settings[0].2, settings[0].3),

@@ -47,7 +47,7 @@ mod test_support;
 
 pub use all_at_once::AllAtOnce;
 pub use bisect::Bisect;
-pub use config::{BayesConfig, Charge, ConfigError, Landing, SchedulerConfig, Speculation};
+pub use config::{BayesConfig, ConfigError, SchedulerConfig, Speculation};
 
 /// A pull request at a head: re-pushing it makes a different member.
 type Member = (PrNumber, Sha);
