@@ -464,6 +464,12 @@ impl GitHubForge {
                     head_branch: summary.head_branch.clone(),
                 },
             );
+            // TODO(github-behind-every-tick): asks GitHub every tick for
+            // what the queue's own landings already determine.
+            // TODO(github-behind-counts-commits): counts commits, not
+            // merge commits.
+            // TODO(github-behind-tested-trunk): always the merge base; the
+            // estimate of the trunk own CI tested should be configurable.
             let behind = self.api.compare(&summary.head, &trunk)?.ahead_by;
             prs.push(PrSnapshot::new(
                 number,
