@@ -1,5 +1,5 @@
 {
-  "checksum": "6bc6f23e99af0c108bd2fa72d3740aa75dc5708f34434d9ca340ba3e531ea39d",
+  "checksum": "b28f043ae6ed42fa219320f2bb1fd61a279d6cd6cff087d679989e1b0c03ef94",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -851,7 +851,7 @@
       ],
       "version": "0.2.12"
     },
-    "dorfq 0.0.0": {
+    "dorfq 0.1.0": {
       "common_attrs": {
         "deps": [
           {
@@ -885,9 +885,9 @@
           }
         }
       ],
-      "version": "0.0.0"
+      "version": "0.1.0"
     },
-    "dorfq-core 0.0.0": {
+    "dorfq-core 0.1.0": {
       "common_attrs": {
         "edition": "2024"
       },
@@ -907,9 +907,9 @@
           }
         }
       ],
-      "version": "0.0.0"
+      "version": "0.1.0"
     },
-    "dorfq-forge-github 0.0.0": {
+    "dorfq-forge-github 0.1.0": {
       "common_attrs": {
         "deps": [
           {
@@ -951,9 +951,9 @@
           }
         }
       ],
-      "version": "0.0.0"
+      "version": "0.1.0"
     },
-    "dorfq-forge-mock 0.0.0": {
+    "dorfq-forge-mock 0.1.0": {
       "common_attrs": {
         "deps": [
           {
@@ -983,9 +983,9 @@
           }
         }
       ],
-      "version": "0.0.0"
+      "version": "0.1.0"
     },
-    "dorfq-scheduler 0.0.0": {
+    "dorfq-scheduler 0.1.0": {
       "common_attrs": {
         "deps": [
           {
@@ -1017,9 +1017,9 @@
           }
         }
       ],
-      "version": "0.0.0"
+      "version": "0.1.0"
     },
-    "dorfq-sim 0.0.0": {
+    "dorfq-sim 0.1.0": {
       "common_attrs": {
         "deps": [
           {
@@ -1057,9 +1057,9 @@
           }
         }
       ],
-      "version": "0.0.0"
+      "version": "0.1.0"
     },
-    "dorfq-sim-wasm 0.0.0": {
+    "dorfq-sim-wasm 0.1.0": {
       "common_attrs": {
         "edition": "2024"
       },
@@ -1071,7 +1071,7 @@
       "package_url": "https://github.com/rnortman/dorfq",
       "repository": null,
       "targets": [],
-      "version": "0.0.0"
+      "version": "0.1.0"
     },
     "equivalent 1.0.3": {
       "common_attrs": {
@@ -4736,12 +4736,12 @@
   ],
   "direct_dev_deps": [],
   "workspace_members": {
-    "dorfq 0.0.0": "crates/dorfq",
-    "dorfq-core 0.0.0": "crates/dorfq-core",
-    "dorfq-forge-github 0.0.0": "crates/dorfq-forge-github",
-    "dorfq-forge-mock 0.0.0": "crates/dorfq-forge-mock",
-    "dorfq-scheduler 0.0.0": "crates/dorfq-scheduler",
-    "dorfq-sim 0.0.0": "crates/dorfq-sim",
-    "dorfq-sim-wasm 0.0.0": "crates/dorfq-sim-wasm"
+    "dorfq 0.1.0": "crates/dorfq",
+    "dorfq-core 0.1.0": "crates/dorfq-core",
+    "dorfq-forge-github 0.1.0": "crates/dorfq-forge-github",
+    "dorfq-forge-mock 0.1.0": "crates/dorfq-forge-mock",
+    "dorfq-scheduler 0.1.0": "crates/dorfq-scheduler",
+    "dorfq-sim 0.1.0": "crates/dorfq-sim",
+    "dorfq-sim-wasm 0.1.0": "crates/dorfq-sim-wasm"
   }
 }

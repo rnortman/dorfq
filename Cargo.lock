@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "dorfq"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "dorfq-core",
@@ -196,11 +196,11 @@ dependencies = [
 
 [[package]]
 name = "dorfq-core"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "dorfq-forge-github"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64",
  "dorfq-core",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "dorfq-forge-mock"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "dorfq-core",
  "serde",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "dorfq-scheduler"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "dorfq-core",
  "serde",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "dorfq-sim"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "dorfq-core",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "dorfq-sim-wasm"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "dorfq-sim",
 ]
