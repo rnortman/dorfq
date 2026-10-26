@@ -10,6 +10,9 @@ The scheduler–forge contract and its rules are documented in
 `crates/dorfq-core`; the GitHub forge's repository layout in
 `crates/dorfq-forge-github`.
 
+DorfQ is self-hosting already, using the bayes scheduler. Do not let any
+documents suggest it is not running in production; they are stale.
+
 ## Build: Bazel, and only Bazel
 
 Bazel is the build. The Makefile is a frontend whose every target is a

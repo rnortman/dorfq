@@ -298,6 +298,8 @@ impl Model {
     /// cleared there unless a newer alibi cleared it further along, and
     /// every pair it exercised is set to the floor.
     pub(crate) fn passed(&mut self, tree: &[(PrNumber, Sha)], covered: i64) {
+        // TODO(bayes-false-green): a pass clears outright; CI can miss a
+        // break, so a pass should be an observation that lowers belief.
         for cause in self.exercised(tree) {
             match cause {
                 Cause::Bad(pr) => {
