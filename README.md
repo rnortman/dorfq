@@ -59,9 +59,9 @@ you have a massive backlog and the PRs are still coming.
 You also, in the AI era, want a merge queue that shines with *high velocity* of
 submissions and *low confidence in their quality*. High velocity increases
 `rate`. Low confidence in quality means your CI had better be exhaustive -- more
-unit tests, more system-wide integration tests, extensive simulation testing (which is a
-very expensive kind of unit test), which makes `ci_wall_time` higher, and both
-of those conspire to make `ci_wall_time >> 1/rate`.
+unit tests, more system-wide integration tests, extensive simulation testing
+(which is a very expensive kind of integration test), which makes `ci_wall_time`
+higher, and both of those conspire to make `ci_wall_time >> 1/rate`.
 
 System-wide integration/simulation testing makes dependency analysis (only run
 what changed) less effective at reducing CI time; most advanced queue strategies
@@ -75,6 +75,10 @@ When dorfq accepts a PR into the pool, it takes responsibility for that PR until
 it explicitly hands responsibility back to the developer. Developers do not need
 to babysit; if dorfq accepted it, dorfq owns it, and it'll let you know when you
 need to take action. Or it'll just get it landed, if it can.
+
+You can, of course, put the PR into the merge pool before the PR has passed its
+own PR CI. DorfQ will hold it until it passes PR CI before testing it in merge
+batches. It's **fire and forget** for the most part.
 
 ### Support PR stacks and trees natively
 
