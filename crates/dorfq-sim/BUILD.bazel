@@ -4,6 +4,7 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 # The examples are the report site's inputs (`//site`).
 exports_files([
     "examples/busy.toml",
+    "examples/outage.toml",
     "examples/sim.toml",
 ])
 
@@ -38,6 +39,7 @@ rust_test(
     size = "small",
     compile_data = [
         "examples/busy.toml",
+        "examples/outage.toml",
         "examples/sim.toml",
         "sweeps/bisect-cap.toml",
         "sweeps/speculation.toml",

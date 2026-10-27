@@ -11,8 +11,13 @@
 //! since its author's last fix conflicts with it, or while its base is
 //! bad. A batch's run starts the instant the batch does, takes a uniform time and fails when, at its
 //! start, its tree held a bad pull request or a conflicting pair not yet
-//! landed, or when the flake draw fires. An ejection is justified only of
-//! a pull request bad at that instant. The world has no runner pool: CI capacity is not the
+//! landed, or an unrepaired break of trunk, unless it missed that at
+//! `p_miss`; or when the flake draw fires. A batch landed through a miss
+//! with a bad member breaks trunk: every run on a tree holding the break
+//! fails until a push repairs it in place, `trunk_fix_minutes` later. Any
+//! run, a batch's or a pull request's own, whose interval touches one of
+//! the `outages` windows fails whatever its tree. An
+//! ejection is justified only of a pull request bad at that instant. The world has no runner pool: CI capacity is not the
 //! constraint, and the only bound on concurrent batch runs is the
 //! scheduler's own `lanes`. Time is the simulator's: the scheduler never
 //! sees it.
@@ -30,11 +35,14 @@
 //! Every pull request also runs its own CI, beside the queue, each time it
 //! gets a head: at arrival and at every re-push. A run starts at once and
 //! takes a uniform time; a head change cancels the old head's run. It
-//! tests the head against trunk as of its start: it fails when the pull
-//! request is itself broken (not merely on a broken base), and its author
-//! then pushes a fix after a rebase delay, the only push that clears the
-//! breakage. As the GitHub forge does, the world reports a pull request
-//! `Waiting(OwnCiPending)` until its current head's run has passed, and
+//! tests the head merged with trunk as of its start: it fails when the
+//! pull request is itself broken (not merely on a broken base) or trunk
+//! is, unless it misses that at `p_miss`, and whenever it touches an
+//! outage. After a rebase delay its author then pushes a fix, the only push
+//! that clears the breakage, or, when the pull request was not broken,
+//! re-runs it on the same head once no outage holds and trunk is green,
+//! the wait traced `re-run N`. As
+//! the GitHub forge does, the world reports a pull request `Waiting(OwnCiPending)` until its current head's run has passed, and
 //! `Waiting(OwnCiFailed)` while its author fixes it, so no batch takes it
 //! before then. With `pr_ci_on_base_landed`, a landed base
 //! makes the pull requests stacked on it run again: the run of each direct

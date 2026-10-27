@@ -87,12 +87,15 @@ pub struct Streams {
     pub ci: SplitMix64,
     pub churn: SplitMix64,
     pub stacks: SplitMix64,
+    /// Whether a run over a broken tree misses the break; drawn only for
+    /// such a run.
+    pub misses: SplitMix64,
 }
 
 impl Streams {
     /// Replication `k`'s streams: its root is seeded with output `k`
     /// (0-based) of the master generator, and stream `j` with output `j` of
-    /// the root, in the order arrivals, truth, ci, churn, stacks.
+    /// the root, in the order arrivals, truth, ci, churn, stacks, misses.
     pub fn for_replication(master_seed: u64, k: u64) -> Streams {
         let mut master = SplitMix64::new(master_seed);
         let mut root_seed = master.next_u64();
@@ -106,6 +109,7 @@ impl Streams {
             ci: SplitMix64::new(root.next_u64()),
             churn: SplitMix64::new(root.next_u64()),
             stacks: SplitMix64::new(root.next_u64()),
+            misses: SplitMix64::new(root.next_u64()),
         }
     }
 }
@@ -184,7 +188,7 @@ mod tests {
     }
 
     fn all(s: &Streams) -> Vec<Vec<u64>> {
-        [&s.arrivals, &s.truth, &s.ci, &s.churn, &s.stacks]
+        [&s.arrivals, &s.truth, &s.ci, &s.churn, &s.stacks, &s.misses]
             .into_iter()
             .map(first_eight)
             .collect()

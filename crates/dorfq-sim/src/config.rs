@@ -55,6 +55,16 @@ pub struct WorldConfig {
     pub p_interact: f64,
     /// A run fails for no reason in the tree.
     pub p_flake: f64,
+    /// A run over a broken tree passes anyway: CI's miss rate, the false
+    /// green. It applies to batch runs and to pull requests' own CI alike;
+    /// a bad pull request landed through a miss breaks trunk.
+    pub p_miss: f64,
+    /// Uniform delay from a bad pull request landing to the push that
+    /// repairs trunk in place.
+    pub trunk_fix_minutes: Minutes,
+    /// CI outages: every run, batch or own, whose interval touches one
+    /// fails. May be empty; windows may overlap.
+    pub outages: Vec<Outage>,
     /// A stack arrives with its root conflicting against trunk; no other
     /// pull request can, being cut from the stack's branch.
     pub p_conflict: f64,
@@ -84,6 +94,32 @@ pub struct WorldConfig {
 pub struct Minutes {
     pub min: u64,
     pub max: u64,
+}
+
+/// A CI outage: the window `[start_hours, start_hours + hours)` on the
+/// world's clock, in hours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Outage {
+    pub start_hours: u64,
+    pub hours: u64,
+}
+
+impl Outage {
+    /// The window's start, in seconds.
+    pub fn from(&self) -> u64 {
+        self.start_hours * crate::HOUR
+    }
+
+    /// The window's end, exclusive, in seconds.
+    pub fn until(&self) -> u64 {
+        (self.start_hours + self.hours) * crate::HOUR
+    }
+
+    /// Whether a run over `[start, end]` touches the window.
+    pub fn touches(&self, start: u64, end: u64) -> bool {
+        start < self.until() && end >= self.from()
+    }
 }
 
 /// What the queue asks of a pull request before it sees it, and what
@@ -273,12 +309,14 @@ impl WorldConfig {
         let longest_pr_ci = minutes("pr_ci_minutes", self.pr_ci_minutes)?;
         let longest_rebase = minutes("rebase_minutes", self.rebase_minutes)?;
         let longest_growth = minutes("stack_growth_minutes", self.stack_growth_minutes)?;
+        let longest_fix = minutes("trunk_fix_minutes", self.trunk_fix_minutes)?;
         // The clock is u64 seconds: the deadline plus the longest delay must
         // stay below its end, so no delay and no deadline overflows it.
         let longest = longest_run
             .max(longest_pr_ci)
             .max(longest_rebase)
-            .max(longest_growth);
+            .max(longest_growth)
+            .max(longest_fix);
         let deadline =
             (u128::from(self.hours) + u128::from(self.drain_hours)) * u128::from(crate::HOUR);
         if deadline + longest >= u128::from(u64::MAX) {
@@ -287,8 +325,25 @@ impl WorldConfig {
                 "plus drain_hours and the longest delay must fit the simulator's clock",
             ));
         }
+        for outage in &self.outages {
+            if outage.hours == 0 {
+                return Err(invalid(
+                    "world.outages",
+                    "each outage lasts at least an hour",
+                ));
+            }
+            let until = (u128::from(outage.start_hours) + u128::from(outage.hours))
+                * u128::from(crate::HOUR);
+            if until >= u128::from(u64::MAX) {
+                return Err(invalid(
+                    "world.outages",
+                    "each outage must end within the simulator's clock",
+                ));
+            }
+        }
         probability("p_interact", self.p_interact)?;
         probability("p_flake", self.p_flake)?;
+        probability("p_miss", self.p_miss)?;
         probability("p_conflict", self.p_conflict)?;
         weights("stack_sizes", &self.stack_sizes)?;
         probability("p_stack_grows", self.p_stack_grows)?;
@@ -316,6 +371,9 @@ rebase_minutes = { min = 15, max = 120 }
 pr_ci_on_base_landed = true
 p_interact = 0.002
 p_flake = 0.02
+p_miss = 0.02
+trunk_fix_minutes = { min = 30, max = 180 }
+outages = []
 p_conflict = 0.02
 repush_per_hour = 0.0
 withdraw_per_hour = 0.0
@@ -386,6 +444,12 @@ max_batch = 16
             Minutes { min: 30, max: 480 }
         );
         assert_eq!(config.world.p_atomic, 0.2);
+        assert_eq!(config.world.p_miss, 0.02);
+        assert_eq!(
+            config.world.trunk_fix_minutes,
+            Minutes { min: 30, max: 180 }
+        );
+        assert_eq!(config.world.outages, []);
         let mean = config.world.mean_pull_requests_per_stack();
         assert!((mean - 4.74).abs() < 1e-9, "{mean}");
         let policies: Vec<_> = config
@@ -460,6 +524,12 @@ max_batch = 16
         assert_eq!(config.world.stack_growth_sizes, [3.0, 2.0, 1.0]);
         assert_eq!(config.world.pr_ci_minutes, Minutes { min: 45, max: 120 });
         assert_eq!(config.world.rebase_minutes, Minutes { min: 15, max: 120 });
+        assert_eq!(config.world.p_miss, 0.02);
+        assert_eq!(
+            config.world.trunk_fix_minutes,
+            Minutes { min: 30, max: 180 }
+        );
+        assert_eq!(config.world.outages, []);
         let admissions: Vec<Admission> = config.policy.iter().map(|p| p.admission).collect();
         assert_eq!(
             admissions,
@@ -505,10 +575,59 @@ max_batch = 16
     }
 
     #[test]
+    fn the_outage_example_is_the_busy_world_with_one_outage() {
+        let busy = SimConfig::parse(include_str!("../examples/busy.toml")).unwrap();
+        let outage = SimConfig::parse(include_str!("../examples/outage.toml")).unwrap();
+        assert_eq!(
+            outage.world.outages,
+            [Outage {
+                start_hours: 24,
+                hours: 12
+            }]
+        );
+        let mut world = outage.world.clone();
+        world.outages = Vec::new();
+        assert_eq!(world, busy.world);
+        assert_eq!(
+            (outage.seed, outage.replications),
+            (busy.seed, busy.replications)
+        );
+        assert_eq!(outage.policy, busy.policy);
+    }
+
+    #[test]
+    fn an_outage_window_is_half_open_and_a_run_touching_it_is_caught() {
+        let o = Outage {
+            start_hours: 1,
+            hours: 1,
+        };
+        assert_eq!((o.from(), o.until()), (3600, 7200));
+        // Ends before the window, ends at its start, in flight across it,
+        // inside it, starts at its end.
+        assert!(!o.touches(0, 3599));
+        assert!(o.touches(0, 3600));
+        assert!(o.touches(3000, 9000));
+        assert!(o.touches(5000, 5000));
+        assert!(o.touches(7199, 9000));
+        assert!(!o.touches(7200, 9000));
+    }
+
+    #[test]
+    fn overlapping_outages_and_one_past_the_deadline_are_legal() {
+        let outages = "[{ start_hours = 1, hours = 4 }, { start_hours = 2, hours = 1 }, \
+                       { start_hours = 5000, hours = 1 }]";
+        let world = SimConfig::parse(&with("outages", outages)).unwrap().world;
+        assert_eq!(world.outages.len(), 3);
+        let unknown = with("outages", "[{ start_hours = 1, hours = 1, end_hours = 2 }]");
+        assert!(rejected(&unknown).contains("end_hours"));
+    }
+
+    #[test]
     fn a_parsed_configuration_round_trips_through_its_serialisation() {
         for text in [
             include_str!("../examples/sim.toml"),
             include_str!("../examples/busy.toml"),
+            include_str!("../examples/outage.toml"),
         ] {
             let config = SimConfig::parse(text).unwrap();
             let json = serde_json::to_string(&config).unwrap();
@@ -534,6 +653,7 @@ max_batch = 16
         for (name, text) in [
             ("sim.toml", include_str!("../examples/sim.toml")),
             ("busy.toml", include_str!("../examples/busy.toml")),
+            ("outage.toml", include_str!("../examples/outage.toml")),
         ] {
             let config = SimConfig::parse(text).unwrap();
             let lanes: BTreeSet<usize> = config
@@ -557,6 +677,7 @@ max_batch = 16
         for (name, text) in [
             ("sim.toml", include_str!("../examples/sim.toml")),
             ("busy.toml", include_str!("../examples/busy.toml")),
+            ("outage.toml", include_str!("../examples/outage.toml")),
         ] {
             let parameters = text
                 .lines()
@@ -601,6 +722,7 @@ max_batch = 16
         for (field, value) in [
             ("p_interact", "-0.1"),
             ("p_flake", "2.0"),
+            ("p_miss", "1.5"),
             ("p_conflict", "-1.0"),
             ("p_stack_grows", "1.1"),
             ("p_atomic", "-0.5"),
@@ -611,6 +733,8 @@ max_batch = 16
             ("pr_ci_minutes", "{ min = 3, max = 2 }"),
             ("rebase_minutes", "{ min = 3, max = 2 }"),
             ("stack_growth_minutes", "{ min = 3, max = 2 }"),
+            ("trunk_fix_minutes", "{ min = 3, max = 2 }"),
+            ("outages", "[{ start_hours = 1, hours = 0 }]"),
         ] {
             let message = rejected(&with(field, value));
             assert!(message.contains(&format!("world.{field}")), "{message}");
@@ -672,10 +796,25 @@ max_batch = 16
             "{ min = 0, max = 18446744073709551615 }",
         ));
         assert!(growth.contains("world.stack_growth_minutes"), "{growth}");
-        for field in ["pr_ci_minutes", "rebase_minutes", "stack_growth_minutes"] {
+        let fix = rejected(&with(
+            "trunk_fix_minutes",
+            "{ min = 0, max = 18446744073709551615 }",
+        ));
+        assert!(fix.contains("world.trunk_fix_minutes"), "{fix}");
+        for field in [
+            "pr_ci_minutes",
+            "rebase_minutes",
+            "stack_growth_minutes",
+            "trunk_fix_minutes",
+        ] {
             let late = rejected(&with(field, "{ min = 0, max = 307445734561825860 }"));
             assert!(late.contains("world.hours"), "{field}: {late}");
         }
+        let outage = rejected(&with(
+            "outages",
+            "[{ start_hours = 5124095576030431, hours = 1 }]",
+        ));
+        assert!(outage.contains("world.outages"), "{outage}");
         // A rate small enough to mean "never" is legal.
         SimConfig::parse(&with("repush_per_hour", "1e-30")).unwrap();
     }
@@ -702,6 +841,9 @@ max_batch = 16
             "stack_growth_sizes",
             "stack_growth_minutes",
             "p_atomic",
+            "p_miss",
+            "trunk_fix_minutes",
+            "outages",
         ] {
             let line = WORLD.lines().find(|l| l.starts_with(&format!("{field} ")));
             let missing = WORLD.replace(&format!("{}\n", line.unwrap()), "");

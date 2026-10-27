@@ -23,9 +23,11 @@ replications with its range.
   simulation page reads. `make sim` runs the binary from Bazel's runfiles
   tree, so give every path absolute, as `$PWD/` does.
 
-The shipped scenarios are `crates/dorfq-sim/examples/busy.toml` and
-`crates/dorfq-sim/examples/sim.toml`. Every line of both is commented, and
-those comments are the file format's reference: copy one and edit it. A
+The shipped scenarios are `crates/dorfq-sim/examples/busy.toml`,
+`crates/dorfq-sim/examples/sim.toml` and
+`crates/dorfq-sim/examples/outage.toml`, the busy world with CI down from
+hour 24 to hour 36. Every line of each is commented, and those comments are
+the file format's reference: copy one and edit it. A
 scenario is a `[world]` table and one `[[policy]]` table per column; a
 policy's `kind` names its scheduler and the rest of the table is that
 scheduler's configuration, the same `[scheduler]` table `dorfq` reads.
@@ -50,7 +52,9 @@ file is a scenario file with two more top-level keys:
 - `baseline`, the policy the others are compared against;
 - `[[axis]]` tables, each with `keys` (fields such as
   `world.arrivals_per_hour` or `policy.bayes.max_batch`, set together),
-  `values`, and optional `labels`.
+  `values`, and optional `labels`. A value may be any TOML value, an array
+  of tables such as an `outages` list included; give such an axis `labels`,
+  since the default label is the value's TOML text.
 
 The sweep runs every point of the axes' cartesian product. It prints one row
 per point and policy with every metric's mean over the replications, then
@@ -99,5 +103,15 @@ Pull requests arrive as stacks, each with hidden truths: whether it conflicts
 with trunk, and which other pull requests it breaks when tested together.
 Each pull request runs its own CI beside the queue, and a policy's admission
 decides when the queue sees it. Batch runs take a uniform time and fail on a
-bad member, a conflicting pair or a flake. The crate documentation,
+bad member, a conflicting pair or a flake.
+
+CI is not perfect. A run over a broken tree, a batch's or a pull request's
+own, passes anyway at `p_miss`, so a bad pull request can land. Trunk is
+then broken: every run on it fails until a push repairs it in place,
+`trunk_fix_minutes` later, and the report counts `landed_bad` and
+`trunk_broken_hours`. Every run whose interval touches one of the
+`outages` windows fails. A pull request whose own CI failed for a broken
+trunk or an outage, not for itself, is not fixed: its author re-runs it on
+the same head once CI is back and trunk is repaired, the wait traced
+`re-run N`. The crate documentation,
 `crates/dorfq-sim/src/lib.rs`, states the model in full.

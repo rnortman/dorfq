@@ -24,6 +24,9 @@ fn small(p_interact: f64, p_flake: f64, p_conflict: f64) -> WorldConfig {
         pr_ci_on_base_landed: true,
         p_interact,
         p_flake,
+        p_miss: 0.0,
+        trunk_fix_minutes: Minutes { min: 0, max: 0 },
+        outages: vec![],
         p_conflict,
         repush_per_hour: 0.0,
         withdraw_per_hour: 0.0,
@@ -700,7 +703,7 @@ fn every_policy_drains_a_stacking_world_under_churn_under_either_admission() {
                 })
                 .collect();
             let landed = world.pr_records().into_iter().any(|r| {
-                stacked.contains(&r.number.0) && matches!(r.left, Some((_, Exit::Landed)))
+                stacked.contains(&r.number.0) && matches!(r.left, Some((_, Exit::Landed { .. })))
             });
             landed_stacked += usize::from(landed);
         }
@@ -721,6 +724,38 @@ fn every_policy_drains_a_stacking_world_under_churn_under_either_admission() {
         left_with_base > 0,
         "no pull request ever left with its base"
     );
+}
+
+#[test]
+fn re_runs_keep_every_life_checked() {
+    // A one-hour window inside six hours of arrivals, and misses that break
+    // trunk: own CI fails for both reasons, and its authors wait to re-run.
+    let world = WorldConfig {
+        outages: vec![crate::config::Outage {
+            start_hours: 2,
+            hours: 1,
+        }],
+        p_miss: 0.5,
+        trunk_fix_minutes: Minutes { min: 30, max: 90 },
+        ..small(0.02, 0.05, 0.02)
+    };
+    for admission in [Admission::Label, Admission::Github] {
+        let mut reruns = 0;
+        for seed in 1..=2 {
+            let mut events = Vec::new();
+            let (w, outcome) = replicate(&world, admission, &bayes(), seed, 0, Some(&mut events));
+            let what = format!("under {admission:?} at seed {seed}");
+            let end = outcome.unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(!end.cut_off, "{what}: {end:?}");
+            assert_eq!(w.check_invariants(), Ok(()), "{what}");
+            assert_eq!(crate::trace::check_lives(&events), Ok(()), "{what}");
+            reruns += events
+                .iter()
+                .filter(|e| matches!(e, TraceEvent::Rerun { .. }))
+                .count();
+        }
+        assert!(reruns > 0, "no re-run under {admission:?}");
+    }
 }
 
 #[test]
@@ -977,6 +1012,7 @@ fn the_json_document_holds_every_policy_and_a_trace_from_time_zero() {
     assert_eq!(document["name"], "stacking");
     assert_eq!(document["config_text"], EXAMPLE);
     assert_eq!(document["config"]["world"]["p_stack_grows"], 0.5);
+    assert_eq!(document["config"]["world"]["p_miss"], 0.0);
     assert!(document["config"]["world"].get("p_stacked").is_none());
     assert!(document["config"]["world"].get("runners").is_none());
     let policies = document["policies"].as_array().unwrap();
@@ -987,6 +1023,12 @@ fn the_json_document_holds_every_policy_and_a_trace_from_time_zero() {
         let replications = policy["replications"].as_array().unwrap();
         assert_eq!(replications.len(), 2);
         assert!(replications.iter().all(|r| r["metrics"].is_object()));
+        assert!(
+            replications
+                .iter()
+                .all(|r| r["metrics"]["landed_bad"].is_u64()
+                    && r["metrics"]["trunk_broken_hours"].is_f64())
+        );
         let trace = policy["trace"].as_array().unwrap();
         assert_eq!(
             trace[0],

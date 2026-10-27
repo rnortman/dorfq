@@ -52,6 +52,12 @@ pub enum TraceEvent {
     /// Hidden truth: its author's fix push cleared its breakage; the push
     /// follows as `repush`.
     Fixed { t: u64, pr: u64 },
+    /// Hidden truth: the landing of `batch`, through a run that missed a
+    /// break, put a bad pull request on trunk; every run on trunk fails
+    /// until the repair.
+    TrunkBroken { t: u64, batch: u64 },
+    /// Hidden truth: a push repaired trunk in place, ending one break.
+    TrunkRepaired { t: u64 },
     /// A head changed, intent kept.
     Repush { t: u64, pr: u64 },
     /// Intent cleared by the world's churn.
@@ -76,13 +82,15 @@ pub enum TraceEvent {
         members: Vec<u64>,
     },
     /// The run's verdict; `broken` when its tree fails for its content,
-    /// `flake` when the flake draw fired.
+    /// `flake` when the flake draw fired, `outage` when the run touched a
+    /// CI outage.
     RunEnd {
         t: u64,
         batch: u64,
         passed: bool,
         broken: bool,
         flake: bool,
+        outage: bool,
     },
     /// A landing fast-forwarded trunk to the batch's tip.
     Land {
@@ -119,6 +127,12 @@ pub enum TraceEvent {
     /// The pull request's author starts rebasing it, for `why`; the push
     /// follows as `repush`.
     Rebase { t: u64, pr: u64, why: Rebase },
+    /// Its own CI failed for trunk's or an outage's reason, not its own: its
+    /// author will re-run it on the same head once no outage holds and trunk
+    /// is green. It is held meanwhile — in the queue under `label`, out
+    /// checking under `github` — until the re-run's `pr_ci`, or a push,
+    /// a `rebase`, an `eject`, a `blocked` or a withdrawal ends the wait.
+    Rerun { t: u64, pr: u64 },
     /// The queue sees the pull request from now, stacked on `base` or on
     /// trunk.
     Admit { t: u64, pr: u64, base: Option<u64> },
@@ -160,6 +174,8 @@ impl fmt::Display for TraceEvent {
             }
             TraceEvent::Broken { pr, by, .. } => write!(f, "broken {pr} by {by}"),
             TraceEvent::Fixed { pr, .. } => write!(f, "fixed {pr}"),
+            TraceEvent::TrunkBroken { batch, .. } => write!(f, "trunk broken by {batch}"),
+            TraceEvent::TrunkRepaired { .. } => write!(f, "trunk repaired"),
             TraceEvent::Repush { pr, .. } => write!(f, "repush {pr}"),
             TraceEvent::Withdraw { pr, .. } => write!(f, "withdraw {pr}"),
             TraceEvent::Blocked {
@@ -193,6 +209,7 @@ impl fmt::Display for TraceEvent {
                 passed,
                 broken,
                 flake,
+                outage,
                 ..
             } => {
                 let verdict = if *passed { "passed" } else { "failed" };
@@ -202,6 +219,9 @@ impl fmt::Display for TraceEvent {
                 }
                 if *flake {
                     write!(f, " flake")?;
+                }
+                if *outage {
+                    write!(f, " outage")?;
                 }
                 Ok(())
             }
@@ -261,6 +281,7 @@ impl fmt::Display for TraceEvent {
                 Rebase::BaseLanded => write!(f, "rebase {pr} base landed"),
                 Rebase::Broken => write!(f, "rebase {pr} broken"),
             },
+            TraceEvent::Rerun { pr, .. } => write!(f, "re-run {pr}"),
             TraceEvent::Admit { pr, base, .. } => {
                 write!(f, "admit {pr}")?;
                 if let Some(base) = base {
@@ -306,7 +327,10 @@ impl fmt::Display for TraceEvent {
 /// `rebase` for a conflict or a landed base comes its push or a withdrawal;
 /// after a `rebase` for breakage, its fix push or whatever ends the pending
 /// fix: a push re-heading it, another `rebase`, an `eject`, a `blocked` or a
-/// withdrawal; after a `wait` a rebase, a
+/// withdrawal; after a `rerun`, the run that is its re-run (a `pr_ci` while
+/// it is not broken against trunk) or whatever ends the pending re-run: a
+/// push re-heading it, a `rebase`, an `eject`, a `blocked` or a withdrawal;
+/// after a `wait` a rebase, a
 /// push, an `admit`, a final `blocked` or a withdrawal; after a final exit that is not
 /// a landing at most one `pr_ci_end`, its last head's run's; after a
 /// landing one `pr_ci_end` if a billed run was in flight at the landing,
@@ -318,10 +342,11 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
     use std::collections::BTreeMap;
 
     /// What the pending event allows next: a `rebase` for a conflict or a
-    /// landed base, one for breakage, or a `wait`.
+    /// landed base, one for breakage, a `rerun`, or a `wait`.
     enum Expect {
         Rebase,
         Fix,
+        Rerun,
         Wait,
     }
 
@@ -329,6 +354,9 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
     struct Life {
         /// Its current head has passed its own CI.
         checked: bool,
+        /// Broken against trunk, by a `broken` not yet followed by its
+        /// `fixed`.
+        bad: bool,
         /// Out with a return pending, since this event.
         returning: Option<String>,
         /// The last `rebase` or `wait` and its text, until the next event
@@ -355,15 +383,29 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
             | TraceEvent::PrCi { pr, .. }
             | TraceEvent::PrCiEnd { pr, .. }
             | TraceEvent::Rebase { pr, .. }
+            | TraceEvent::Rerun { pr, .. }
             | TraceEvent::Admit { pr, .. }
             | TraceEvent::Recheck { pr, .. }
-            | TraceEvent::Wait { pr, .. } => vec![*pr],
+            | TraceEvent::Wait { pr, .. }
+            | TraceEvent::Broken { pr, .. }
+            | TraceEvent::Fixed { pr, .. } => vec![*pr],
             TraceEvent::Land { members, .. } => members.clone(),
             _ => Vec::new(),
         };
         for pr in prs {
             let life = lives.entry(pr).or_default();
             let fail = |why: &str| Err(format!("pr {pr}: {why} at `{text}`"));
+            match event {
+                TraceEvent::Broken { .. } => {
+                    life.bad = true;
+                    continue;
+                }
+                TraceEvent::Fixed { .. } => {
+                    life.bad = false;
+                    continue;
+                }
+                _ => {}
+            }
             if let Some((exit, landed)) = &life.exit {
                 let allowed = match event {
                     TraceEvent::PrCiEnd { .. } if *landed => std::mem::take(&mut life.billed),
@@ -380,6 +422,9 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
             }
             match event {
                 TraceEvent::PrCi { billed, .. } => {
+                    if !life.bad && matches!(life.expecting, Some((Expect::Rerun, _))) {
+                        life.expecting = None;
+                    }
                     life.billed = *billed;
                     continue;
                 }
@@ -398,7 +443,7 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
                     (Expect::Wait, TraceEvent::Rebase { .. } | TraceEvent::Admit { .. }) => true,
                     (Expect::Wait, TraceEvent::Blocked { r#final, .. }) => *r#final,
                     (
-                        Expect::Fix,
+                        Expect::Fix | Expect::Rerun,
                         TraceEvent::Rebase { .. }
                         | TraceEvent::Eject { .. }
                         | TraceEvent::Blocked { .. },
@@ -428,6 +473,7 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
                     why: Rebase::Broken,
                     ..
                 } => life.expecting = Some((Expect::Fix, text.clone())),
+                TraceEvent::Rerun { .. } => life.expecting = Some((Expect::Rerun, text.clone())),
                 TraceEvent::Rebase { .. } => {
                     life.expecting = Some((Expect::Rebase, text.clone()));
                 }
@@ -498,6 +544,7 @@ mod tests {
                 passed: true,
                 broken: false,
                 flake: false,
+                outage: false,
             },
             TraceEvent::RunEnd {
                 t: 5,
@@ -505,6 +552,7 @@ mod tests {
                 passed: false,
                 broken: true,
                 flake: true,
+                outage: false,
             },
             TraceEvent::Land {
                 t: 6,
@@ -633,6 +681,17 @@ mod tests {
                 why: Rebase::Broken,
             },
             TraceEvent::Fixed { t: 14, pr: 7 },
+            TraceEvent::TrunkBroken { t: 15, batch: 2 },
+            TraceEvent::TrunkRepaired { t: 16 },
+            TraceEvent::RunEnd {
+                t: 17,
+                batch: 4,
+                passed: false,
+                broken: false,
+                flake: false,
+                outage: true,
+            },
+            TraceEvent::Rerun { t: 18, pr: 7 },
         ]
     }
 
@@ -674,6 +733,10 @@ mod tests {
                 "pr-ci 7 failed",
                 "rebase 7 broken",
                 "fixed 7",
+                "trunk broken by 2",
+                "trunk repaired",
+                "ci 4 failed outage",
+                "re-run 7",
             ]
         );
     }
@@ -869,6 +932,90 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_re_run_ends_only_as_the_re_run_says() {
+        let rerun = TraceEvent::Rerun { t: 1, pr: 7 };
+        let rebase = |why| TraceEvent::Rebase { t: 2, pr: 7, why };
+        let pr_ci = |billed| TraceEvent::PrCi {
+            t: 2,
+            pr: 7,
+            billed,
+        };
+        let eject = |r#final| TraceEvent::Eject {
+            t: 2,
+            pr: 7,
+            reason: "batch 3 failed".to_owned(),
+            justified: true,
+            r#final,
+        };
+        let blocked = |r#final| TraceEvent::Blocked {
+            t: 2,
+            pr: 7,
+            on: 3,
+            r#final,
+            bad: false,
+        };
+        let repush = TraceEvent::Repush { t: 2, pr: 7 };
+        let withdraw = TraceEvent::Withdraw { t: 2, pr: 7 };
+        let broken = TraceEvent::Broken { t: 2, pr: 7, by: 3 };
+        let fixed = TraceEvent::Fixed { t: 2, pr: 7 };
+        let admit = TraceEvent::Admit {
+            t: 3,
+            pr: 7,
+            base: None,
+        };
+        let wait = TraceEvent::Wait { t: 3, pr: 7, on: 3 };
+        let start = TraceEvent::Start {
+            t: 3,
+            batch: 1,
+            base: None,
+            members: vec![7],
+        };
+        for next in [
+            vec![pr_ci(false), admit.clone()],
+            vec![pr_ci(true), admit.clone()],
+            vec![repush.clone()],
+            vec![rebase(Rebase::BaseLanded), repush.clone()],
+            vec![rebase(Rebase::Conflict), repush.clone()],
+            vec![rebase(Rebase::Broken), fixed.clone(), repush.clone()],
+            vec![withdraw],
+            vec![eject(true)],
+            vec![eject(false)],
+            vec![blocked(true)],
+            vec![blocked(false)],
+            // The landing that broke it turns the wait into a fix push.
+            vec![
+                broken.clone(),
+                pr_ci(true),
+                rebase(Rebase::Broken),
+                fixed.clone(),
+                repush.clone(),
+            ],
+            // Fixed meanwhile, the next run is the re-run again.
+            vec![broken.clone(), fixed, pr_ci(false), admit.clone()],
+        ] {
+            let mut events = vec![rerun.clone()];
+            events.extend(next);
+            assert_eq!(check_lives(&events), Ok(()), "{events:?}");
+        }
+        for (events, after) in [
+            (vec![rerun.clone(), admit.clone()], "after `re-run 7`"),
+            (vec![rerun.clone(), wait], "after `re-run 7`"),
+            (vec![rerun.clone(), start], "after `re-run 7`"),
+            (
+                vec![rerun, broken, pr_ci(true), admit.clone()],
+                "after `re-run 7`",
+            ),
+            (
+                vec![rebase(Rebase::Broken), pr_ci(false), admit],
+                "after `rebase 7 broken`",
+            ),
+        ] {
+            let error = check_lives(&events).unwrap_err();
+            assert!(error.contains(after), "{error}");
+        }
+    }
+
+    #[test]
     fn an_empty_step_keeps_every_section() {
         let step = TraceEvent::Step {
             t: 0,
@@ -924,6 +1071,10 @@ mod tests {
             "pr_ci_end",
             "rebase",
             "fixed",
+            "trunk_broken",
+            "trunk_repaired",
+            "run_end",
+            "rerun",
         ];
         assert_eq!(kinds, expected.map(|k| json!(k)));
         let events = every_kind();
@@ -997,6 +1148,25 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&events[31]).unwrap(),
             json!({ "kind": "fixed", "t": 14, "pr": 7 })
+        );
+        assert_eq!(
+            serde_json::to_value(&events[32]).unwrap(),
+            json!({ "kind": "trunk_broken", "t": 15, "batch": 2 })
+        );
+        assert_eq!(
+            serde_json::to_value(&events[33]).unwrap(),
+            json!({ "kind": "trunk_repaired", "t": 16 })
+        );
+        assert_eq!(
+            serde_json::to_value(&events[34]).unwrap(),
+            json!({
+                "kind": "run_end", "t": 17, "batch": 4, "passed": false, "broken": false,
+                "flake": false, "outage": true
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&events[35]).unwrap(),
+            json!({ "kind": "rerun", "t": 18, "pr": 7 })
         );
     }
 }

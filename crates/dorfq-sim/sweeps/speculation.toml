@@ -27,6 +27,9 @@ rebase_minutes = { min = 15, max = 120 }   # uniform delay from a rebase becomin
 pr_ci_on_base_landed = true   # the repository re-runs a pull request's own CI when its base lands
 p_interact = 0.001         # a pair conflicts: a run with both fails; whichever lands first breaks the other (swept)
 p_flake = 0.03             # a run fails for no reason in the tree (swept)
+p_miss = 0.02              # a run over a broken tree passes anyway: CI's miss rate; a bad pull request that lands breaks trunk
+trunk_fix_minutes = { min = 30, max = 180 }   # uniform delay from a bad pull request landing to the push that repairs trunk
+outages = []               # CI outages, each { start_hours, hours }: every run touching one fails
 p_conflict = 0.02          # a stack arrives with its root conflicting against trunk
 repush_per_hour = 0.02     # per open pull request, the rate at which its author pushes a new head
 withdraw_per_hour = 0.005  # per open pull request, the rate at which its author takes it out of the queue

@@ -11,6 +11,7 @@ load(":wasm.bzl", "wasm_module")
 
 EXAMPLES = [
     "busy",
+    "outage",
     "sim",
 ]
 

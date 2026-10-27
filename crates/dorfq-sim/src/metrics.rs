@@ -10,7 +10,10 @@ const HOUR: f64 = crate::HOUR as f64;
 /// How a pull request left the queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exit {
-    Landed,
+    /// Landed; `bad` when it was bad against trunk at that instant — broken
+    /// by an earlier landing, on a bad base, or beside a pull request of its
+    /// batch it conflicts with — through a run that missed the break.
+    Landed { bad: bool },
     /// Ejected; `bad_since` is when it became bad against trunk, when it
     /// was bad at the moment of ejection (the ejection was justified), and
     /// `None` when it was not.
@@ -53,6 +56,14 @@ impl End {
     }
 }
 
+/// A span trunk was broken: from a bad landing at `at` to its repair at
+/// `until`, `None` while unrepaired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Break {
+    pub at: u64,
+    pub until: Option<u64>,
+}
+
 /// One pull request's life.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrRecord {
@@ -88,6 +99,9 @@ pub struct RunRecord {
     pub landed: bool,
     /// True when its batch was retired while the run was running.
     pub cancelled: bool,
+    /// Its tree was broken and the run missed it, fixed at its start: it
+    /// passes unless it flakes.
+    pub missed: bool,
 }
 
 /// One pull request's own CI run.
@@ -105,7 +119,8 @@ pub struct PrCiRecord {
     /// The queue caused it by landing the pull request's direct base
     /// without it; its time counts in `runner_hours`.
     pub billed: bool,
-    /// Its verdict, fixed at its start: the head was broken against trunk.
+    /// Its verdict, fixed at its start: the head was broken against trunk,
+    /// or trunk itself was broken, and the run did not miss it.
     pub failed: bool,
 }
 
@@ -130,6 +145,14 @@ pub struct Metrics {
     pub left_with_base: usize,
     /// Pull requests that were bad against trunk at some point.
     pub ever_bad: usize,
+    /// Pull requests landed while bad against trunk — broken by an earlier
+    /// landing, on a bad base, or beside a pull request they conflict
+    /// with — through a run that missed the break.
+    pub landed_bad: usize,
+    /// Hours trunk spent broken: from a bad landing until its repair,
+    /// overlapping breaks counted once, an unrepaired break clipped at the
+    /// replication's end.
+    pub trunk_broken_hours: f64,
     /// Rebases pushed, over every pull request.
     pub rebases: u64,
     /// Batch runs started, cancelled included.
@@ -188,6 +211,31 @@ fn root<'a>(exits: &BTreeMap<PrNumber, &'a Exit>, mut exit: &'a Exit) -> &'a Exi
     exit
 }
 
+/// Hours covered by the union of `breaks`, each clipped at `end`.
+fn broken_hours(breaks: &[Break], end: u64) -> f64 {
+    let mut spans: Vec<(u64, u64)> = breaks
+        .iter()
+        .map(|b| (b.at.min(end), b.until.unwrap_or(end).min(end)))
+        .collect();
+    spans.sort_unstable();
+    let mut total = 0;
+    let mut open: Option<(u64, u64)> = None;
+    for (from, until) in spans {
+        open = match open {
+            Some((a, b)) if from <= b => Some((a, b.max(until))),
+            Some((a, b)) => {
+                total += b - a;
+                Some((from, until))
+            }
+            None => Some((from, until)),
+        };
+    }
+    if let Some((a, b)) = open {
+        total += b - a;
+    }
+    total as f64 / HOUR
+}
+
 fn ratio(numerator: f64, denominator: f64) -> Option<f64> {
     (denominator > 0.0).then(|| numerator / denominator)
 }
@@ -201,15 +249,18 @@ pub struct RunningSeconds {
 
 impl Metrics {
     /// Summarises the records of a replication that ended as `end`, with
-    /// the runs still running having used `running`.
+    /// the runs still running having used `running` and trunk broken over
+    /// `breaks`.
     pub fn summarise(
         prs: &[PrRecord],
         runs: &[RunRecord],
         pr_ci: &[PrCiRecord],
+        breaks: &[Break],
         running: RunningSeconds,
         end: End,
     ) -> Metrics {
         let mut landed = 0;
+        let mut landed_bad = 0;
         let mut ejected_bad = 0;
         let mut ejected_good = 0;
         let mut withdrawn = 0;
@@ -231,14 +282,15 @@ impl Metrics {
             let hours = (left_at - pr.arrived_at) as f64 / HOUR;
             let bad_since = match exit {
                 Exit::Ejected { bad_since, .. } | Exit::Blocked { bad_since, .. } => *bad_since,
-                Exit::Landed | Exit::Withdrawn => None,
+                Exit::Landed { .. } | Exit::Withdrawn => None,
             };
             if matches!(exit, Exit::Blocked { .. }) {
                 left_with_base += 1;
             }
             match root(&exits, exit) {
-                Exit::Landed => {
+                Exit::Landed { bad } => {
                     landed += 1;
+                    landed_bad += usize::from(*bad);
                     land_hours.push(hours);
                 }
                 Exit::Ejected { .. } => match bad_since {
@@ -273,6 +325,8 @@ impl Metrics {
             unfinished,
             left_with_base,
             ever_bad: prs.iter().filter(|p| p.ever_bad).count(),
+            landed_bad,
+            trunk_broken_hours: broken_hours(breaks, end.at),
             rebases,
             runs: runs.len(),
             cancelled_runs: runs.iter().filter(|r| r.cancelled).count(),
@@ -319,6 +373,7 @@ mod tests {
             tree: Vec::new(),
             landed,
             cancelled: false,
+            missed: false,
         }
     }
 
@@ -346,8 +401,8 @@ mod tests {
     #[test]
     fn summarises_counts_costs_and_latencies() {
         let prs = [
-            pr(1, 0, Some((3600, Exit::Landed))),
-            pr(2, 0, Some((7200, Exit::Landed))),
+            pr(1, 0, Some((3600, Exit::Landed { bad: false }))),
+            pr(2, 0, Some((7200, Exit::Landed { bad: true }))),
             pr(3, 0, Some((1800, ejected(Some(0))))),
             pr(4, 0, Some((1800, ejected(None)))),
             pr(5, 0, Some((60, Exit::Withdrawn))),
@@ -369,8 +424,16 @@ mod tests {
         let mut prs = prs;
         prs[0].rebases = 2;
         prs[5].rebases = 1;
-        let m = Metrics::summarise(&prs, &runs, &[], RunningSeconds::default(), End::drained(0));
+        let m = Metrics::summarise(
+            &prs,
+            &runs,
+            &[],
+            &[],
+            RunningSeconds::default(),
+            End::drained(0),
+        );
         assert_eq!(m.rebases, 3);
+        assert_eq!((m.landed_bad, m.trunk_broken_hours), (1, 0.0));
         assert_eq!(
             (
                 m.arrived,
@@ -424,6 +487,7 @@ mod tests {
             &prs,
             &[],
             &[],
+            &[],
             RunningSeconds::default(),
             End::drained(7200),
         );
@@ -449,7 +513,14 @@ mod tests {
 
     #[test]
     fn empty_sets_summarise_to_none() {
-        let m = Metrics::summarise(&[], &[], &[], RunningSeconds::default(), End::drained(0));
+        let m = Metrics::summarise(
+            &[],
+            &[],
+            &[],
+            &[],
+            RunningSeconds::default(),
+            End::drained(0),
+        );
         assert_eq!(m.arrived, 0);
         assert_eq!(m.runner_hours, 0.0);
         assert_eq!((m.billed_pr_ci_runs, m.billed_pr_ci_hours), (0, 0.0));
@@ -468,6 +539,7 @@ mod tests {
             &[],
             &runs,
             &[],
+            &[],
             RunningSeconds {
                 batches: 3600,
                 billed_pr_ci: 0,
@@ -480,7 +552,7 @@ mod tests {
 
     #[test]
     fn billed_pr_ci_costs_runner_time_but_is_not_batch_waste() {
-        let prs = [pr(1, 0, Some((7200, Exit::Landed)))];
+        let prs = [pr(1, 0, Some((7200, Exit::Landed { bad: false })))];
         let runs = [run(1800, 1, true), run(1800, 1, false)];
         let pr_ci = [
             pr_ci(1800, false, true),
@@ -492,6 +564,7 @@ mod tests {
             &prs,
             &runs,
             &pr_ci,
+            &[],
             RunningSeconds {
                 batches: 0,
                 billed_pr_ci: 900,
@@ -507,8 +580,14 @@ mod tests {
 
     #[test]
     fn the_end_and_the_clock_are_carried() {
-        let drained =
-            Metrics::summarise(&[], &[], &[], RunningSeconds::default(), End::drained(5400));
+        let drained = Metrics::summarise(
+            &[],
+            &[],
+            &[],
+            &[],
+            RunningSeconds::default(),
+            End::drained(5400),
+        );
         assert_eq!(
             (drained.ended_hours, drained.cut_off, drained.stalled),
             (1.5, false, false)
@@ -518,11 +597,53 @@ mod tests {
             cut_off: true,
             stalled: true,
         };
-        let stalled = Metrics::summarise(&[], &[], &[], RunningSeconds::default(), end);
+        let stalled = Metrics::summarise(&[], &[], &[], &[], RunningSeconds::default(), end);
         assert_eq!(
             (stalled.ended_hours, stalled.cut_off, stalled.stalled),
             (2.0, true, true)
         );
+    }
+
+    #[test]
+    fn trunk_broken_hours_counts_overlapping_breaks_once_and_clips_an_open_one() {
+        let at = |h: u64| h * 3600;
+        let breaks = [
+            Break {
+                at: at(2),
+                until: Some(at(4)),
+            },
+            Break {
+                at: at(6),
+                until: None,
+            },
+            Break {
+                at: at(1),
+                until: Some(at(3)),
+            },
+        ];
+        let m = Metrics::summarise(
+            &[],
+            &[],
+            &[],
+            &breaks,
+            RunningSeconds::default(),
+            End::drained(at(7)),
+        );
+        assert_eq!(m.trunk_broken_hours, 4.0);
+        // A repair scheduled past the end counts up to the end alone.
+        let late = [Break {
+            at: at(1),
+            until: Some(at(9)),
+        }];
+        let m = Metrics::summarise(
+            &[],
+            &[],
+            &[],
+            &late,
+            RunningSeconds::default(),
+            End::drained(at(7)),
+        );
+        assert_eq!(m.trunk_broken_hours, 6.0);
     }
 
     #[test]
