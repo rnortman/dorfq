@@ -147,13 +147,6 @@ pub(crate) fn failed_by(id: u64) -> EjectReason {
     EjectReason::BatchFailed { batch: BatchId(id) }
 }
 
-pub(crate) fn interacts_with(pr: u64, id: u64) -> EjectReason {
-    EjectReason::InteractsWith {
-        pr: PrNumber(pr),
-        batch: BatchId(id),
-    }
-}
-
 pub(crate) fn conflicts_with_trunk() -> EjectReason {
     EjectReason::Conflicts {
         with: ConflictWith::Trunk,

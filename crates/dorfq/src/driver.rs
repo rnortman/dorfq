@@ -71,9 +71,9 @@ impl<'a> Driver<'a> {
     }
 
     /// Observes, steps the scheduler, and executes the plan in the order
-    /// `land`, `start`, `eject`, `retire`, stopping at the first error. An
-    /// error means the rest of the plan was abandoned, or none was made; the
-    /// tick still counts.
+    /// `land`, `notify`, `start`, `eject`, `retire`, stopping at the first
+    /// error. An error means the rest of the plan was abandoned, or none was
+    /// made; the tick still counts.
     pub fn tick(&mut self) -> Result<TickReport, DriverError> {
         let tick = self.tick;
         self.tick += 1;
@@ -84,6 +84,9 @@ impl<'a> Driver<'a> {
             .map_err(DriverError::Scheduler)?;
         for &batch in &plan.land {
             self.forge.land(batch)?;
+        }
+        for notice in &plan.notify {
+            self.forge.notify(notice.pr, &notice.reason)?;
         }
         for batch in &plan.start {
             self.forge.start_batch(batch)?;
@@ -178,6 +181,9 @@ impl fmt::Display for TickReport {
         let plan = &self.plan;
         for batch in &plan.land {
             write!(f, "\n  land batch {}", batch.0)?;
+        }
+        for notice in &plan.notify {
+            write!(f, "\n  notify pr {}: {}", notice.pr.0, notice.reason)?;
         }
         for start in &plan.start {
             let members: Vec<String> = start.prs.iter().map(|p| p.0.to_string()).collect();

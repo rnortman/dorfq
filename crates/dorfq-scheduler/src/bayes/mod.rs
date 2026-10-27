@@ -99,7 +99,9 @@ pub(crate) use model::{FLOOR, Priors};
 /// best batch on any node, weighted by the chance it lands: its node becomes
 /// trunk and every older batch on the node fails; a batch whose node dies,
 /// or whose chance of landing falls to zero, is cancelled. A pull request is
-/// ejected only when a failed run singles it out.
+/// ejected only when a failed run singles it out. A pull request whose cause
+/// a failed run singles out at `notify_above` is told so, once per head, and
+/// stays; at `eject_above` it is ejected.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Bayes {
     params: BayesConfig,
@@ -127,6 +129,12 @@ pub(crate) struct Bayes {
     /// verdict read by then: credited to the current stretch once an
     /// observation reports it landed.
     landing_breaks: BTreeMap<BatchId, f64>,
+    /// Each materialised pair's posterior as of the latest step, so that
+    /// when one half reaches trunk the belief it earned is carried onto the
+    /// other at that position.
+    pair_posteriors: BTreeMap<model::Cause, f64>,
+    /// The head each queued pull request was last told about.
+    notified: BTreeMap<PrNumber, Sha>,
 }
 
 /// A tracked batch: what its run exercises and the trunk it tested.
@@ -152,6 +160,8 @@ impl Bayes {
             since: BTreeMap::new(),
             values: BTreeMap::new(),
             landing_breaks: BTreeMap::new(),
+            pair_posteriors: BTreeMap::new(),
+            notified: BTreeMap::new(),
         }
     }
 }

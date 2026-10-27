@@ -13,8 +13,8 @@ pub enum Rebase {
     Conflict,
     /// Its base landed, under `github` admission.
     BaseLanded,
-    /// Its own CI failed on its head: it is broken against trunk, and the
-    /// push is its author's fix.
+    /// Its own CI failed on its head, or the queue told its author it is
+    /// probably broken: the push is its author's fix.
     Broken,
 }
 
@@ -25,9 +25,9 @@ pub struct PlannedStart {
     pub members: Vec<u64>,
 }
 
-/// One ejection of a step's plan, its reason worded.
+/// One pull request a step's plan ejects or notifies, its reason worded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PlannedEject {
+pub struct PlannedPr {
     pub pr: u64,
     pub reason: String,
 }
@@ -110,6 +110,14 @@ pub enum TraceEvent {
         justified: bool,
         r#final: bool,
     },
+    /// The queue told the pull request's author what it believes, worded
+    /// as `reason`, without acting on it; `justified` by the world's truth.
+    Notice {
+        t: u64,
+        pr: u64,
+        reason: String,
+        justified: bool,
+    },
     /// A batch was retired; `cancelled` when its run was still running.
     Retire { t: u64, batch: u64, cancelled: bool },
     /// A pull request's own CI run started on its current head; `billed`
@@ -146,8 +154,9 @@ pub enum TraceEvent {
         queued: usize,
         in_flight: usize,
         land: Vec<u64>,
+        notify: Vec<PlannedPr>,
         start: Vec<PlannedStart>,
-        eject: Vec<PlannedEject>,
+        eject: Vec<PlannedPr>,
         retire: Vec<u64>,
     },
 }
@@ -247,6 +256,19 @@ impl fmt::Display for TraceEvent {
                 }
                 Ok(())
             }
+            TraceEvent::Notice {
+                pr,
+                reason,
+                justified,
+                ..
+            } => {
+                let truth = if *justified {
+                    "justified"
+                } else {
+                    "unjustified"
+                };
+                write!(f, "notice {pr} {truth}: {reason}")
+            }
             TraceEvent::Retire {
                 batch, cancelled, ..
             } => {
@@ -296,10 +318,15 @@ impl fmt::Display for TraceEvent {
                 queued,
                 in_flight,
                 land,
+                notify,
                 start,
                 eject,
                 retire,
             } => {
+                let notices: Vec<String> = notify
+                    .iter()
+                    .map(|n| format!("{}({})", n.pr, n.reason))
+                    .collect();
                 let starts: Vec<String> = start
                     .iter()
                     .map(|s| format!("{}{}", s.batch, ids(&s.members)))
@@ -310,8 +337,9 @@ impl fmt::Display for TraceEvent {
                     .collect();
                 write!(
                     f,
-                    "t={t} queued={queued} in_flight={in_flight} | land {} | start {} | eject {} | retire {}",
+                    "t={t} queued={queued} in_flight={in_flight} | land {} | notify {} | start {} | eject {} | retire {}",
                     ids(land),
+                    notices.join(" "),
                     starts.join(" "),
                     ejects.join(" "),
                     ids(retire),
@@ -336,7 +364,8 @@ impl fmt::Display for TraceEvent {
 /// landing one `pr_ci_end` if a billed run was in flight at the landing,
 /// and nothing else; and no `start` names it unless its current head, from
 /// its `arrive` or latest `repush`, has passed its own CI (a failed run does
-/// not count).
+/// not count). A `notice` fits anywhere before a final exit and expects
+/// nothing.
 #[cfg(test)]
 pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
     use std::collections::BTreeMap;
@@ -380,6 +409,7 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
             | TraceEvent::Withdraw { pr, .. }
             | TraceEvent::Blocked { pr, .. }
             | TraceEvent::Eject { pr, .. }
+            | TraceEvent::Notice { pr, .. }
             | TraceEvent::PrCi { pr, .. }
             | TraceEvent::PrCiEnd { pr, .. }
             | TraceEvent::Rebase { pr, .. }
@@ -421,6 +451,9 @@ pub(crate) fn check_lives(events: &[TraceEvent]) -> Result<(), String> {
                 continue;
             }
             match event {
+                // Told, not moved: it fits wherever the pull request is, held
+                // or out, and changes nothing that comes after.
+                TraceEvent::Notice { .. } => continue,
                 TraceEvent::PrCi { billed, .. } => {
                     if !life.bad && matches!(life.expecting, Some((Expect::Rerun, _))) {
                         life.expecting = None;
@@ -648,6 +681,10 @@ mod tests {
                 queued: 4,
                 in_flight: 1,
                 land: vec![2],
+                notify: vec![PlannedPr {
+                    pr: 8,
+                    reason: "probably broken against trunk (batch 3)".to_owned(),
+                }],
                 start: vec![
                     PlannedStart {
                         batch: 5,
@@ -658,7 +695,7 @@ mod tests {
                         members: vec![8],
                     },
                 ],
-                eject: vec![PlannedEject {
+                eject: vec![PlannedPr {
                     pr: 5,
                     reason: "batch 3 failed".to_owned(),
                 }],
@@ -692,6 +729,18 @@ mod tests {
                 outage: true,
             },
             TraceEvent::Rerun { t: 18, pr: 7 },
+            TraceEvent::Notice {
+                t: 19,
+                pr: 7,
+                reason: "probably broken against trunk (batch 3)".to_owned(),
+                justified: true,
+            },
+            TraceEvent::Notice {
+                t: 19,
+                pr: 8,
+                reason: "probably fails together with #7 (batch 3)".to_owned(),
+                justified: false,
+            },
         ]
     }
 
@@ -728,7 +777,7 @@ mod tests {
                 "admit 7 on 3",
                 "recheck 7",
                 "wait 7 on 3",
-                "t=6 queued=4 in_flight=1 | land [2] | start 5[6,7] 6[8] | eject 5(batch 3 failed) | retire [3,4]",
+                "t=6 queued=4 in_flight=1 | land [2] | notify 8(probably broken against trunk (batch 3)) | start 5[6,7] 6[8] | eject 5(batch 3 failed) | retire [3,4]",
                 "broken 7 by 2",
                 "pr-ci 7 failed",
                 "rebase 7 broken",
@@ -737,6 +786,8 @@ mod tests {
                 "trunk repaired",
                 "ci 4 failed outage",
                 "re-run 7",
+                "notice 7 justified: probably broken against trunk (batch 3)",
+                "notice 8 unjustified: probably fails together with #7 (batch 3)",
             ]
         );
     }
@@ -843,6 +894,61 @@ mod tests {
             let error = check_lives(&events).unwrap_err();
             assert!(error.contains("after its exit `land 1 [7]`"), "{error}");
         }
+    }
+
+    #[test]
+    fn a_notice_fits_any_pending_wait_but_not_a_final_exit() {
+        let notice = TraceEvent::Notice {
+            t: 2,
+            pr: 7,
+            reason: "probably broken against trunk (batch 3)".to_owned(),
+            justified: true,
+        };
+        let pr_ci = TraceEvent::PrCi {
+            t: 3,
+            pr: 7,
+            billed: false,
+        };
+        let rerun = TraceEvent::Rerun { t: 1, pr: 7 };
+        let wait = TraceEvent::Wait { t: 1, pr: 7, on: 3 };
+        let held = TraceEvent::Blocked {
+            t: 1,
+            pr: 7,
+            on: 3,
+            r#final: false,
+            bad: false,
+        };
+        let fix = TraceEvent::Rebase {
+            t: 1,
+            pr: 7,
+            why: Rebase::Broken,
+        };
+        let repush = TraceEvent::Repush { t: 3, pr: 7 };
+        let admit = TraceEvent::Admit {
+            t: 3,
+            pr: 7,
+            base: None,
+        };
+        // The pending wait is still pending after the notice, and ends as
+        // it would have without it.
+        for events in [
+            vec![rerun.clone(), notice.clone(), pr_ci],
+            vec![wait, notice.clone(), admit.clone()],
+            vec![held, notice.clone(), admit],
+            vec![fix.clone(), notice.clone(), repush],
+        ] {
+            assert_eq!(check_lives(&events), Ok(()), "{events:?}");
+        }
+        let still = TraceEvent::Admit {
+            t: 3,
+            pr: 7,
+            base: None,
+        };
+        let error = check_lives(&[rerun, notice.clone(), still]).unwrap_err();
+        assert!(error.contains("after `re-run 7`"), "{error}");
+        let withdraw = TraceEvent::Withdraw { t: 1, pr: 7 };
+        let error = check_lives(&[withdraw, notice]).unwrap_err();
+        assert!(error.contains("after its exit `withdraw 7`"), "{error}");
     }
 
     #[test]
@@ -1022,13 +1128,14 @@ mod tests {
             queued: 0,
             in_flight: 0,
             land: Vec::new(),
+            notify: Vec::new(),
             start: Vec::new(),
             eject: Vec::new(),
             retire: Vec::new(),
         };
         assert_eq!(
             step.to_string(),
-            "t=0 queued=0 in_flight=0 | land [] | start  | eject  | retire []"
+            "t=0 queued=0 in_flight=0 | land [] | notify  | start  | eject  | retire []"
         );
     }
 
@@ -1075,6 +1182,8 @@ mod tests {
             "trunk_repaired",
             "run_end",
             "rerun",
+            "notice",
+            "notice",
         ];
         assert_eq!(kinds, expected.map(|k| json!(k)));
         let events = every_kind();
@@ -1128,6 +1237,7 @@ mod tests {
             serde_json::to_value(&events[27]).unwrap(),
             json!({
                 "kind": "step", "t": 6, "queued": 4, "in_flight": 1, "land": [2],
+                "notify": [{ "pr": 8, "reason": "probably broken against trunk (batch 3)" }],
                 "start": [{ "batch": 5, "members": [6, 7] }, { "batch": 6, "members": [8] }],
                 "eject": [{ "pr": 5, "reason": "batch 3 failed" }],
                 "retire": [3, 4]
@@ -1167,6 +1277,13 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&events[35]).unwrap(),
             json!({ "kind": "rerun", "t": 18, "pr": 7 })
+        );
+        assert_eq!(
+            serde_json::to_value(&events[36]).unwrap(),
+            json!({
+                "kind": "notice", "t": 19, "pr": 7,
+                "reason": "probably broken against trunk (batch 3)", "justified": true
+            })
         );
     }
 }

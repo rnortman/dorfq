@@ -44,6 +44,11 @@ pub struct WorldConfig {
     /// Uniform delay from a rebase becoming necessary — a conflict, or under
     /// `github` admission a landed base — to the author's push of it.
     pub rebase_minutes: Minutes,
+    /// The chance an author acts on the queue's notice that their pull
+    /// request is probably broken — a rebase onto trunk and a push, as a
+    /// failed own-CI run already makes them do — rather than waiting for the
+    /// queue.
+    pub p_heed: f64,
     /// Whether a landed base makes the pull requests stacked on it run
     /// their own CI again — under `github` admission through the author's
     /// rebase of the rest of the stack, under `label` on the direct
@@ -345,6 +350,7 @@ impl WorldConfig {
         probability("p_flake", self.p_flake)?;
         probability("p_miss", self.p_miss)?;
         probability("p_conflict", self.p_conflict)?;
+        probability("p_heed", self.p_heed)?;
         weights("stack_sizes", &self.stack_sizes)?;
         probability("p_stack_grows", self.p_stack_grows)?;
         weights("stack_growth_sizes", &self.stack_growth_sizes)?;
@@ -368,6 +374,7 @@ arrivals_per_hour = 4.0
 ci_minutes = { min = 150, max = 210 }
 pr_ci_minutes = { min = 40, max = 60 }
 rebase_minutes = { min = 15, max = 120 }
+p_heed = 0.75
 pr_ci_on_base_landed = true
 p_interact = 0.002
 p_flake = 0.02
@@ -433,6 +440,7 @@ max_batch = 16
         assert_eq!(config.world.ci_minutes, Minutes { min: 45, max: 120 });
         assert_eq!(config.world.pr_ci_minutes, Minutes { min: 45, max: 120 });
         assert_eq!(config.world.rebase_minutes, Minutes { min: 15, max: 120 });
+        assert_eq!(config.world.p_heed, 0.75);
         let sizes = [
             16.0, 16.0, 15.0, 13.0, 11.0, 9.0, 7.0, 5.0, 3.0, 2.0, 2.0, 1.0,
         ];
@@ -478,6 +486,7 @@ max_batch = 16
             w_reject: 1.0,
             w_age: 0.02,
             eject_above: 0.9,
+            notify_above: 0.5,
             others_below: 0.1,
             speculate_above: 0.0,
             speculation,
@@ -526,6 +535,7 @@ max_batch = 16
         assert_eq!(config.world.stack_growth_sizes, [3.0, 2.0, 1.0]);
         assert_eq!(config.world.pr_ci_minutes, Minutes { min: 45, max: 120 });
         assert_eq!(config.world.rebase_minutes, Minutes { min: 15, max: 120 });
+        assert_eq!(config.world.p_heed, 0.75);
         assert_eq!(config.world.p_miss, 0.02);
         assert_eq!(
             config.world.trunk_fix_minutes,
@@ -731,6 +741,8 @@ max_batch = 16
             ("p_flake", "2.0"),
             ("p_miss", "1.5"),
             ("p_conflict", "-1.0"),
+            ("p_heed", "1.5"),
+            ("p_heed", "-0.1"),
             ("p_stack_grows", "1.1"),
             ("p_atomic", "-0.5"),
             ("arrivals_per_hour", "-1.0"),
@@ -842,6 +854,7 @@ max_batch = 16
             "stall_hours",
             "pr_ci_minutes",
             "rebase_minutes",
+            "p_heed",
             "pr_ci_on_base_landed",
             "stack_sizes",
             "p_stack_grows",

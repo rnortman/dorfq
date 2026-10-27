@@ -113,5 +113,14 @@ then broken: every run on it fails until a push repairs it in place,
 `outages` windows fails. A pull request whose own CI failed for a broken
 trunk or an outage, not for itself, is not fixed: its author re-runs it on
 the same head once CI is back and trunk is repaired, the wait traced
-`re-run N`. The crate documentation,
+`re-run N`.
+
+A scheduler can tell an author what it believes without ejecting: that the
+pull request is probably broken against trunk, or probably fails together
+with another. Told it is probably broken, the author acts at `p_heed`:
+after a rebase delay they rebase onto trunk and push, whether or not it is
+in fact broken, so a wrong notice costs a rebase and a new head's own CI
+run. The report counts `notices_good`, pull requests whose first notice was
+wrong, and `notice_p50_hours` and `notice_p95_hours`, how long a broken
+pull request waited for its first true notice. The crate documentation,
 `crates/dorfq-sim/src/lib.rs`, states the model in full.

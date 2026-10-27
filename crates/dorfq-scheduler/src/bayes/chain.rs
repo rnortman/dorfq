@@ -123,7 +123,7 @@ impl Bayes {
             fates.push(fate);
         }
 
-        let ejected = self.eject(observation, inference, &mut fates, &mut plan);
+        let ejected = self.eject_and_notify(observation, heads, inference, &mut fates, &mut plan);
         let (in_flight, pending) = self.settle(observation, &fates, &mut plan);
         if pending >= self.params.lanes {
             return Ok(plan);
@@ -177,7 +177,7 @@ impl Bayes {
         if pool.is_empty() {
             return Ok(plan);
         }
-        let units = self.units(inference, &stacks, heads, &taken);
+        let units = self.units(inference, &stacks, heads, &taken, &below);
 
         let mut candidates: Vec<Candidate> = Vec::new();
         if let Some((members, score)) = self

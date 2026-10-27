@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dorfq_core::{
     BatchId, BatchStart, BatchState, CiStatus, ConflictWith, EjectReason, Forge, ForgeError, Hold,
-    LandRefusal, Observation, PrBase, PrNumber, PrSnapshot, PrStatus, Sha,
+    LandRefusal, NoticeReason, Observation, PrBase, PrNumber, PrSnapshot, PrStatus, Sha,
 };
 use dorfq_forge_github::api::{Auth, GitHubApi, RefUpdate, RestClient};
 use dorfq_forge_github::app::AppKey;
@@ -523,7 +523,8 @@ fn run() -> Result<(), String> {
         })?;
     }
 
-    // 4. A batch of all three conflicts at C, attributed to A by the probe.
+    // 4. A batch of all three conflicts at C, attributed to A by the probe;
+    // C is ejected and B told it is probably broken, keeping its place.
     forge
         .start_batch(&BatchStart::new(
             BatchId(1),
@@ -546,11 +547,15 @@ fn run() -> Result<(), String> {
             },
         )
         .map_err(at("ejecting C"))?;
+    forge
+        .notify(b.number, &NoticeReason::Broken { batch: BatchId(1) })
+        .map_err(at("notifying B"))?;
     forge.retire(BatchId(1)).map_err(at("retiring batch 1"))?;
     observe_until(&mut forge, "A and B enqueued, no batches", |o| {
         enqueued(o) == [a.number, b.number] && o.batches.is_empty()
     })?;
     repo.wait_for_marker(c.number, Marker::Ejected)?;
+    repo.wait_for_marker(b.number, Marker::Notice)?;
     for prefix in ["refs/heads/dorfq/", "refs/dorfq/"] {
         let left = repo.client.list_refs(prefix).map_err(at("listing refs"))?;
         check(left.is_empty(), || {

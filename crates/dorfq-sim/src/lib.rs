@@ -52,6 +52,17 @@
 //! and its rebase delays from its own clock, seeded from its key, so the
 //! n-th draw of a pull request is the same under every policy.
 //!
+//! A scheduler's notice reaches the author. Told that the pull request is
+//! probably broken against trunk, the author acts at `p_heed`, a draw from
+//! the pull request's own clock: after a rebase delay they rebase it onto
+//! trunk and push, broken or not, as for a failed own-CI run, the push
+//! traced `rebase N broken` when it happens. Until then the pull request
+//! stays where it was, batchable. Told that it probably fails together
+//! with another, the author can do nothing until that one lands. Each
+//! notice is judged against the truth — broken now, or in conflict with
+//! the pull request it names — and the first a pull request receives is
+//! kept for the report.
+//!
 //! Each policy runs under an [`Admission`]: what the queue asks of a pull
 //! request before it sees it. Under `label`, dorfq's, a pull request is in
 //! the queue from arrival; ejected for the conflict with trunk it has, it
@@ -71,8 +82,9 @@
 //!
 //! [`simulate`] runs every policy of a [`SimConfig`] at every replication
 //! and returns a [`Report`]: runner-hours per landed pull request, time to
-//! land, to reject and from breaking to ejection, wasted runner time and
-//! false ejections, one column per policy. Traced, the first replication of each policy is recorded as
+//! land, to reject and from breaking to ejection, from breaking to the
+//! first notice, wasted runner time, false ejections and false notices,
+//! one column per policy. Traced, the first replication of each policy is recorded as
 //! [`TraceEvent`]s: every step and its plan, and everything the world did.
 //! [`Report::to_json`] writes the report, its configuration and those
 //! traces as one JSON document, the input of the report site.
@@ -103,7 +115,7 @@ pub use rng::{SplitMix64, Streams};
 pub use sweep::{
     Axis, Point, PointReport, SWEEP_SCHEMA, SweepConfig, SweepConfigError, SweepReport, sweep,
 };
-pub use trace::{PlannedEject, PlannedStart, Rebase, TraceEvent};
+pub use trace::{PlannedPr, PlannedStart, Rebase, TraceEvent};
 pub use world::World;
 
 /// Non-empty plans at one instant after which a scheduler is livelocked.
@@ -322,6 +334,9 @@ fn execute(forge: &mut dyn Forge, plan: &Plan) -> Result<(), ForgeError> {
     for &b in &plan.land {
         forge.land(b)?;
     }
+    for n in &plan.notify {
+        forge.notify(n.pr, &n.reason)?;
+    }
     for s in &plan.start {
         forge.start_batch(s)?;
     }
@@ -361,6 +376,14 @@ fn step_event(t: u64, o: &Observation, plan: &Plan) -> TraceEvent {
         queued: o.prs.len(),
         in_flight,
         land: plan.land.iter().map(|b| b.0).collect(),
+        notify: plan
+            .notify
+            .iter()
+            .map(|n| PlannedPr {
+                pr: n.pr.0,
+                reason: n.reason.to_string(),
+            })
+            .collect(),
         start: plan
             .start
             .iter()
@@ -372,7 +395,7 @@ fn step_event(t: u64, o: &Observation, plan: &Plan) -> TraceEvent {
         eject: plan
             .eject
             .iter()
-            .map(|e| PlannedEject {
+            .map(|e| PlannedPr {
                 pr: e.pr.0,
                 reason: e.reason.to_string(),
             })

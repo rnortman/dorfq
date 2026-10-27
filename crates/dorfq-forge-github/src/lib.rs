@@ -120,8 +120,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use dorfq_core::ledger::Ledger;
 use dorfq_core::{
     BatchId, BatchMember, BatchStart, BatchState, BatchStatus, CiStatus, ConflictWith, Departed,
-    Departure, EjectReason, Forge, ForgeError, Hold, LandRefusal, Observation, PrBase, PrNumber,
-    PrSnapshot, PrStatus, Sha, Timestamp, Withdrawal,
+    Departure, EjectReason, Forge, ForgeError, Hold, LandRefusal, NoticeReason, Observation,
+    PrBase, PrNumber, PrSnapshot, PrStatus, Sha, Timestamp, Withdrawal,
 };
 
 use api::{ApiError, GitHubApi, Merge, PrSummary, RefEntry, RefUpdate};
@@ -737,8 +737,8 @@ impl GitHubForge {
     /// already ends with that, naming the same blocker. A pull request in
     /// `entered` is greeted unless its comment thread shows it was greeted
     /// already. One that is `Waiting` and was not at the latest observation
-    /// is told what holds it, unless it entered and its thread already ends
-    /// with that. Holds that are only
+    /// is told what holds it, unless it entered and the last transition its
+    /// thread records is that. Holds that are only
     /// `MergeabilityUnknown` are not told: GitHub recomputes mergeability
     /// after every move of trunk, and the author has nothing to do.
     fn transitions(
@@ -795,7 +795,7 @@ impl GitHubForge {
                         event: Event::Queued,
                     });
                 }
-                messages::last_marker(&thread) == Some(Marker::Held)
+                messages::last_transition_marker(&thread) == Some(Marker::Held)
             } else {
                 self.held_at_latest(pr)
             };
@@ -1250,6 +1250,21 @@ impl Forge for GitHubForge {
             event: Event::Ejected {
                 reason: reason.clone(),
                 base,
+            },
+        });
+        self.flush()
+    }
+
+    /// Tells the author what the scheduler believes; removes nothing. The
+    /// comment goes through the outbox, so a transient failure to post it
+    /// keeps it for the next flush.
+    fn notify(&mut self, pr: PrNumber, reason: &NoticeReason) -> Result<(), ForgeError> {
+        self.ledger.check_notify(pr)?;
+        self.ledger.notified(pr);
+        self.outbox.push_back(Message {
+            pr,
+            event: Event::Notice {
+                reason: reason.clone(),
             },
         });
         self.flush()

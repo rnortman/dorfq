@@ -139,7 +139,11 @@ and `max_batch` to what the repository's CI can take, and the `p_flake` and
 `p_interact` priors from its history, `p_miss` from the rate its CI has
 been seen to pass a change that was broken, and `p_trunk` from how often
 trunk or CI has broken between two passing runs for a reason no queued
-change explains.
+change explains. `eject_above` is the belief at which a failed run's
+culprit is ejected; `notify_above`, at most `eject_above`, the belief at
+which its author is told it is probably broken without an ejection, and at
+which each of two pull requests that fail only together is told so,
+naming the other.
 
 Run it wherever outbound HTTPS is available:
 
@@ -170,6 +174,11 @@ user unit expects it and restarts the unit if it is running.
   impossible: one made while probes are failing is worth a second look
   before telling its author. A probe still running when trunk moves is
   cancelled; its verdict would be about a trunk that is gone.
+- A comment beginning `<!-- dorfq: notice -->` is the queue telling an
+  author what it believes without acting on it: that the pull request is
+  probably broken against trunk, or probably fails together with another
+  queued pull request. The pull request stays queued. Rebasing and letting
+  its own checks run again is the fastest way to settle it either way.
 - A queue that stops with "batch <id>'s tip is its base" is tracking a batch
   that an earlier build published at its own base, because every member was
   already in trunk. Stop the queue, delete `refs/dorfq/batches/<id>` and the

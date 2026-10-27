@@ -41,6 +41,7 @@ pub(super) fn params() -> BayesConfig {
         w_reject: 1.0,
         w_age: 0.0,
         eject_above: 0.9,
+        notify_above: 0.5,
         others_below: 0.1,
         speculate_above: 0.0,
         speculation: Speculation::Chain,
@@ -65,6 +66,19 @@ pub(super) fn members(prs: &[u64]) -> Vec<Member> {
 pub(super) fn failed_alone(model: &mut Model, id: u64, tree: &[Member]) {
     model.passed(BatchId(2 * id), &[], 0, true);
     model.failed(BatchId(2 * id + 1), tree, 0);
+}
+
+/// Reads `one` and `two` failing together three times at position 0, from
+/// run `first`, each passing alone on trunk twice, the passes between the
+/// failures: their pair is singled out by run `first + 6`.
+pub(super) fn pair_failed(model: &mut Model, one: &[Member], two: &[Member], first: u64) {
+    let both = [one, two].concat();
+    model.failed(BatchId(first), &both, 0);
+    for k in 0..2 {
+        model.passed(BatchId(first + 3 * k + 1), one, 0, true);
+        model.passed(BatchId(first + 3 * k + 2), two, 0, true);
+        model.failed(BatchId(first + 3 * k + 3), &both, 0);
+    }
 }
 
 pub(super) fn bad(n: u64) -> Cause {

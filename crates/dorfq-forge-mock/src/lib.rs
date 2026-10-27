@@ -37,8 +37,8 @@ use std::io::Write;
 use dorfq_core::ledger::Ledger;
 use dorfq_core::{
     BatchId, BatchMember, BatchStart, BatchState, BatchStatus, CiStatus, ConflictWith, Departed,
-    EjectReason, Failure, Forge, ForgeError, Hold, LandRefusal, Observation, PrBase, PrNumber,
-    PrSnapshot, PrStatus, Sha, StackPolicy, Timestamp, Withdrawal,
+    EjectReason, Failure, Forge, ForgeError, Hold, LandRefusal, NoticeReason, Observation, PrBase,
+    PrNumber, PrSnapshot, PrStatus, Sha, StackPolicy, Timestamp, Withdrawal,
 };
 
 use scenario::{OwnCi, PrSpec};
@@ -64,6 +64,8 @@ pub enum Event {
     Landed { tip: Sha },
     /// The scheduler ejected the pull request.
     Ejected { reason: EjectReason },
+    /// The scheduler told the author what it believes, and changed nothing.
+    Notice { reason: NoticeReason },
     /// The pull request's intent was cleared before it landed or was ejected.
     Withdrawn,
     /// The pull request left the queue because its base `on` did.
@@ -82,6 +84,7 @@ impl fmt::Display for Message {
             Event::Testing { batch } => write!(f, "testing in batch {}", batch.0),
             Event::Landed { tip } => write!(f, "landed as {tip}"),
             Event::Ejected { reason } => write!(f, "ejected: {reason}"),
+            Event::Notice { reason } => write!(f, "notice: {reason}"),
             Event::Withdrawn => f.write_str("withdrawn"),
             Event::Blocked { on } => write!(f, "blocked on #{}", on.0),
         }
@@ -505,6 +508,17 @@ impl Forge for MockForge {
         self.tell(
             pr,
             Event::Ejected {
+                reason: reason.clone(),
+            },
+        )
+    }
+
+    fn notify(&mut self, pr: PrNumber, reason: &NoticeReason) -> Result<(), ForgeError> {
+        self.ledger.check_notify(pr)?;
+        self.ledger.notified(pr);
+        self.tell(
+            pr,
+            Event::Notice {
                 reason: reason.clone(),
             },
         )

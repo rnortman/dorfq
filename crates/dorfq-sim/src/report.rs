@@ -32,7 +32,7 @@ pub struct Report {
 /// A metric row: its name, the decimals it prints with, and its value.
 pub(crate) type Row = (&'static str, usize, fn(&Metrics) -> Option<f64>);
 
-pub(crate) const ROWS: [Row; 28] = [
+pub(crate) const ROWS: [Row; 31] = [
     ("arrived", 1, |m| Some(m.arrived as f64)),
     ("ever_bad", 1, |m| Some(m.ever_bad as f64)),
     ("landed_bad", 1, |m| Some(m.landed_bad as f64)),
@@ -58,6 +58,9 @@ pub(crate) const ROWS: [Row; 28] = [
     ("reject_p95_hours", 2, |m| m.reject_p95_hours),
     ("detect_p50_hours", 2, |m| m.detect_p50_hours),
     ("detect_p95_hours", 2, |m| m.detect_p95_hours),
+    ("notice_p50_hours", 2, |m| m.notice_p50_hours),
+    ("notice_p95_hours", 2, |m| m.notice_p95_hours),
+    ("notices_good", 1, |m| Some(m.notices_good as f64)),
     ("ended_hours", 1, |m| Some(m.ended_hours)),
     ("cut_off", 2, |m| Some(f64::from(u8::from(m.cut_off)))),
     ("stalled", 2, |m| Some(f64::from(u8::from(m.stalled)))),
@@ -71,7 +74,7 @@ pub(crate) enum Better {
 }
 
 /// The metrics of [`ROWS`] that have a direction; the rest have none.
-pub(crate) const BETTER: [(&str, Better); 20] = [
+pub(crate) const BETTER: [(&str, Better); 23] = [
     ("landed_bad", Better::Lower),
     ("trunk_broken_hours", Better::Lower),
     ("landed", Better::Higher),
@@ -89,6 +92,9 @@ pub(crate) const BETTER: [(&str, Better); 20] = [
     ("reject_p95_hours", Better::Lower),
     ("detect_p50_hours", Better::Lower),
     ("detect_p95_hours", Better::Lower),
+    ("notice_p50_hours", Better::Lower),
+    ("notice_p95_hours", Better::Lower),
+    ("notices_good", Better::Lower),
     ("ended_hours", Better::Lower),
     ("cut_off", Better::Lower),
     ("stalled", Better::Lower),
@@ -287,6 +293,9 @@ mod tests {
             reject_p95_hours: None,
             detect_p50_hours: None,
             detect_p95_hours: None,
+            notice_p50_hours: Some(1.5),
+            notice_p95_hours: Some(3.0),
+            notices_good: 2,
             ended_hours: 80.0,
             cut_off: landed < 10,
             stalled: false,
@@ -394,6 +403,9 @@ mod tests {
                 "reject_p95_hours",
                 "detect_p50_hours",
                 "detect_p95_hours",
+                "notice_p50_hours",
+                "notice_p95_hours",
+                "notices_good",
                 "ended_hours",
                 "cut_off",
                 "stalled",
@@ -417,6 +429,8 @@ mod tests {
         assert_eq!(better("arrived"), None);
         assert_eq!(better("stalled"), Some(Better::Lower));
         assert_eq!(better("detect_p95_hours"), Some(Better::Lower));
+        assert_eq!(better("notice_p95_hours"), Some(Better::Lower));
+        assert_eq!(better("notices_good"), Some(Better::Lower));
         assert_eq!(better("ever_bad"), None);
         assert_eq!(better("landed_bad"), Some(Better::Lower));
         assert_eq!(better("trunk_broken_hours"), Some(Better::Lower));
@@ -476,6 +490,8 @@ mod tests {
         let floor = &document["policies"][0];
         assert_eq!(floor["name"], "floor");
         assert_eq!(floor["replications"][0]["metrics"]["landed"], 4);
+        assert_eq!(floor["replications"][0]["metrics"]["notice_p50_hours"], 1.5);
+        assert_eq!(floor["replications"][0]["metrics"]["notices_good"], 2);
         assert_eq!(
             floor["replications"][0]["metrics"]["land_p50_hours"],
             serde_json::Value::Null

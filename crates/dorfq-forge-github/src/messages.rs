@@ -3,16 +3,18 @@
 //! own journal of what it has said.
 //!
 //! The marker is `<!-- dorfq: <event> -->`, with `event` one of `queued`,
-//! `held`, `testing`, `landed`, `ejected`, `withdrawn`, `blocked`; a
-//! `blocked` marker also names the blocker, `blocked #<n>` or
-//! `blocked branch <name>`. A pull request whose last marker is `queued`,
-//! `held` or `testing` was greeted already; any other last marker, or none,
-//! means it is entering the queue.
+//! `held`, `testing`, `landed`, `ejected`, `notice`, `withdrawn`,
+//! `blocked`; a `blocked` marker also names the blocker, `blocked #<n>` or
+//! `blocked branch <name>`. A `notice` is the scheduler telling the author
+//! what it believes; it is not a transition, the pull request stays queued,
+//! and every reading of the thread skips it. A pull request whose last
+//! transition marker is `queued`, `held` or `testing` was greeted already;
+//! any other, or none, means it is entering the queue.
 
 use std::collections::BTreeSet;
 use std::fmt;
 
-use dorfq_core::{BatchId, ConflictWith, EjectReason, Hold, PrBase, PrNumber, Sha};
+use dorfq_core::{BatchId, ConflictWith, EjectReason, Hold, NoticeReason, PrBase, PrNumber, Sha};
 
 /// Something the forge tells a pull request's author.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +37,9 @@ pub enum Event {
     Landed { batch: BatchId, tip: Sha },
     /// The scheduler ejected the pull request, which was based on `base`.
     Ejected { reason: EjectReason, base: PrBase },
+    /// The scheduler told the author what it believes; the pull request
+    /// stays queued.
+    Notice { reason: NoticeReason },
     /// The pull request left the queue by neither landing nor ejection.
     Withdrawn,
     /// The pull request carries the label but is not enqueued, for `on`.
@@ -69,6 +74,7 @@ pub enum Marker {
     Testing,
     Landed,
     Ejected,
+    Notice,
     Withdrawn,
     Blocked,
 }
@@ -84,6 +90,7 @@ impl Marker {
             Marker::Testing => "testing",
             Marker::Landed => "landed",
             Marker::Ejected => "ejected",
+            Marker::Notice => "notice",
             Marker::Withdrawn => "withdrawn",
             Marker::Blocked => "blocked",
         }
@@ -101,6 +108,7 @@ impl Marker {
             Marker::Testing,
             Marker::Landed,
             Marker::Ejected,
+            Marker::Notice,
             Marker::Withdrawn,
             Marker::Blocked,
         ]
@@ -115,15 +123,29 @@ pub fn last_marker(bodies: &[String]) -> Option<Marker> {
     bodies.iter().rev().find_map(|body| Marker::of(body))
 }
 
-/// Whether the last comment in `bodies` (oldest first) that carries a
-/// marker told the author the pull request is blocked on `on`.
-pub fn told_blocked(bodies: &[String], on: &Blocker) -> bool {
-    let marker = format!("{MARKER_OPEN}{}{MARKER_CLOSE}", blocked_marker(on));
+/// The last comment in `bodies` (oldest first) whose marker is a
+/// transition, with that marker: a `notice` is skipped.
+fn last_transition(bodies: &[String]) -> Option<(&str, Marker)> {
     bodies
         .iter()
         .rev()
-        .find(|body| Marker::of(body).is_some())
-        .is_some_and(|body| body.starts_with(&marker))
+        .find_map(|body| match Marker::of(body)? {
+            Marker::Notice => None,
+            marker => Some((body.as_str(), marker)),
+        })
+}
+
+/// The marker of the last comment in `bodies` (oldest first) that carries
+/// a transition marker.
+pub fn last_transition_marker(bodies: &[String]) -> Option<Marker> {
+    last_transition(bodies).map(|(_, marker)| marker)
+}
+
+/// Whether the last comment in `bodies` (oldest first) that carries a
+/// transition marker told the author the pull request is blocked on `on`.
+pub fn told_blocked(bodies: &[String], on: &Blocker) -> bool {
+    let marker = format!("{MARKER_OPEN}{}{MARKER_CLOSE}", blocked_marker(on));
+    last_transition(bodies).is_some_and(|(body, _)| body.starts_with(&marker))
 }
 
 /// The text of the marker of a comment saying blocked on `on`.
@@ -135,7 +157,7 @@ fn blocked_marker(on: &Blocker) -> String {
 /// by a process that did not know it, is to be greeted.
 pub fn needs_greeting(bodies: &[String]) -> bool {
     !matches!(
-        last_marker(bodies),
+        last_transition_marker(bodies),
         Some(Marker::Queued | Marker::Held | Marker::Testing)
     )
 }
@@ -148,6 +170,7 @@ impl Event {
             Event::Testing { .. } => Marker::Testing,
             Event::Landed { .. } => Marker::Landed,
             Event::Ejected { .. } => Marker::Ejected,
+            Event::Notice { .. } => Marker::Notice,
             Event::Withdrawn => Marker::Withdrawn,
             Event::Blocked { .. } => Marker::Blocked,
         }
@@ -182,6 +205,7 @@ impl Message {
                     next_step(reason, *base, trunk, label)
                 )
             }
+            Event::Notice { reason } => notice(reason, trunk),
             Event::Withdrawn => {
                 "Left the merge queue (label removed, pull request closed, or retargeted)."
                     .to_owned()
@@ -235,14 +259,33 @@ fn next_step(reason: &EjectReason, base: PrBase, trunk: &str, label: &str) -> St
              again.",
             branch = crate::batch_branch(*batch)
         ),
-        EjectReason::InteractsWith { pr, batch } => format!(
-            "It passes without #{pr} but fails with it, last on `{branch}`. Once #{pr} \
-             lands, rebase onto `{trunk}` and fix the interaction, then re-add the \
-             `{label}` label.",
-            pr = pr.0,
+        _ => format!("Re-add the `{label}` label once that is addressed."),
+    }
+}
+
+/// What the scheduler believes about a queued pull request, in a sentence
+/// per reason.
+fn notice(reason: &NoticeReason, trunk: &str) -> String {
+    match reason {
+        NoticeReason::Broken { batch } => format!(
+            "Heads-up from the merge queue: this pull request is probably broken against \
+             `{trunk}`. Batch {n} (`{branch}`) failed and nothing else in it explains the \
+             failure. It stays in the queue and is ejected only if the queue becomes sure; \
+             to settle it sooner, rebase onto `{trunk}` and let its own checks run again.",
+            n = batch.0,
             branch = crate::batch_branch(*batch)
         ),
-        _ => format!("Re-add the `{label}` label once that is addressed."),
+        NoticeReason::InteractsWith { pr, batch } => format!(
+            "Heads-up from the merge queue: this pull request probably passes on its own but \
+             fails together with #{pr}, last in batch {n} (`{branch}`). It stays in the queue \
+             and is not tested with #{pr} again. If #{pr} lands first, this one is tested alone \
+             on the new `{trunk}` and ejected if that fails; to settle it sooner, rebase onto \
+             `{trunk}` once #{pr} lands and fix the interaction. If this one lands first, the \
+             interaction is #{pr}'s to fix.",
+            pr = pr.0,
+            n = batch.0,
+            branch = crate::batch_branch(*batch)
+        ),
     }
 }
 
@@ -263,6 +306,7 @@ impl fmt::Display for Message {
             Event::Testing { batch, .. } => write!(f, "testing in batch {}", batch.0),
             Event::Landed { tip, .. } => write!(f, "landed as {tip}"),
             Event::Ejected { reason, .. } => write!(f, "ejected: {reason}"),
+            Event::Notice { reason } => write!(f, "notice: {reason}"),
             Event::Withdrawn => f.write_str("withdrawn"),
             Event::Blocked { on } => write!(f, "blocked on {on}"),
         }
@@ -311,10 +355,6 @@ mod tests {
                 with: ConflictWith::Pr(PrNumber(9)),
             }),
             ejected(EjectReason::BatchFailed { batch: BatchId(7) }),
-            ejected(EjectReason::InteractsWith {
-                pr: PrNumber(9),
-                batch: BatchId(7),
-            }),
             Event::Withdrawn,
             Event::Blocked {
                 on: Blocker::Pr(PrNumber(9)),
@@ -327,6 +367,15 @@ mod tests {
                     with: ConflictWith::Pr(PrNumber(9)),
                 },
                 base: PrBase::Pr(PrNumber(9)),
+            },
+            Event::Notice {
+                reason: NoticeReason::Broken { batch: BatchId(7) },
+            },
+            Event::Notice {
+                reason: NoticeReason::InteractsWith {
+                    pr: PrNumber(9),
+                    batch: BatchId(7),
+                },
             },
         ]
     }
@@ -371,6 +420,8 @@ mod tests {
         assert!(!told_blocked(&[], &on_pr));
         let bare = vec!["<!-- dorfq: blocked -->\ntext".to_owned()];
         assert!(!told_blocked(&bare, &on_pr));
+        let notified = vec![blocked(&on_pr), "<!-- dorfq: notice -->\ntext".to_owned()];
+        assert!(told_blocked(&notified, &on_pr));
     }
 
     #[test]
@@ -402,37 +453,67 @@ mod tests {
         assert!(
             bodies[6].contains("batch 7 failed. The batch failed its checks on `dorfq/batch/7`")
         );
-        assert!(bodies[7].contains("fails together with #9 (batch 7)"));
-        assert!(bodies[7].contains("last on `dorfq/batch/7`. Once #9 lands"));
         assert!(
-            bodies[8].contains(
+            bodies[7].contains(
                 "Left the merge queue (label removed, pull request closed, or retargeted)."
             )
         );
         assert!(
-            bodies[9].contains(
+            bodies[8].contains(
                 "Not in the merge queue: its base #9 is not queued. It enters the queue \
                  once #9 does, or retarget it onto `main`."
+            ),
+            "{}",
+            bodies[8]
+        );
+        assert!(
+            bodies[9].contains(
+                "Not in the merge queue: it targets `release`, which is neither `main` nor \
+                 the branch of a queued pull request. Retarget it onto `main` or onto a \
+                 queued pull request's branch."
             ),
             "{}",
             bodies[9]
         );
         assert!(
             bodies[10].contains(
-                "Not in the merge queue: it targets `release`, which is neither `main` nor \
-                 the branch of a queued pull request. Retarget it onto `main` or onto a \
-                 queued pull request's branch."
+                "conflicts with #9. It does not merge into its base #9. Rebase onto #9's \
+                 branch, then re-add the `queue` label."
             ),
             "{}",
             bodies[10]
         );
         assert!(
             bodies[11].contains(
-                "conflicts with #9. It does not merge into its base #9. Rebase onto #9's \
-                 branch, then re-add the `queue` label."
+                "Heads-up from the merge queue: this pull request is probably broken against \
+                 `main`. Batch 7 (`dorfq/batch/7`) failed and nothing else in it explains \
+                 the failure. It stays in the queue"
             ),
             "{}",
             bodies[11]
+        );
+        assert!(
+            bodies[11].contains("rebase onto `main` and let its own checks run again."),
+            "{}",
+            bodies[11]
+        );
+        assert!(
+            bodies[12].contains(
+                "probably passes on its own but fails together with #9, last in batch 7 \
+                 (`dorfq/batch/7`). It stays in the queue and is not tested with #9 again"
+            ),
+            "{}",
+            bodies[12]
+        );
+        assert!(
+            bodies[12].contains("rebase onto `main` once #9 lands and fix the interaction."),
+            "{}",
+            bodies[12]
+        );
+        assert!(
+            bodies[12].contains("the interaction is #9's to fix"),
+            "{}",
+            bodies[12]
         );
     }
 
@@ -452,11 +533,12 @@ mod tests {
                 "message to pr 12: ejected: conflicts with trunk".to_owned(),
                 "message to pr 12: ejected: conflicts with #9".to_owned(),
                 "message to pr 12: ejected: batch 7 failed".to_owned(),
-                "message to pr 12: ejected: fails together with #9 (batch 7)".to_owned(),
                 "message to pr 12: withdrawn".to_owned(),
                 "message to pr 12: blocked on #9".to_owned(),
                 "message to pr 12: blocked on branch release".to_owned(),
                 "message to pr 12: ejected: conflicts with #9".to_owned(),
+                "message to pr 12: notice: probably broken against trunk (batch 7)".to_owned(),
+                "message to pr 12: notice: probably fails together with #9 (batch 7)".to_owned(),
             ]
         );
     }
@@ -476,6 +558,10 @@ mod tests {
             Marker::of("<!-- dorfq: blocked branch release -->\nhi"),
             Some(Marker::Blocked)
         );
+        assert_eq!(
+            Marker::of("<!-- dorfq: notice -->\nhi"),
+            Some(Marker::Notice)
+        );
         assert_eq!(Marker::of("<!-- dorfq: merged -->"), None);
         assert_eq!(Marker::of("<!-- dorfq: queued"), None);
         assert_eq!(Marker::of("LGTM"), None);
@@ -489,10 +575,14 @@ mod tests {
         for greeted in ["queued", "held", "testing"] {
             let thread = vec![body("withdrawn"), body(greeted), "LGTM".to_owned()];
             assert!(!needs_greeting(&thread), "{greeted}");
+            let notified = vec![body("withdrawn"), body(greeted), body("notice")];
+            assert!(!needs_greeting(&notified), "{greeted} then notice");
         }
         for left in ["landed", "ejected", "withdrawn", "blocked"] {
             let thread = vec![body("queued"), body(left), "please re-queue".to_owned()];
             assert!(needs_greeting(&thread), "{left}");
+            let notified = vec![body("queued"), body(left), body("notice")];
+            assert!(needs_greeting(&notified), "{left} then notice");
         }
     }
 }

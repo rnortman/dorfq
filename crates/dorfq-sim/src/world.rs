@@ -8,12 +8,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use dorfq_core::ledger::Ledger;
 use dorfq_core::{
     BatchId, BatchMember, BatchStart, BatchState, BatchStatus, CiStatus, ConflictWith, Departed,
-    EjectReason, Failure, Forge, ForgeError, Hold, LandRefusal, Observation, PrBase, PrNumber,
-    PrSnapshot, PrStatus, Sha, StackPolicy, Timestamp, Withdrawal,
+    EjectReason, Failure, Forge, ForgeError, Hold, LandRefusal, NoticeReason, Observation, PrBase,
+    PrNumber, PrSnapshot, PrStatus, Sha, StackPolicy, Timestamp, Withdrawal,
 };
 
 use crate::config::{Admission, Minutes, WorldConfig};
-use crate::metrics::{Break, End, Exit, Metrics, PrCiRecord, PrRecord, RunRecord, RunningSeconds};
+use crate::metrics::{
+    Break, End, Exit, FirstNotice, Metrics, PrCiRecord, PrRecord, RunRecord, RunningSeconds,
+};
 use crate::rng::{SplitMix64, Streams, mix, unit};
 use crate::trace::{Rebase, TraceEvent};
 
@@ -48,6 +50,9 @@ enum Event {
     /// pull request is broken, else re-runs it on the same head once trunk
     /// is green.
     Fix(PrNumber),
+    /// The author acts on the queue's notice that the pull request is
+    /// probably broken: rebases it onto trunk and pushes, broken or not.
+    Heed(PrNumber),
     /// A push repairs, in place, the break that the landing of this batch
     /// put on trunk.
     Repair(BatchId),
@@ -84,6 +89,8 @@ struct SimPr {
     /// The pending `fix` was scheduled as a re-run and has no `rebase` line
     /// yet.
     rerun: bool,
+    /// Its author's pending push in answer to the queue's notice.
+    heed: Option<EventKey>,
     conflicts_with_trunk: bool,
     key: u64,
     /// The pull request it is stacked on, set at arrival.
@@ -728,12 +735,7 @@ impl World {
             Event::CiDone(Job::Batch(batch)) => self.complete(batch),
             Event::CiDone(Job::PrCi(pr)) => self.complete_pr_ci(pr),
             Event::Repush(pr) => {
-                // Its author is mid-rebase, its own or its base's, or about to
-                // push a fix: no head.
-                let p = &self.prs[&pr];
-                let busy = p.fix.is_some()
-                    || matches!(p.out, Some(Out::Rebasing { .. } | Out::WithBase { .. }));
-                if !busy {
+                if !self.pushing(pr) {
                     let pushed = self.push(pr, false);
                     self.recheck(pushed);
                 }
@@ -760,14 +762,19 @@ impl World {
                         why: Rebase::Broken,
                     });
                 }
-                let p = self.prs.get_mut(&pr).expect("arrived");
-                p.fix = None;
-                p.record.rebases += 1;
-                p.broke_at = None;
-                p.last_fix_push = Some(self.now);
-                self.note(|t| TraceEvent::Fixed { t, pr: pr.0 });
-                let pushed = self.push(pr, false);
-                self.recheck(pushed);
+                self.prs.get_mut(&pr).expect("arrived").fix = None;
+                self.fix_push(pr);
+            }
+            Event::Heed(pr) => {
+                self.prs.get_mut(&pr).expect("arrived").heed = None;
+                if !self.pushing(pr) {
+                    self.note(|t| TraceEvent::Rebase {
+                        t,
+                        pr: pr.0,
+                        why: Rebase::Broken,
+                    });
+                    self.fix_push(pr);
+                }
             }
             Event::Rebase(pr) => {
                 let p = self.prs.get_mut(&pr).expect("arrived");
@@ -817,23 +824,53 @@ impl World {
         }
     }
 
-    /// Drops `pr`'s pending fix push or re-run, if any: a push by someone
-    /// else is about to re-head it, a new run is its re-run, or it is
-    /// leaving.
+    /// Drops `pr`'s pending fix push or re-run, if any.
     fn cancel_fix(&mut self, pr: PrNumber) {
         if let Some(key) = self.prs.get_mut(&pr).expect("arrived").fix.take() {
             self.events.remove(&key);
         }
     }
 
+    /// Drops every push `pr`'s author has pending — the fix or re-run, and
+    /// the answer to a notice: a push by someone else is about to re-head
+    /// it, or it is leaving.
+    fn cancel_pushes(&mut self, pr: PrNumber) {
+        self.cancel_fix(pr);
+        if let Some(key) = self.prs.get_mut(&pr).expect("arrived").heed.take() {
+            self.events.remove(&key);
+        }
+    }
+
+    /// Whether `pr`'s author is pushing already: mid-rebase, its own or its
+    /// base's, or about to push a fix. A pending heed is not counted: every
+    /// push cancels it.
+    fn pushing(&self, pr: PrNumber) -> bool {
+        let p = &self.prs[&pr];
+        p.fix.is_some() || matches!(p.out, Some(Out::Rebasing { .. } | Out::WithBase { .. }))
+    }
+
+    /// `pr`'s author pushes a rebase onto trunk as it is now: the fix of
+    /// its breakage when it is broken, which `fixed` records, and a new
+    /// head either way.
+    fn fix_push(&mut self, pr: PrNumber) {
+        let p = self.prs.get_mut(&pr).expect("arrived");
+        if p.broke_at.take().is_some() {
+            p.last_fix_push = Some(self.now);
+            self.note(|t| TraceEvent::Fixed { t, pr: pr.0 });
+        }
+        self.prs.get_mut(&pr).expect("arrived").record.rebases += 1;
+        let pushed = self.push(pr, false);
+        self.recheck(pushed);
+    }
+
     /// Gives `pr` and every present pull request stacked on it a new head,
-    /// each with its own CI requested and any pending fix push dropped, and
-    /// returns them, `pr` first. `pr`'s run is `billed` as given; its
-    /// descendants' never are.
+    /// each with its own CI requested and any pending push of its author's
+    /// dropped, and returns them, `pr` first. `pr`'s run is `billed` as
+    /// given; its descendants' never are.
     fn push(&mut self, pr: PrNumber, billed: bool) -> Vec<PrNumber> {
         let pushed: Vec<PrNumber> = std::iter::once(pr).chain(self.descendants(pr)).collect();
         for &p in &pushed {
-            self.cancel_fix(p);
+            self.cancel_pushes(p);
             let head = self.mint();
             self.prs.get_mut(&p).expect("arrived").head = head;
             self.note(|t| TraceEvent::Repush { t, pr: p.0 });
@@ -877,6 +914,7 @@ impl World {
             left: None,
             rebases: 0,
             ever_bad: false,
+            notice: None,
         };
         let atomic = atomic && base.is_some();
         let pr = SimPr {
@@ -886,6 +924,7 @@ impl World {
             last_fix_push: None,
             fix: None,
             rerun: false,
+            heed: None,
             conflicts_with_trunk: conflicts && may_conflict,
             key,
             base,
@@ -941,7 +980,7 @@ impl World {
     /// of the rebase below it.
     fn out_with_base(&mut self, pr: PrNumber) {
         let on = self.prs[&pr].base().expect("stacked");
-        self.cancel_fix(pr);
+        self.cancel_pushes(pr);
         self.set_out(pr, Some(Out::WithBase { on }));
         let bad = self.bad_since(pr).is_some();
         self.note(|t| TraceEvent::Blocked {
@@ -953,10 +992,10 @@ impl World {
         });
     }
 
-    /// `pr`'s author starts rebasing it for `why`, dropping any pending fix
-    /// push; the push is drawn from its own clock.
+    /// `pr`'s author starts rebasing it for `why`, dropping any other push
+    /// pending; the push is drawn from its own clock.
     fn begin_rebase(&mut self, pr: PrNumber, why: Rebase) {
-        self.cancel_fix(pr);
+        self.cancel_pushes(pr);
         let minutes = self.config.rebase_minutes;
         let delay = seconds(&mut self.prs.get_mut(&pr).expect("arrived").own, minutes);
         let push = self.schedule(self.now + delay, Event::Rebase(pr));
@@ -1007,7 +1046,8 @@ impl World {
     }
 
     /// Records `pr`'s exit now and cancels its churn clocks and any pending
-    /// rebase or fix push; its own CI run is not cancelled.
+    /// rebase, fix push or answer to a notice; its own CI run is not
+    /// cancelled.
     fn depart(&mut self, pr: PrNumber, exit: Exit) {
         let now = self.now;
         let p = self.prs.get_mut(&pr).expect("arrived");
@@ -1022,7 +1062,13 @@ impl World {
             Some(Out::Rebasing { push, .. }) => Some(push),
             _ => None,
         };
-        let clocks = [p.repush.take(), p.withdraw.take(), p.fix.take(), push];
+        let clocks = [
+            p.repush.take(),
+            p.withdraw.take(),
+            p.fix.take(),
+            p.heed.take(),
+            push,
+        ];
         if superseded {
             self.untrace_blocked(pr);
         }
@@ -1146,8 +1192,6 @@ impl World {
     /// re-running it when it was not broken (see [`Event::Fix`]). It stays
     /// where it is: held in the queue under `label`, checking under
     /// `github`.
-    // TODO(soft-eject): a scheduler's notice that a pull request is probably
-    // broken would start this fix too, with some probability.
     fn begin_fix(&mut self, pr: PrNumber) {
         let minutes = self.config.rebase_minutes;
         let delay = seconds(&mut self.prs.get_mut(&pr).expect("arrived").own, minutes);
@@ -1525,6 +1569,50 @@ impl Forge for World {
             );
         }
         self.ledger.ejected(pr);
+        Ok(())
+    }
+
+    /// Judges the notice against the truth — broken against trunk now, or
+    /// in conflict with the named pull request — and keeps the pull
+    /// request's first. Told it is probably broken, its author rebases and
+    /// pushes with probability `p_heed`, `rebase_minutes` later, unless a
+    /// push of theirs is already pending; told it fails together with
+    /// another, the author can do nothing before that one lands.
+    fn notify(&mut self, pr: PrNumber, reason: &NoticeReason) -> Result<(), ForgeError> {
+        self.ledger.check_notify(pr)?;
+        let (justified, waited) = match reason {
+            NoticeReason::Broken { .. } => match self.bad_since(pr) {
+                Some(since) => {
+                    let from = since.max(self.prs[&pr].record.arrived_at);
+                    (true, Some(self.now - from))
+                }
+                None => (false, None),
+            },
+            NoticeReason::InteractsWith { pr: other, .. } => (self.conflicts(pr, *other), None),
+        };
+        let first = FirstNotice {
+            t: self.now,
+            justified,
+            waited,
+        };
+        let p = self.prs.get_mut(&pr).expect("arrived");
+        p.record.notice.get_or_insert(first);
+        self.note(|t| TraceEvent::Notice {
+            t,
+            pr: pr.0,
+            reason: reason.to_string(),
+            justified,
+        });
+        if matches!(reason, NoticeReason::Broken { .. }) {
+            let p = self.prs.get_mut(&pr).expect("arrived");
+            let heeds = p.own.bernoulli(self.config.p_heed);
+            if heeds && p.fix.is_none() && p.heed.is_none() {
+                let delay = seconds(&mut p.own, self.config.rebase_minutes);
+                let key = self.schedule(self.now + delay, Event::Heed(pr));
+                self.prs.get_mut(&pr).expect("arrived").heed = Some(key);
+            }
+        }
+        self.ledger.notified(pr);
         Ok(())
     }
 }
