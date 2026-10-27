@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "allthechanges"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a0c2ad5e9dbf7897e10eca3244ccd4caa35489dc3560bfab712b0535847df8a"
+checksum = "7eedca9981ec0fe5edd33441615d97ab6e16932a8b83feed7b73ce9079113474"
 dependencies = [
  "clap",
  "jiff",

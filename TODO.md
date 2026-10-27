@@ -6,15 +6,13 @@ where the work happens. Slugs are the join key: adding a TODO requires both
 halves, and removing one removes both.
 
 A new entry is never written here: it is a fragment, `todo.d/<slug>.md`, which
-`make todo-gather` or `make release` folds into `## Open` below. Between
-gathers the open list is this file plus `todo.d/`;
+`make todo-gather` or `make release` folds in below as a `` ## `<slug>` ``
+entry. Between gathers the open list is this file plus `todo.d/`;
 `make changes ARGS="todo query"` lists the fragments.
 
 Every entry is public writing.
 
-## Open
-
-### bayes-atomic-unit-resolution
+## `bayes-atomic-unit-resolution`
 
 An `Atomic` unit whose runs all fail blames every member equally under
 `bayes`: each member's `Bad` cause is exercised by every run of the unit,
@@ -26,7 +24,7 @@ for a unit that fails alone, measured on a broken member of a unit of
 seven in the simulator. Model design. The `TODO(bayes-atomic-unit-resolution)`
 comment is on `singled_out` in `crates/dorfq-scheduler/src/bayes/policy.rs`.
 
-### bayes-atomic-unit-starvation
+## `bayes-atomic-unit-starvation`
 
 The Bayesian scheduler grows a batch from whole units, lowest combined
 chance of failing over its members' mean value first; a unit is every pull
@@ -53,7 +51,7 @@ reserved start after some number of skips) sized in that world against the
 whole wait, selection in `step` included. Deferred because the rule changes
 which batch the extension emits, which is design work.
 
-### bayes-pair-eject-timing
+## `bayes-pair-eject-timing`
 
 When `bayes` singles out a pair of pull requests while both are still
 queued, `culprit` in `crates/dorfq-scheduler/src/bayes/policy.rs` ejects the
@@ -82,7 +80,7 @@ singled-out pair is counted `ejected_good`, and the newer half of a real
 pair still leaves the queue after the older lands, counted `ejected_bad`.
 The `TODO(bayes-pair-eject-timing)` comment is on `culprit`.
 
-### bayes-pair-search
+## `bayes-pair-search`
 
 The `bayes` scheduler's suspect batches search a set of materialised cross
 pairs one pair per run, in rank order — under `speculation = "chain"` as
@@ -97,7 +95,7 @@ strategy is design work: which subsets to run, how their verdicts update the
 pair beliefs, and how a suspect batch of several pull requests is scored
 against the extensions.
 
-### chain-collapse-under-runner-queue
+## `chain-collapse-under-runner-queue`
 
 Both pipelining schedulers bound their chain's depth by `lanes`, counting
 every batch `is_pending` in `crates/dorfq-scheduler/src/lib.rs` accepts, and
@@ -119,7 +117,7 @@ extend a chain whose end has not begun running, or a rule that bounds
 waiting batches without it. Deferred because the contract change and the
 rule's effect on each scheduler's chain are design work.
 
-### dependency-audit-lane
+## `dependency-audit-lane`
 
 A license and advisory audit of the Rust dependency graph (for example
 `cargo deny`), fetched through Bazel like every other tool, run by a
@@ -133,7 +131,7 @@ audit through Bazel, a workflow that runs it nightly and on demand, and
 nothing new in `check`. The `TODO(dependency-audit-lane)` comment sits above
 `check` in the `Makefile`, beside where that target goes.
 
-### errhandling-write-applied-but-reported-transient-tells-authors-wrong-thing
+## `errhandling-write-applied-but-reported-transient-tells-authors-wrong-thing`
 
 A GitHub write can be applied while the client sees a failure (a timeout, a
 `5xx` or a reset connection after the request was processed), which the
@@ -166,7 +164,7 @@ change the answer. The
 comments sit above the label removal in `eject` and above the `testing`
 record write in `start_batch`.
 
-### github-retire-cancels-run
+## `github-retire-cancels-run`
 
 `GitHubForge::retire` deletes a batch's record and branch and never cancels
 the CI run on its tip, so a retired pending batch keeps a runner busy to the
@@ -186,7 +184,7 @@ fake that models runs, and what to do when a cancel is refused. The
 `TODO(github-retire-cancels-run)` comment sits in `GitHubForge::retire` in
 `crates/dorfq-forge-github/src/lib.rs`.
 
-### github-unlanded-moves-lost-on-crash
+## `github-unlanded-moves-lost-on-crash`
 
 The GitHub forge moves each stacked member of a batch onto trunk just before
 it fast-forwards trunk, because GitHub refuses the move once trunk contains
@@ -210,7 +208,7 @@ one compatibility requirement is that a restarted queue reads a `landing`
 record written before the change without stopping. Deferred because the
 window is a few API calls and nothing at today's load has reached it.
 
-### quality-pages-workflow-copies-ci-bazel-setup
+## `quality-pages-workflow-copies-ci-bazel-setup`
 
 Share the Bazel setup between `.github/workflows/ci.yml` and
 `.github/workflows/pages.yml`. Both restore the repository and disk caches
@@ -225,7 +223,7 @@ rewrites the gate's own workflow, so it waits for a moment when no other
 branch is editing `ci.yml`.
 The `TODO(quality-pages-workflow-copies-ci-bazel-setup)` comment sits above the cache steps in `.github/workflows/pages.yml`.
 
-### security-label-grants-unreviewed-landing-on-any-later-head
+## `security-label-grants-unreviewed-landing-on-any-later-head`
 
 The GitHub forge in `crates/dorfq-forge-github/src/lib.rs` enqueues an open
 pull request because it carries the intent label. It never asks which head
@@ -266,7 +264,7 @@ when branch protection's own required checks differ from the configured one.
 The `TODO(security-label-grants-unreviewed-landing-on-any-later-head)`
 comment sits above the label check in `enqueued_bases`.
 
-### soft-eject
+## `soft-eject`
 
 A second, lower belief threshold at which the scheduler tells an author that
 their pull request is probably broken against trunk, without ejecting it.
@@ -300,7 +298,7 @@ on top of the world that models breakage against trunk. The
 `crates/dorfq-scheduler/src/config.rs` and where the simulated world starts
 an author's fix, `begin_fix` in `crates/dorfq-sim/src/world.rs`.
 
-### test-site-app-js-untested-against-report-schema
+## `test-site-app-js-untested-against-report-schema`
 
 Test the report page against the documents it reads. Nothing in the gate
 checks that `site/app.js` parses, or that the fields it reads from a report

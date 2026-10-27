@@ -70,7 +70,7 @@ crate.from_specs(
 crate.spec(
     package = "allthechanges",
     repositories = ["allthechanges_crates"],
-    version = "=0.2.0",
+    version = "=0.3.0",
 )
 crate.annotation(
     crate = "allthechanges",

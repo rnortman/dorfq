@@ -1,8 +1,8 @@
 {
   "binary_crates": [
-    "allthechanges 0.2.0"
+    "allthechanges 0.3.0"
   ],
-  "checksum": "77554827be9f441dee8a41b579b44983f1091bfe01d462c0e894642541de8d81",
+  "checksum": "a256309008b39e7f913d5ddfc6804c790e4ec8057beeab5d311678c2231096bd",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -32,7 +32,7 @@
     ]
   },
   "crates": {
-    "allthechanges 0.2.0": {
+    "allthechanges 0.3.0": {
       "common_attrs": {
         "deps": [
           {
@@ -64,8 +64,8 @@
       "package_url": "https://github.com/rnortman/allthechanges",
       "repository": {
         "Http": {
-          "sha256": "9a0c2ad5e9dbf7897e10eca3244ccd4caa35489dc3560bfab712b0535847df8a",
-          "url": "https://static.crates.io/crates/allthechanges/0.2.0/download"
+          "sha256": "7eedca9981ec0fe5edd33441615d97ab6e16932a8b83feed7b73ce9079113474",
+          "url": "https://static.crates.io/crates/allthechanges/0.3.0/download"
         }
       },
       "targets": [
@@ -82,7 +82,7 @@
           }
         }
       ],
-      "version": "0.2.0"
+      "version": "0.3.0"
     },
     "anstream 1.0.0": {
       "common_attrs": {
@@ -707,7 +707,7 @@
       "common_attrs": {
         "deps": [
           {
-            "id": "allthechanges 0.2.0",
+            "id": "allthechanges 0.3.0",
             "target": "allthechanges"
           }
         ],
@@ -1976,7 +1976,7 @@
     }
   },
   "direct_deps": [
-    "allthechanges 0.2.0"
+    "allthechanges 0.3.0"
   ],
   "direct_dev_deps": [],
   "workspace_members": {
