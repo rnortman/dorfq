@@ -124,7 +124,7 @@ no ATX heading outside a code fence, and every fence is closed. Never add an
 entry by editing `TODO.md`. `make todo-gather` folds the fragments into
 `TODO.md` at any time, `make release` at release time; between gathers
 `make changes ARGS="todo query"` lists them. Removing a done TODO deletes its
-fragment if it still is one, else its `### <slug>` entry in `TODO.md`, and its
+fragment if it still is one, else its `` ## `<slug>` `` entry in `TODO.md`, and its
 comment.
 
 Slugs are the join key; adding a TODO requires both halves. Don't use TODOs for
