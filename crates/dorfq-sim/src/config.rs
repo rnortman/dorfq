@@ -472,6 +472,8 @@ max_batch = 16
             max_batch: 16,
             p_interact: 0.001,
             p_flake: 0.02,
+            p_miss: 0.02,
+            p_trunk: 0.001,
             run_cost: 0.5,
             w_reject: 1.0,
             w_age: 0.02,
@@ -564,9 +566,14 @@ max_batch = 16
                 };
                 assert_eq!((bayes.lanes, bayes.max_batch), (8, 8));
                 assert_eq!(bayes.w_age, 0.02);
+                assert_eq!(bayes.p_trunk, 0.001);
                 assert_eq!(
-                    (bayes.p_interact, bayes.p_flake),
-                    (config.world.p_interact, config.world.p_flake)
+                    (bayes.p_interact, bayes.p_flake, bayes.p_miss),
+                    (
+                        config.world.p_interact,
+                        config.world.p_flake,
+                        config.world.p_miss
+                    )
                 );
                 bayes.speculation
             })

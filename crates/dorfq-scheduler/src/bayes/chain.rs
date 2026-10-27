@@ -9,7 +9,7 @@ use dorfq_core::{
 
 use super::Bayes;
 use super::infer::Inference;
-use super::policy::{Fate, doomed, landing_members};
+use super::policy::{Fate, doomed, is_probe, landing_members, probe_fate, probe_pending};
 use crate::stacks::Stacks;
 use crate::{Member, chain};
 
@@ -18,7 +18,8 @@ use crate::{Member, chain};
 enum Kind {
     /// Built on the chain's end, to land; on an empty chain, on trunk.
     Extension,
-    /// Built on trunk for its verdict about a suspect.
+    /// Built on trunk for its verdict about a suspect; with no members, a
+    /// probe of trunk alone.
     Finder,
 }
 
@@ -44,9 +45,12 @@ impl Bayes {
         let mut plan = Plan::default();
 
         // Land one chain from trunk; a passed finder lands only on trunk
-        // with no chain batch on trunk, and is otherwise retired.
+        // with no chain batch on trunk, and is otherwise retired. A probe,
+        // started here or inherited, is waited for while its base is trunk
+        // and retired on its verdict or once trunk moves, never landed.
         let chain_on_trunk = observation.batches.iter().any(|b| {
             !self.finders.contains(&b.id)
+                && !is_probe(b)
                 && !doomed(heads, b)
                 && b.base == *trunk
                 && matches!(
@@ -64,6 +68,7 @@ impl Bayes {
             let finder = self.finders.contains(&batch.id);
             let base_live = batch.base == *trunk || live.contains(&batch.base);
             let fate = match &batch.state {
+                BatchState::Testing { ci, .. } if is_probe(batch) => probe_fate(batch, ci, trunk),
                 BatchState::Testing { .. } if doomed(heads, batch) => Fate::Retire,
                 BatchState::Testing {
                     ci: CiStatus::Pending,
@@ -136,7 +141,9 @@ impl Bayes {
                 .iter()
                 .zip(&fates)
                 .filter(|(batch, fate)| {
-                    matches!(fate, Fate::Wait) && !self.finders.contains(&batch.id)
+                    matches!(fate, Fate::Wait)
+                        && !self.finders.contains(&batch.id)
+                        && !is_probe(batch)
                 })
                 .map(|(batch, _)| batch),
         );
@@ -191,7 +198,8 @@ impl Bayes {
                 score,
             });
         }
-        for members in self.suspects(inference, &stacks, &pool, &BTreeSet::new()) {
+        let probing = probe_pending(observation);
+        for members in self.suspects(inference, &stacks, &pool, &BTreeSet::new(), !probing) {
             // TODO(bayes-landing-term): a finder is scored at `p_node = 1`
             // with its members' full landing value, as though its pass lands;
             // under load a passed finder is retired, not landed (above), and
@@ -224,9 +232,11 @@ impl Bayes {
         }
         // Liveness: a free lane with ready work runs the best candidate on
         // trunk even when none is worth its run: the fresh batch on an empty
-        // chain, a culprit finder beside a non-empty one. With neither,
-        // nothing starts, and the chain drains.
+        // chain, a culprit finder or a probe beside a non-empty one. With
+        // neither, nothing starts, and the chain drains. While a probe
+        // pends the queue waits on trunk, and nothing starts this way.
         if chosen.is_empty()
+            && !probing
             && let Some(candidate) = candidates.iter().find(|c| c.base == *after)
         {
             chosen.push(candidate);

@@ -1,4 +1,4 @@
-use dorfq_scheduler::{SchedulerConfig, Speculation};
+use dorfq_scheduler::{BayesConfig, SchedulerConfig, Speculation};
 
 use super::*;
 use crate::config::tests::WORLD;
@@ -419,21 +419,16 @@ fn the_document_carries_schema_axes_points_and_cells() {
     assert!(point.get("trace").is_none());
 }
 
-/// Each bayes column's settings at a point, flags aside.
-fn bayes_settings(config: &SimConfig) -> Vec<(usize, usize, f64, f64, f64, f64, f64)> {
+/// Each bayes column's settings at a point, `speculation` aside.
+fn bayes_settings(config: &SimConfig) -> Vec<BayesConfig> {
     config
         .policy
         .iter()
         .filter_map(|p| match &p.scheduler {
-            SchedulerConfig::Bayes(b) => Some((
-                b.lanes,
-                b.max_batch,
-                b.p_flake,
-                b.p_interact,
-                b.run_cost,
-                b.w_reject,
-                b.w_age,
-            )),
+            SchedulerConfig::Bayes(b) => Some(BayesConfig {
+                speculation: Speculation::Chain,
+                ..*b
+            }),
             SchedulerConfig::Bisect { .. } | SchedulerConfig::AllAtOnce {} => None,
         })
         .collect()
@@ -465,14 +460,14 @@ fn the_shipped_speculation_sweep_runs_both_bayes_variants_at_like_settings() {
     for point in &sweep.points {
         let world = &point.config.world;
         let settings = bayes_settings(&point.config);
-        if !max_batches.contains(&settings[0].1) {
-            max_batches.push(settings[0].1);
+        if !max_batches.contains(&settings[0].max_batch) {
+            max_batches.push(settings[0].max_batch);
         }
-        if !w_rejects.contains(&settings[0].5) {
-            w_rejects.push(settings[0].5);
+        if !w_rejects.contains(&settings[0].w_reject) {
+            w_rejects.push(settings[0].w_reject);
         }
-        if !w_ages.contains(&settings[0].6) {
-            w_ages.push(settings[0].6);
+        if !w_ages.contains(&settings[0].w_age) {
+            w_ages.push(settings[0].w_age);
         }
         if !ci.contains(&world.ci_minutes) {
             ci.push(world.ci_minutes);
@@ -480,9 +475,14 @@ fn the_shipped_speculation_sweep_runs_both_bayes_variants_at_like_settings() {
         assert_eq!(settings.len(), 2);
         assert!(settings.iter().all(|s| *s == settings[0]), "{settings:?}");
         assert_eq!(
-            (settings[0].2, settings[0].3),
-            (world.p_flake, world.p_interact)
+            (
+                settings[0].p_flake,
+                settings[0].p_interact,
+                settings[0].p_miss
+            ),
+            (world.p_flake, world.p_interact, world.p_miss)
         );
+        assert_eq!(settings[0].p_trunk, 0.001);
         assert_eq!(world.ci_minutes, world.pr_ci_minutes);
         assert_eq!(
             point.config.policy[0].scheduler,

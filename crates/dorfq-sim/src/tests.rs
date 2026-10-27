@@ -62,6 +62,8 @@ fn bayes() -> SchedulerConfig {
         max_batch: 24,
         p_interact: 0.002,
         p_flake: 0.02,
+        p_miss: 0.02,
+        p_trunk: 0.001,
         run_cost: 0.5,
         w_reject: 1.0,
         w_age: 0.0,

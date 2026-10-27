@@ -14,7 +14,7 @@ use dorfq_core::{
 use super::Bayes;
 use super::infer::Inference;
 use super::model::Cause;
-use super::policy::{Fate, doomed, landing_members};
+use super::policy::{Fate, doomed, is_probe, landing_members, probe_fate, probe_pending};
 use crate::stacks::Stacks;
 use crate::{Member, is_pending};
 
@@ -85,6 +85,9 @@ struct Ground<'a> {
     ejected: &'a BTreeSet<PrNumber>,
     /// Each evidence component's suspects.
     components: &'a [BTreeSet<PrNumber>],
+    /// Trunk once the plan's landings run, the only node a probe is
+    /// started on.
+    after: &'a Sha,
 }
 
 /// The best of `candidates`, by [`Candidate::beats`].
@@ -110,7 +113,9 @@ impl Bayes {
         // on it. `live` is trunk once the landings so far run and the tip
         // of every batch left waiting; a landing removes the base it lands
         // past. A passed batch lands only with no older pending batch on its
-        // base: a hedge never pre-empts the batch it hedges.
+        // base: a hedge never pre-empts the batch it hedges. A probe is no
+        // node and blocks no landing: it is waited for while its base is
+        // trunk and retired on its verdict or once trunk moves, never landed.
         let mut live: BTreeSet<&Sha> = BTreeSet::from([trunk]);
         let mut pending_on: BTreeSet<&Sha> = BTreeSet::new();
         let mut after = trunk;
@@ -118,6 +123,7 @@ impl Bayes {
         for batch in &observation.batches {
             let base_live = live.contains(&batch.base);
             let fate = match &batch.state {
+                BatchState::Testing { ci, .. } if is_probe(batch) => probe_fate(batch, ci, trunk),
                 BatchState::Testing { .. } if doomed(heads, batch) => Fate::Retire,
                 BatchState::Testing {
                     tip,
@@ -168,6 +174,9 @@ impl Bayes {
             let BatchState::Testing { tip, .. } = &batch.state else {
                 continue;
             };
+            if is_probe(batch) {
+                continue;
+            }
             match fate {
                 Fate::Land => {
                     nodes.remove(&batch.base);
@@ -241,9 +250,12 @@ impl Bayes {
             landed: &landed,
             ejected: &ejected,
             components: &components,
+            after,
         };
+        // One probe at a time: none while one pends or once one is chosen.
+        let mut probe = !probe_pending(observation);
         while free > 0 {
-            let candidates = self.candidates(&ground, &nodes, &taken)?;
+            let candidates = self.candidates(&ground, &nodes, &taken, probe)?;
             let Some(mut chosen) = best(&candidates) else {
                 break;
             };
@@ -257,11 +269,15 @@ impl Bayes {
                     _ => break,
                 }
             }
-            let node = nodes
-                .get_mut(&chosen.base)
-                .expect("a candidate is built on a node");
-            node.siblings
-                .push(self.p_pass(inference, &chosen.members, &node.tree));
+            if chosen.members.is_empty() {
+                probe = false;
+            } else {
+                let node = nodes
+                    .get_mut(&chosen.base)
+                    .expect("a candidate is built on a node");
+                node.siblings
+                    .push(self.p_pass(inference, &chosen.members, &node.tree));
+            }
             taken.extend(chosen.members.iter().map(|m| m.0));
             let prs = stacks.ordered(chosen.members.iter().map(|m| m.0));
             plan.start
@@ -278,12 +294,14 @@ impl Bayes {
     /// over the pull requests not `taken`: the extension grown from every
     /// unit, each suspect batch, and each component's extension grown from
     /// the units holding its suspects, each scored with the node's tree as
-    /// `below` at the node's weight.
+    /// `below` at the node's weight; with `probe`, a probe among the
+    /// suspects on `after` alone.
     fn candidates(
         &self,
         ground: &Ground,
         nodes: &BTreeMap<Sha, Node>,
         taken: &BTreeSet<PrNumber>,
+        probe: bool,
     ) -> Result<Vec<Candidate>, SchedulerError> {
         let Ground {
             inference,
@@ -292,6 +310,7 @@ impl Bayes {
             landed,
             ejected,
             components,
+            after,
         } = *ground;
         let pool = self.pool(stacks, heads, taken);
         if pool.is_empty() {
@@ -335,9 +354,8 @@ impl Bayes {
                     grown(&theirs)?;
                 }
             }
-            // TODO(tree-starves-resolution): a suspect batch's score rarely beats a
-            // fresh extension's, so suspects seldom start while fresh work is ready.
-            for members in self.suspects(inference, stacks, &pool, &beneath) {
+            let probe = probe && base == after;
+            for members in self.suspects(inference, stacks, &pool, &beneath, probe) {
                 let score = self
                     .score(inference, &members, &node.tree, weight, ejected)
                     .map_err(SchedulerError::new)?;
@@ -354,7 +372,7 @@ impl Bayes {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{informative, members, params};
+    use super::super::test_support::{failed_alone, informative, members, params};
     use super::*;
     use crate::test_support::*;
     use crate::{BayesConfig, Speculation};
@@ -613,6 +631,7 @@ mod tests {
             &stacks,
             &members(&[2, 3]),
             &BTreeSet::from([PrNumber(1)]),
+            false,
         );
         assert_eq!(sets, vec![members(&[2]), members(&[3]), members(&[2, 3])]);
         informative(&bayes.model, &inference, &sets);
@@ -633,8 +652,9 @@ mod tests {
     /// A scheduler of `speculation` at beliefs one landing above the floor,
     /// whose evidence is two
     /// chains of `n` failed pairs, over 1..=n+1 and 101..=n+101, each held
-    /// for review, with `n + 1` and 101 ready: each chain resolves alone,
-    /// and a failure of {n + 1, 101} would join them into one that does not.
+    /// for review, with `n + 1` and 101 ready, each run in a stretch of its
+    /// own: each chain resolves alone, and a failure of {n + 1, 101} would
+    /// join them into one that resolves only over fewer runs.
     fn two_clusters(speculation: Speculation, n: u64) -> (Bayes, Observation) {
         let mut bayes = Bayes::new(BayesConfig {
             speculation,
@@ -646,65 +666,55 @@ mod tests {
             .collect();
         prs.extend([stale(ready(n + 1), 1), stale(ready(101), 1)]);
         let input = observation(prs, vec![]);
-        bayes.model.sync(&input.prs, &BTreeSet::new(), 0);
+        bayes.model.sync(&input.prs, &BTreeSet::new(), 0, 0);
         bayes.age(&input);
         for r in 1..=n {
-            bayes.model.failed(BatchId(r), &members(&[r, r + 1]), 0);
-            bayes
-                .model
-                .failed(BatchId(100 + r), &members(&[100 + r, 101 + r]), 0);
+            failed_alone(&mut bayes.model, r, &members(&[r, r + 1]));
+            failed_alone(&mut bayes.model, 100 + r, &members(&[100 + r, 101 + r]));
         }
         (bayes, input)
     }
 
     #[test]
-    fn an_unresolvable_hypothetical_scores_no_resolution_under_the_tree_only() {
+    fn an_unresolvable_hypothetical_is_read_over_fewer_runs_under_both() {
         const N: u64 = 5;
         let none = BTreeSet::new();
         let both = members(&[N + 1, 101]);
-
-        let (mut chain, input) = two_clusters(Speculation::Chain, N);
-        let inference = Inference::of(&chain.model).unwrap();
-        assert!(chain.score(&inference, &both, &[], 1.0, &none).is_err());
-        let stacks = Stacks::new(&input);
-        let units = vec![members(&[N + 1]), members(&[101])];
-        let beneath = BTreeSet::new();
-        let footing = stacks.on(&beneath);
-        assert!(
-            chain
-                .grow(&inference, &footing, &units, &[], 1.0, &none)
-                .is_err()
-        );
-        let error = chain.step(&input).unwrap_err();
-        assert!(error.to_string().contains("cannot be resolved"), "{error}");
-
-        let (mut tree, input) = two_clusters(Speculation::Tree, N);
-        let inference = Inference::of(&tree.model).unwrap();
-        let p = tree.p_pass(&inference, &both, &[]);
-        let score = tree.score(&inference, &both, &[], 1.0, &none).unwrap();
-        assert!((score - (p * 2.0 - 0.5)).abs() < 1e-12, "{score} {p}");
-        assert!(
-            tree.grow(&inference, &footing, &units, &[], 1.0, &none)
-                .unwrap()
-                .is_some()
-        );
-        let plan = tree.step(&input).unwrap();
-        assert!(!plan.start.is_empty(), "{plan:?}");
-        assert!(plan.start.iter().all(|s| s.base == trunk()), "{plan:?}");
+        let mut scores = Vec::new();
+        for speculation in [Speculation::Chain, Speculation::Tree] {
+            let (mut bayes, input) = two_clusters(speculation, N);
+            let inference = Inference::of(&bayes.model).unwrap();
+            let extra = bayes.model.would_blame(&both);
+            let runs = inference.with_failure(&bayes.model, &extra).unwrap();
+            assert!(runs.len() < 2 * N as usize + 1, "{speculation:?}");
+            scores.push(bayes.score(&inference, &both, &[], 1.0, &none).unwrap());
+            let stacks = Stacks::new(&input);
+            let units = vec![members(&[N + 1]), members(&[101])];
+            let beneath = BTreeSet::new();
+            let footing = stacks.on(&beneath);
+            assert!(
+                bayes
+                    .grow(&inference, &footing, &units, &[], 1.0, &none)
+                    .unwrap()
+                    .is_some(),
+                "{speculation:?}"
+            );
+            let plan = bayes.step(&input).unwrap();
+            assert!(!plan.start.is_empty(), "{speculation:?}: {plan:?}");
+        }
+        assert_eq!(scores[0], scores[1]);
     }
 
     #[test]
-    fn evidence_too_improbable_to_resolve_is_a_scheduler_error_under_the_tree_too() {
+    fn evidence_too_improbable_to_resolve_in_full_plans_under_the_tree_too() {
         let mut bayes = tree(|_| {});
         let prs = (1..=12).map(|n| stale(ready(n), 1)).collect();
         let input = observation(prs, vec![]);
-        bayes.model.sync(&input.prs, &BTreeSet::new(), 0);
+        bayes.model.sync(&input.prs, &BTreeSet::new(), 0, 0);
         for r in 1..=11 {
-            bayes
-                .model
-                .failed(BatchId(100 + r), &members(&[r, r + 1]), 0);
+            failed_alone(&mut bayes.model, 100 + r, &members(&[r, r + 1]));
         }
-        let error = bayes.step(&input).unwrap_err();
-        assert!(error.to_string().contains("cannot be resolved"), "{error}");
+        let plan = bayes.step(&input).unwrap();
+        assert!(!plan.start.is_empty(), "{plan:?}");
     }
 }
