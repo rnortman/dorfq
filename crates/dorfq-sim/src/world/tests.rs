@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{Admission, Minutes};
+use crate::config::{Admission, Minutes, Outage};
 
 fn config(p_interact: f64, p_flake: f64) -> WorldConfig {
     WorldConfig {
@@ -13,6 +13,9 @@ fn config(p_interact: f64, p_flake: f64) -> WorldConfig {
         pr_ci_on_base_landed: true,
         p_interact,
         p_flake,
+        p_miss: 0.0,
+        trunk_fix_minutes: Minutes { min: 0, max: 0 },
+        outages: vec![],
         p_conflict: 0.0,
         repush_per_hour: 0.0,
         withdraw_per_hour: 0.0,
@@ -122,6 +125,21 @@ fn queue_lines(w: &mut World) -> Vec<String> {
 /// The events recorded since the last call, as `--trace` prints them.
 fn lines(w: &mut World) -> Vec<String> {
     w.take_trace().iter().map(ToString::to_string).collect()
+}
+
+/// [`lines`], the events also appended to `kept`, so that a test can check
+/// every life over the whole trace at its end.
+fn kept_lines(w: &mut World, kept: &mut Vec<TraceEvent>) -> Vec<String> {
+    let events = w.take_trace();
+    let lines = events.iter().map(ToString::to_string).collect();
+    kept.extend(events);
+    lines
+}
+
+/// [`kept_lines`] without the pull requests' own CI, as [`queue_lines`].
+fn kept_queue_lines(w: &mut World, kept: &mut Vec<TraceEvent>) -> Vec<String> {
+    let lines = kept_lines(w, kept).into_iter();
+    lines.filter(|l| !l.starts_with("pr-ci ")).collect()
 }
 
 fn start(w: &mut World, id: u64, base: &Sha, prs: &[u64]) -> Result<(), ForgeError> {
@@ -604,7 +622,7 @@ fn a_child_of_a_bad_base_is_bad_from_its_base_s_breakage() {
     let since: Vec<Option<u64>> = (1..=5).map(|n| w.bad_since(PrNumber(n))).collect();
     assert_eq!(since, [Some(60), Some(60), Some(60), Some(60), None]);
     // A base that left no longer makes its children bad.
-    w.prs.get_mut(&PrNumber(1)).unwrap().record.left = Some((120, Exit::Landed));
+    w.prs.get_mut(&PrNumber(1)).unwrap().record.left = Some((120, Exit::Landed { bad: false }));
     let since: Vec<Option<u64>> = (2..=4).map(|n| w.bad_since(PrNumber(n))).collect();
     assert_eq!(since, [None, Some(120), None]);
 }
@@ -1164,13 +1182,18 @@ fn two_landed_pull_requests_that_conflict_break_the_invariant_unless_landed_apar
     w.land(BatchId(1)).unwrap();
     assert_eq!(w.check_invariants(), Ok(()));
     // 2 was in the world when 1 landed: landing it too breaks the rule.
-    let landed = Some((w.now(), Exit::Landed));
-    w.prs.get_mut(&PrNumber(second)).unwrap().record.left = landed;
+    let landed = Some((w.now(), Exit::Landed { bad: false }));
+    w.prs.get_mut(&PrNumber(second)).unwrap().record.left = landed.clone();
     let message = w.check_invariants().unwrap_err();
     assert!(
         message.contains("prs 1 and 2 landed but conflict"),
         "{message}"
     );
+    // Landed bad, through a run that missed the break, it is accepted.
+    let bad = Some((w.now(), Exit::Landed { bad: true }));
+    w.prs.get_mut(&PrNumber(second)).unwrap().record.left = bad;
+    assert_eq!(w.landed_apart(PrNumber(first), PrNumber(second)), Ok(()));
+    w.prs.get_mut(&PrNumber(second)).unwrap().record.left = landed;
     // A fix pushed at or after 1's landing makes 2 fresh against it.
     w.prs.get_mut(&PrNumber(second)).unwrap().last_fix_push = Some(w.now());
     assert_eq!(w.landed_apart(PrNumber(first), PrNumber(second)), Ok(()));
@@ -1182,22 +1205,25 @@ fn a_landing_of_a_bad_or_conflicting_member_breaks_check_landed() {
     let (p, q) = (add(&mut w, false, 1), add(&mut w, false, 2));
     let member =
         |w: &World, n: u64| BatchMember::new(PrNumber(n), w.prs[&PrNumber(n)].head.clone());
-    assert_eq!(w.check_landed(&[member(&w, p)]), Ok(()));
-    let message = w.check_landed(&[member(&w, p), member(&w, q)]).unwrap_err();
+    assert_eq!(w.check_landed(&[member(&w, p)], false), Ok(()));
+    let both = [member(&w, p), member(&w, q)];
+    let message = w.check_landed(&both, false).unwrap_err();
     assert!(
         message.contains("prs 1 and 2 landed but conflict"),
         "{message}"
     );
+    assert_eq!(w.check_landed(&both, true), Ok(()));
     break_now(&mut w, p);
-    let message = w.check_landed(&[member(&w, p)]).unwrap_err();
+    let message = w.check_landed(&[member(&w, p)], false).unwrap_err();
     assert!(message.contains("pr 1 landed but is bad"), "{message}");
+    assert_eq!(w.check_landed(&[member(&w, p)], true), Ok(()));
 }
 
 #[test]
 fn a_landed_pull_request_whose_base_did_not_land_breaks_the_invariant() {
     let mut w = world(0.0, 0.0);
     tree(&mut w);
-    w.prs.get_mut(&PrNumber(2)).unwrap().record.left = Some((0, Exit::Landed));
+    w.prs.get_mut(&PrNumber(2)).unwrap().record.left = Some((0, Exit::Landed { bad: false }));
     let message = w.check_invariants().unwrap_err();
     assert!(message.contains("base 1 did not land"), "{message}");
 }
@@ -2468,4 +2494,355 @@ fn under_github_a_pull_request_appears_behind_by_the_landings_during_its_run() {
     assert_eq!(observed(&o), [p]);
     assert_eq!(behind(&o, p), 1);
     assert_eq!(w.check_invariants(), Ok(()));
+}
+
+/// [`world`] at `p_miss = 1`, every repair `trunk_fix` minutes after its
+/// break, with only the first two of its pull requests conflicting.
+fn missing(trunk_fix: u64) -> World {
+    let mut cfg = config(0.5, 0.0);
+    cfg.p_miss = 1.0;
+    cfg.trunk_fix_minutes = Minutes {
+        min: trunk_fix,
+        max: trunk_fix,
+    };
+    World::new(cfg, Admission::Label, Streams::for_replication(1, 0)).traced()
+}
+
+/// In [`missing`], lands `a`, breaking `b`, then lands `b` through a run
+/// that misses it: trunk is broken from then. Returns the three numbers;
+/// the events up to the second landing are appended to `kept`.
+fn land_a_bad_pull_request(w: &mut World, kept: &mut Vec<TraceEvent>) -> (u64, u64, u64) {
+    let (a, b, c) = only_first_two_conflict();
+    let (pa, pb, pc) = (add(w, false, a), add(w, false, b), add(w, false, c));
+    land_now(w, 1, &[pa]);
+    assert!(w.bad_since(PrNumber(pb)).is_some());
+    kept.extend(w.take_trace());
+    land_now(w, 2, &[pb]);
+    (pa, pb, pc)
+}
+
+#[test]
+fn a_miss_passes_a_run_over_a_broken_tree_and_its_landing_breaks_trunk() {
+    let mut w = missing(60);
+    let mut kept = Vec::new();
+    let (_, pb, pc) = land_a_bad_pull_request(&mut w, &mut kept);
+    let broken_at = w.now();
+    assert_eq!(
+        kept_queue_lines(&mut w, &mut kept),
+        [
+            "start 2 [2] on trunk",
+            "ci 2 passed broken",
+            "land 2 [2]",
+            "trunk broken by 2"
+        ]
+    );
+    assert_eq!(exit_of(&w, pb), Exit::Landed { bad: true });
+    assert_eq!(w.check_invariants(), Ok(()));
+    // Caught from here: every run on trunk fails, a probe included.
+    w.config.p_miss = 0.0;
+    let trunk = w.observe().unwrap().trunk;
+    start(&mut w, 3, &trunk, &[pc]).unwrap();
+    start(&mut w, 4, &trunk, &[]).unwrap();
+    // A new arrival's own CI fails for trunk; its author waits for the
+    // repair and re-runs it on the same head.
+    let pd = add(&mut w, false, 99);
+    let head = w.prs[&PrNumber(pd)].head.clone();
+    assert_eq!(status(&w.observe().unwrap(), pd), fixing());
+    let repair = broken_at + HOUR as u64;
+    let fix = w.prs[&PrNumber(pd)].fix.expect("a pending re-run");
+    assert_eq!(fix.0, repair);
+    assert_eq!(w.check_invariants(), Ok(()));
+    w.advance_to(repair - 1);
+    assert!(matches!(ci(&mut w, 3), CiStatus::Failed(_)));
+    assert!(matches!(ci(&mut w, 4), CiStatus::Failed(_)));
+    w.advance_to(repair);
+    assert_eq!(w.prs[&PrNumber(pd)].head, head);
+    assert_eq!(status(&w.observe().unwrap(), pd), PrStatus::Ready);
+    assert_eq!(
+        kept_lines(&mut w, &mut kept),
+        [
+            "start 3 [3] on trunk",
+            "start 4 [] on trunk",
+            "arrive 4",
+            "pr-ci 4",
+            "admit 4",
+            "pr-ci 4 failed",
+            "re-run 4",
+            "ci 3 failed broken",
+            "ci 4 failed broken",
+            "trunk repaired",
+            "pr-ci 4",
+            "pr-ci 4 passed"
+        ]
+    );
+    // Repaired in place: trunk does not move, and a run on it passes.
+    assert_eq!(w.observe().unwrap().trunk, trunk);
+    assert_eq!(verdict_of(&mut w, 5, &[pc]), CiStatus::Passed);
+    let m = w.metrics(End::drained(w.now()));
+    assert_eq!((m.landed_bad, m.trunk_broken_hours), (1, 1.0));
+    assert_eq!(m.rebases, 0);
+    assert_eq!(w.check_invariants(), Ok(()));
+    kept.extend(w.take_trace());
+    assert_eq!(crate::trace::check_lives(&kept), Ok(()));
+}
+
+#[test]
+fn own_ci_over_a_broken_trunk_misses_at_the_same_rate() {
+    let mut w = missing(60);
+    land_a_bad_pull_request(&mut w, &mut Vec::new());
+    let pd = add(&mut w, false, 99);
+    assert_eq!(own_verdicts(&w, pd), [false]);
+    assert_eq!(status(&w.observe().unwrap(), pd), PrStatus::Ready);
+    w.take_trace();
+    land_now(&mut w, 3, &[pd]);
+    assert_eq!(exit_of(&w, pd), Exit::Landed { bad: false });
+    assert_eq!(w.breaks.len(), 1);
+    assert_eq!(
+        queue_lines(&mut w),
+        ["start 3 [4] on trunk", "ci 3 passed broken", "land 3 [4]"]
+    );
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_broken_pull_request_s_own_ci_misses_too() {
+    let mut w = missing(60);
+    let p = add(&mut w, false, 1);
+    break_now(&mut w, p);
+    w.fire(Event::Repush(PrNumber(p)));
+    settle(&mut w);
+    assert_eq!(own_verdicts(&w, p), [false, false]);
+    assert_eq!(status(&w.observe().unwrap(), p), PrStatus::Ready);
+}
+
+#[test]
+fn a_pull_request_landed_beside_one_it_conflicts_with_is_a_bad_landing() {
+    let mut w = missing(60);
+    let (a, b, _) = only_first_two_conflict();
+    let (pa, pb) = (add(&mut w, false, a), add(&mut w, false, b));
+    land_now(&mut w, 1, &[pa, pb]);
+    let both = [exit_of(&w, pa), exit_of(&w, pb)];
+    assert_eq!(
+        both,
+        [Exit::Landed { bad: true }, Exit::Landed { bad: true }]
+    );
+    assert_eq!(w.breaks.len(), 1);
+    assert_eq!(w.check_invariants(), Ok(()));
+    finish(&mut w);
+    let m = w.metrics(End::drained(w.now()));
+    assert_eq!(
+        (m.ever_bad, m.landed_bad, m.trunk_broken_hours),
+        (2, 2, 1.0)
+    );
+}
+
+#[test]
+fn a_passing_run_on_the_same_head_is_the_pending_re_run() {
+    let mut cfg = config(0.0, 0.0);
+    cfg.pr_ci_minutes = Minutes { min: 10, max: 10 };
+    cfg.rebase_minutes = Minutes { min: 120, max: 120 };
+    cfg.outages = vec![Outage {
+        start_hours: 1,
+        hours: 1,
+    }];
+    let mut w = World::new(cfg, Admission::Label, Streams::for_replication(1, 0)).traced();
+    let mut kept = Vec::new();
+    let (pp, pc) = (add(&mut w, false, 1), add(&mut w, false, 2));
+    stack(&mut w, pc, pp, false);
+    // `c`'s re-pushed head fails its run into the window; the re-run is due
+    // at 185 minutes.
+    w.advance_to(55 * 60);
+    w.fire(Event::Repush(PrNumber(pc)));
+    w.advance_to(65 * 60);
+    assert_eq!(status(&w.observe().unwrap(), pc), fixing());
+    // `p` lands after the window: `c`'s run on its retarget is the re-run.
+    w.advance_to(121 * 60);
+    land_now(&mut w, 1, &[pp]);
+    assert_eq!(w.prs[&PrNumber(pc)].fix, None);
+    w.advance_to(131 * 60);
+    assert_eq!(status(&w.observe().unwrap(), pc), PrStatus::Ready);
+    kept_lines(&mut w, &mut kept);
+    finish(&mut w);
+    let after = kept_lines(&mut w, &mut kept);
+    assert!(after.iter().all(|l| !l.starts_with("pr-ci ")));
+    assert_eq!(own_verdicts(&w, pc), [false, true, false]);
+    assert_eq!(w.check_invariants(), Ok(()));
+    assert_eq!(crate::trace::check_lives(&kept), Ok(()));
+}
+
+#[test]
+fn a_re_run_waits_for_the_last_of_two_repairs() {
+    let mut w = missing(60);
+    let (_, _, pc) = land_a_bad_pull_request(&mut w, &mut Vec::new());
+    w.advance_to(w.now() + 30 * 60);
+    // `c` conflicts with nothing: landed through the broken trunk, it
+    // breaks nothing new.
+    land_now(&mut w, 3, &[pc]);
+    assert_eq!(w.breaks.len(), 1);
+    w.config.trunk_fix_minutes = Minutes { min: 90, max: 90 };
+    // A conflicting pair arriving now: landing both is a second break,
+    // repaired after the first.
+    let (a, b, _) = only_first_two_conflict();
+    let (e, f) = (add(&mut w, false, a), add(&mut w, false, b));
+    land_now(&mut w, 4, &[e, f]);
+    assert_eq!(w.breaks.len(), 2);
+    let second = w.now() + 90 * 60;
+    w.config.p_miss = 0.0;
+    let pg = add(&mut w, false, 1003);
+    assert_eq!(w.prs[&PrNumber(pg)].fix.expect("pending").0, second);
+    w.advance_to(second - 1);
+    assert_eq!(own_verdicts(&w, pg), [true]);
+    w.advance_to(second);
+    assert_eq!(own_verdicts(&w, pg), [true, false]);
+    let m = w.metrics(End::drained(w.now()));
+    assert_eq!(m.trunk_broken_hours, 2.0);
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn an_open_break_without_its_repair_scheduled_breaks_the_invariant() {
+    let mut w = missing(60);
+    land_a_bad_pull_request(&mut w, &mut Vec::new());
+    assert_eq!(w.check_invariants(), Ok(()));
+    let (_, repair) = w.breaks[&BatchId(2)];
+    w.events.remove(&repair);
+    let message = w.check_invariants().unwrap_err();
+    assert!(message.contains("batch 2's break"), "{message}");
+}
+
+#[test]
+fn an_outage_fails_every_run_it_touches_and_own_ci_is_re_run_when_it_ends() {
+    // Own CI and its author's response take no time: without the wait for
+    // the window's end, a re-run would fail and re-run at one instant
+    // forever.
+    let mut cfg = config(0.0, 0.0);
+    cfg.outages = vec![Outage {
+        start_hours: 1,
+        hours: 1,
+    }];
+    let mut w = World::new(cfg, Admission::Label, Streams::for_replication(1, 0)).traced();
+    let mut kept = Vec::new();
+    let (pa, pb, pc, pd) = (
+        add(&mut w, false, 1),
+        add(&mut w, false, 2),
+        add(&mut w, false, 3),
+        add(&mut w, false, 4),
+    );
+    let trunk = w.observe().unwrap().trunk;
+    kept_lines(&mut w, &mut kept);
+    // Ends before the window.
+    start(&mut w, 1, &trunk, &[pa]).unwrap();
+    // In flight when CI goes down.
+    w.advance_to(55 * 60);
+    start(&mut w, 2, &trunk, &[pb]).unwrap();
+    // Own CI inside the window fails, and its author waits for the end.
+    w.advance_to(90 * 60);
+    let pe = add(&mut w, false, 5);
+    let head = w.prs[&PrNumber(pe)].head.clone();
+    let fix = w.prs[&PrNumber(pe)].fix.expect("a pending re-run");
+    assert_eq!(fix.0, 2 * HOUR as u64);
+    assert_eq!(status(&w.observe().unwrap(), pe), fixing());
+    assert_eq!(w.check_invariants(), Ok(()));
+    // Starts inside the window and ends after it.
+    w.advance_to(115 * 60);
+    start(&mut w, 3, &trunk, &[pc]).unwrap();
+    w.advance_to(2 * HOUR as u64);
+    assert_eq!(w.prs[&PrNumber(pe)].head, head);
+    assert_eq!(status(&w.observe().unwrap(), pe), PrStatus::Ready);
+    // Starts at the window's end.
+    w.advance_to(125 * 60);
+    start(&mut w, 4, &trunk, &[pd]).unwrap();
+    finish(&mut w);
+    assert_eq!(
+        kept_lines(&mut w, &mut kept),
+        [
+            "start 1 [1] on trunk",
+            "ci 1 passed",
+            "start 2 [2] on trunk",
+            "ci 2 failed outage",
+            "arrive 5",
+            "pr-ci 5",
+            "admit 5",
+            "pr-ci 5 failed",
+            "re-run 5",
+            "start 3 [3] on trunk",
+            "pr-ci 5",
+            "pr-ci 5 passed",
+            "ci 3 failed outage",
+            "start 4 [4] on trunk",
+            "ci 4 passed",
+        ]
+    );
+    assert_eq!(own_verdicts(&w, pe), [true, false]);
+    let m = w.metrics(End::drained(w.now()));
+    assert_eq!((m.rebases, m.landed_bad, m.trunk_broken_hours), (0, 0, 0.0));
+    assert_eq!(w.check_invariants(), Ok(()));
+    assert_eq!(crate::trace::check_lives(&kept), Ok(()));
+}
+
+#[test]
+fn a_re_run_waits_for_the_later_of_an_outage_and_a_repair() {
+    let mut w = missing(60);
+    land_a_bad_pull_request(&mut w, &mut Vec::new());
+    let down = w.now() + 2 * HOUR as u64;
+    w.config.outages = vec![Outage {
+        start_hours: 0,
+        hours: down / HOUR as u64,
+    }];
+    w.config.p_miss = 0.0;
+    let pd = add(&mut w, false, 99);
+    assert_eq!(w.prs[&PrNumber(pd)].fix.expect("pending").0, down);
+    w.advance_to(down - 1);
+    assert_eq!(lines(&mut w).last().unwrap(), "trunk repaired");
+    assert_eq!(own_verdicts(&w, pd), [true]);
+    w.advance_to(down);
+    assert_eq!(own_verdicts(&w, pd), [true, false]);
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_re_run_that_a_landing_turns_into_a_fix_traces_its_rebase() {
+    let mut cfg = config(0.5, 0.0);
+    cfg.rebase_minutes = Minutes { min: 60, max: 60 };
+    cfg.outages = vec![Outage {
+        start_hours: 1,
+        hours: 1,
+    }];
+    let mut w = World::new(cfg, Admission::Label, Streams::for_replication(1, 0)).traced();
+    let mut kept = Vec::new();
+    let (a, b, _) = only_first_two_conflict();
+    let (pa, pb) = (add(&mut w, false, a), add(&mut w, false, b));
+    // `b`'s re-pushed head fails its run into the window; its author will
+    // re-run it at 150 minutes.
+    w.advance_to(90 * 60);
+    w.fire(Event::Repush(PrNumber(pb)));
+    settle(&mut w);
+    let tail = kept_lines(&mut w, &mut kept);
+    assert_eq!(
+        tail[tail.len() - 4..],
+        ["repush 2", "pr-ci 2", "pr-ci 2 failed", "re-run 2"]
+    );
+    // `a` lands after the window and breaks `b` while it waits: the re-run
+    // is a fix push when it fires.
+    w.advance_to(130 * 60);
+    land_now(&mut w, 1, &[pa]);
+    w.advance_to(150 * 60);
+    assert_eq!(
+        kept_lines(&mut w, &mut kept),
+        [
+            "start 1 [1] on trunk",
+            "ci 1 passed",
+            "land 1 [1]",
+            "broken 2 by 1",
+            "rebase 2 broken",
+            "fixed 2",
+            "repush 2",
+            "pr-ci 2",
+            "pr-ci 2 passed",
+        ]
+    );
+    assert_eq!(w.prs[&PrNumber(pb)].record.rebases, 1);
+    assert_eq!(status(&w.observe().unwrap(), pb), PrStatus::Ready);
+    assert_eq!(w.check_invariants(), Ok(()));
+    assert_eq!(crate::trace::check_lives(&kept), Ok(()));
 }

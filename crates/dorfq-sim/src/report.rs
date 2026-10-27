@@ -32,9 +32,11 @@ pub struct Report {
 /// A metric row: its name, the decimals it prints with, and its value.
 pub(crate) type Row = (&'static str, usize, fn(&Metrics) -> Option<f64>);
 
-pub(crate) const ROWS: [Row; 26] = [
+pub(crate) const ROWS: [Row; 28] = [
     ("arrived", 1, |m| Some(m.arrived as f64)),
     ("ever_bad", 1, |m| Some(m.ever_bad as f64)),
+    ("landed_bad", 1, |m| Some(m.landed_bad as f64)),
+    ("trunk_broken_hours", 2, |m| Some(m.trunk_broken_hours)),
     ("landed", 1, |m| Some(m.landed as f64)),
     ("ejected_bad", 1, |m| Some(m.ejected_bad as f64)),
     ("ejected_good", 1, |m| Some(m.ejected_good as f64)),
@@ -69,7 +71,9 @@ pub(crate) enum Better {
 }
 
 /// The metrics of [`ROWS`] that have a direction; the rest have none.
-pub(crate) const BETTER: [(&str, Better); 18] = [
+pub(crate) const BETTER: [(&str, Better); 20] = [
+    ("landed_bad", Better::Lower),
+    ("trunk_broken_hours", Better::Lower),
     ("landed", Better::Higher),
     ("ejected_bad", Better::Higher),
     ("ejected_good", Better::Lower),
@@ -266,6 +270,8 @@ mod tests {
             unfinished: 10 - landed,
             left_with_base: 1,
             ever_bad: 2,
+            landed_bad: 1,
+            trunk_broken_hours: 0.5,
             rebases: 0,
             runs: 2,
             cancelled_runs: 1,
@@ -365,6 +371,8 @@ mod tests {
                 "metric",
                 "arrived",
                 "ever_bad",
+                "landed_bad",
+                "trunk_broken_hours",
                 "landed",
                 "ejected_bad",
                 "ejected_good",
@@ -410,6 +418,8 @@ mod tests {
         assert_eq!(better("stalled"), Some(Better::Lower));
         assert_eq!(better("detect_p95_hours"), Some(Better::Lower));
         assert_eq!(better("ever_bad"), None);
+        assert_eq!(better("landed_bad"), Some(Better::Lower));
+        assert_eq!(better("trunk_broken_hours"), Some(Better::Lower));
         assert_eq!(better("left_with_base"), None);
     }
 

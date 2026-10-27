@@ -70,19 +70,25 @@ is pruned. CI misses a real break at some small rate, so a pass should lower
 the belief that a pull request or pair is broken, as any other observation
 does, not zero it; own CI is the same mechanism at its own rate, and
 `prune`'s rule that a run with nothing left to blame was a flake changes
-with it. The simulator has the same blind spot: a run over a broken tree
-always fails, so no world ever lands a bad pull request, the sweep cannot
-measure what a false green costs or what modelling one buys, and
-`trunk-broken-probe` has nothing to probe. World first, model second. It
-keeps more causes alive, so it bears on `bayes-posterior-precision`. Done
-means: the simulator's world produces false greens at a configured rate,
-own-CI and batch runs alike, and counts the landings that put a bad pull
-request on trunk and the time trunk spent broken; no passing run, queue or
-own CI, clears a cause outright in the model; the mock's `bad` pull request
-at `behind = 0` is either ejected under `bayes` in a driver test or
-documented in `crates/dorfq-forge-mock` as a fixture `bayes` reads as a
-flake, by the design's choice; and a sweep measures the scheduler against
-that world. The `TODO(bayes-false-green)` comment is on `passed`.
+with it. The simulator's world now produces false greens: a run over a
+broken tree passes at `p_miss`, own CI and batch runs alike, a bad pull
+request that lands breaks trunk until the world repairs it after
+`trunk_fix_minutes`, and the report counts `landed_bad` and
+`trunk_broken_hours`; `crates/dorfq-sim/examples/busy.toml` runs at
+`p_miss = 0.02`, where `bayes` made one bad landing in four replications, a
+stack of five pull requests, trunk was broken for 2.2 hours, and the queue ejected
+three innocents in that replication, against none in any replication at
+`p_miss = 0`. What a false green costs the scheduler is therefore
+measurable, and what modelling one buys is the design: no passing run, queue
+or own CI, clears a cause outright, and `prune`'s rule that a run with
+nothing left to blame was a flake changes with it. It keeps more causes
+alive, so it bears on `bayes-posterior-precision`. Done means: no passing
+run clears a cause outright in the model; the mock's `bad` pull request at
+`behind = 0` is either ejected under `bayes` in a driver test or documented
+in `crates/dorfq-forge-mock` as a fixture `bayes` reads as a flake, by the
+design's choice; and the speculation sweep at `p_miss = 0.02` shows the
+change against the world. The `TODO(bayes-false-green)` comment is on
+`passed`.
 
 ### bayes-pair-eject-timing
 
@@ -161,18 +167,25 @@ no resolution credit: the tree scores several times more hypotheticals a
 step, over deeper trees, and would stop far more often. The stop on the
 evidence remains under both. On a real forge a long flaky spell or a CI
 outage stops the queue; the self-hosting queue is far too small to have
-reached the regime, and no simulated world reaches it either, so the world
-that exercises it — an outage window, a long flaky spell — comes before the
-choice of recovery. Two recoveries are candidates: drop the component's
-oldest runs until the sum is significant, or fall back to exact enumeration
-over the component's causes when there are few of them. Deferred because
-either changes what the posteriors are in a regime no simulated world has
-reached, so choosing and sizing one is model design with a world that
-exercises it. Scoring has a third, exact remedy for the union: components
-share no cause, so the hypothetical run's failure can be scored against each
-component separately and the results combined, which leaves the posteriors
-unchanged and moves the scoring stop back to where a single cluster puts it.
-It resolves neither the single-cluster case nor inference over the evidence,
+reached the regime. `crates/dorfq-sim/examples/outage.toml` — the busy world
+with CI down from hour 24 to hour 36 — puts an outage in the world but does
+not reach the regime: the stop fired under neither speculation in any of
+four replications. Every run that touches the window fails, own CI included,
+so no pull request arriving in it becomes ready before it ends; `bayes` ran
+6 to 13 batch runs to a failed end in the window in each of three
+replications traced, and ejected 0 to 17 innocents a replication against 0
+to 3 in `busy.toml`. The world that reaches the regime — a longer outage, a
+long flaky spell — is still to be found, and comes before the choice of
+recovery. Two recoveries are candidates: drop the component's oldest runs
+until the sum is significant, or fall back to exact enumeration over the
+component's causes when there are few of them. Deferred because either
+changes what the posteriors are in a regime no simulated world has reached,
+so choosing and sizing one is model design with a world that exercises it.
+Scoring has a third, exact remedy for the union: components share no cause,
+so the hypothetical run's failure can be scored against each component
+separately and the results combined, which leaves the posteriors unchanged
+and moves the scoring stop back to where a single cluster puts it. It
+resolves neither the single-cluster case nor inference over the evidence,
 and it changes when the queue stops, so it is chosen together with the
 recovery above.
 
@@ -421,10 +434,15 @@ request left queued costs the objective nothing. Two things to price, each
 as a flag measured by that sweep: `w_age`, a value per hour waited, shipped;
 the sweep has it as an axis and at `[0.02, 0.1]` the criterion was not met;
 and `w_reject`, which prices a resolution at one landing against a fresh
-batch's several. The criterion has been evaluated along `w_age` only;
-evaluate it along `w_reject` before designing anything structural. If it
-still fails, the structural options are a lane reservation for resolution,
-which is what the chain's one-extension-per-step rule gives it, or a
+batch's several. Along `w_reject` too the criterion was not met: in the
+speculation sweep at `p_miss = 0.02`, run in thirds pinned on `w_age` at
+eight replications, the summary had the tree better than the chain on
+`ejected_bad` at no more than 31 of 192 points in any third (at
+`w_age = 0.1`, where it was better on `ended_hours` at 99 of 192), and,
+counted point by point on both metrics at once from the sweep's JSON, at no
+more than 12 of 96 points in any `w_age`/`w_reject` cell; at `p_miss = 0`
+fewer on both counts. The structural options are therefore next: a lane
+reservation for resolution, which is what the chain's one-extension-per-step rule gives it, or a
 detection-latency term in the objective, which has none. Done means a flag
 under which the tree is better than the chain on `ejected_bad` and on
 `ended_hours` at more than half of the compared points, as that sweep's
@@ -449,9 +467,10 @@ candidate scored like any other — run when its resolution value beats the
 alternatives, nothing held specially since every candidate's chance of
 passing already carries the trunk posterior, resumed when a probe passes;
 under the chain a probe is a finder on trunk, under the tree a candidate on
-the trunk node. How the operator is told is open. The simulator cannot
-produce a broken trunk today — a run over a broken tree always fails, so no
-bad pull request lands — so this follows the world half of
-`bayes-false-green`. The `TODO(trunk-broken-probe)` comment sits at
-`Bayes`'s suspect generation in
+the trunk node. How the operator is told is open. The simulator produces a
+broken trunk: a bad pull request lands on a false green at `p_miss`, every
+run on trunk fails until the repair after `trunk_fix_minutes`, a probe on
+trunk fails with them, and `trunk_broken_hours` and `ejected_good` in
+`crates/dorfq-sim/examples/busy.toml` measure what the probe would buy. The
+`TODO(trunk-broken-probe)` comment sits at `Bayes`'s suspect generation in
 `crates/dorfq-scheduler/src/bayes/policy.rs`.

@@ -1,8 +1,8 @@
 use dorfq_scheduler::{SchedulerConfig, Speculation};
 
 use super::*;
-use crate::config::Minutes;
 use crate::config::tests::WORLD;
+use crate::config::{Minutes, Outage};
 
 const POLICIES: &str = "\
 [[policy]]
@@ -96,6 +96,29 @@ fn a_dotted_key_sets_a_leaf_two_tables_deep() {
         sweep.points[0].config.world.ci_minutes,
         Minutes { min: 150, max: 300 }
     );
+}
+
+#[test]
+fn an_axis_value_may_be_an_array_of_tables() {
+    let axes = "\
+[[axis]]
+keys = [\"world.outages\"]
+values = [[], [{ start_hours = 24, hours = 12 }]]
+labels = [\"none\", \"half-day\"]
+";
+    let sweep = SweepConfig::parse(&file("floor", axes)).unwrap();
+    let labels: Vec<&str> = sweep.points.iter().map(|p| p.labels[0].as_str()).collect();
+    assert_eq!(labels, ["none", "half-day"]);
+    let outages: Vec<&[Outage]> = sweep
+        .points
+        .iter()
+        .map(|p| p.config.world.outages.as_slice())
+        .collect();
+    let half_day = Outage {
+        start_hours: 24,
+        hours: 12,
+    };
+    assert_eq!(outages, [&[][..], &[half_day][..]]);
 }
 
 #[test]
@@ -221,6 +244,8 @@ fn metrics(landed: usize, runs: usize) -> Metrics {
         unfinished: 10 - landed,
         left_with_base: 0,
         ever_bad: 0,
+        landed_bad: 0,
+        trunk_broken_hours: 0.0,
         rebases: 0,
         runs,
         cancelled_runs: 0,
@@ -293,15 +318,33 @@ fn the_grid_has_a_row_per_point_and_policy_with_means_and_failures() {
     let text = report().to_string();
     let header = cells(text.lines().next().unwrap());
     assert_eq!(
-        header[..6],
-        ["point", "lanes", "policy", "arrived", "ever_bad", "landed"]
+        header[..8],
+        [
+            "point",
+            "lanes",
+            "policy",
+            "arrived",
+            "ever_bad",
+            "landed_bad",
+            "trunk_broken_hours",
+            "landed"
+        ]
     );
     assert_eq!(header.last(), Some(&"failure"));
     assert!(header.contains(&"cancelled_runs"));
     let rows: Vec<Vec<&str>> = text.lines().skip(1).take(4).map(cells).collect();
-    assert_eq!(rows[0][..6], ["0", "4", "chain", "10.0", "0.0", "4.0"]);
-    assert_eq!(rows[1][..6], ["0", "4", "tree", "10.0", "0.0", "6.0"]);
-    assert_eq!(rows[3][..6], ["1", "8", "tree", "10.0", "0.0", "4.0"]);
+    assert_eq!(
+        rows[0][..8],
+        ["0", "4", "chain", "10.0", "0.0", "0.0", "0.00", "4.0"]
+    );
+    assert_eq!(
+        rows[1][..8],
+        ["0", "4", "tree", "10.0", "0.0", "0.0", "0.00", "6.0"]
+    );
+    assert_eq!(
+        rows[3][..8],
+        ["1", "8", "tree", "10.0", "0.0", "0.0", "0.00", "4.0"]
+    );
     assert_eq!(rows[3].last(), Some(&"1: livelock at t=7"));
     assert_eq!(rows[2].last(), Some(&"-"));
 }

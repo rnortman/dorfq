@@ -15,6 +15,8 @@ const DEFAULT_REPLAY_POLICY = "bayes";
 const ROWS = [
   ["arrived", 1, null],
   ["ever_bad", 1, "pull requests that were broken against trunk at some point"],
+  ["landed_bad", 1, "pull requests landed while broken against trunk, through a run that missed the break"],
+  ["trunk_broken_hours", 2, "hours trunk spent broken: from a bad landing until its repair, overlapping breaks counted once, an unrepaired break cut at the replication's end"],
   ["landed", 1, null],
   ["ejected_bad", 1, "pull requests ejected, directly or with an ejected base, while broken against trunk"],
   ["ejected_good", 1, "pull requests ejected, directly or with an ejected base, while not broken against trunk"],
@@ -334,12 +336,14 @@ function eventText(e) {
     }
     case "broken": return `broken ${e.pr} by ${e.by}`;
     case "fixed": return `fixed ${e.pr}`;
+    case "trunk_broken": return `trunk broken by ${e.batch}`;
+    case "trunk_repaired": return "trunk repaired";
     case "repush": return `repush ${e.pr}`;
     case "withdraw": return `withdraw ${e.pr}`;
     case "blocked": return `blocked ${e.pr} ${e.final ? "on" : "with"} ${e.on}${e.bad ? " bad" : ""}`;
     case "start": return `start ${e.batch} ${list(e.members)} on ${e.base === null ? "trunk" : e.base}`;
     case "run_end":
-      return `ci ${e.batch} ${e.passed ? "passed" : "failed"}${e.broken ? " broken" : ""}${e.flake ? " flake" : ""}`;
+      return `ci ${e.batch} ${e.passed ? "passed" : "failed"}${e.broken ? " broken" : ""}${e.flake ? " flake" : ""}${e.outage ? " outage" : ""}`;
     case "land": return `land ${e.batch} ${list(e.members)}`;
     case "refused": return `refused ${e.batch}: ${e.reason}`;
     case "eject":
@@ -348,6 +352,7 @@ function eventText(e) {
     case "pr_ci": return `pr-ci ${e.pr}${e.billed ? " billed" : ""}`;
     case "pr_ci_end": return `pr-ci ${e.pr} ${e.cancelled ? "cancelled" : e.failed ? "failed" : "passed"}`;
     case "rebase": return `rebase ${e.pr} ${e.why === "base_landed" ? "base landed" : e.why}`;
+    case "rerun": return `re-run ${e.pr}`;
     case "admit": return `admit ${e.pr}${e.base === null ? "" : ` on ${e.base}`}`;
     case "recheck": return `recheck ${e.pr}`;
     case "wait": return `wait ${e.pr} on ${e.on}`;
@@ -369,6 +374,7 @@ const OUTSIDE = {
   pr_ci: { long: "PR CI", short: "PR CI" },
   rebasing: { long: "rebasing", short: "rebasing" },
   fixing: { long: "its author is fixing it", short: "fixing" },
+  rerun: { long: "waiting to re-run its CI", short: "re-run" },
   with_base: { long: "out with base", short: "with base" },
   waiting_for_base: { long: "waiting for base", short: "for base" },
 };
@@ -448,7 +454,7 @@ class World {
   // A queued pull request whose current head's PR CI has not passed: the
   // forge reports it waiting, and no batch can take it.
   held(pr) {
-    return this.queued.has(pr.pr) && (pr.ci !== null || pr.fixing);
+    return this.queued.has(pr.pr) && (pr.ci !== null || pr.fixing || pr.rerunning);
   }
 
   heldCount() {
@@ -530,6 +536,7 @@ class World {
           pr: e.pr, base: e.base, atomic: e.atomic, arrived: e.t, state: "queued", left: null,
           bad: false, conflicts: Boolean(e.conflicts),
           batches: new Set(), repushed: null, ci: null, place: null, rebases: 0, fixing: false,
+          rerunning: false,
         });
         break;
       case "admit": {
@@ -559,8 +566,18 @@ class World {
         // Its own CI failed: its author fixes it where it is, held in the
         // queue under `label`, out checking under `github`.
         pr.fixing = e.why === "broken";
+        pr.rerunning = false;
         pr.place = pr.fixing ? "fixing" : "rebasing";
         pr.rebases += 1;
+        break;
+      }
+      case "rerun": {
+        const pr = this.prs.get(e.pr);
+        if (!pr) break;
+        // Its own CI failed for trunk or an outage: its author re-runs it on
+        // the same head once CI is back and trunk is green, held meanwhile.
+        pr.rerunning = true;
+        pr.place = "rerun";
         break;
       }
       case "wait": {
@@ -575,6 +592,8 @@ class World {
         if (!pr) break;
         pr.ci = { billed: e.billed };
         pr.place = "pr_ci";
+        // A run on a head not broken against trunk is the pending re-run.
+        if (!pr.bad) pr.rerunning = false;
         if (e.billed) this.count.billed_pr_ci_runs += 1;
         break;
       }
@@ -588,6 +607,7 @@ class World {
         if (!pr) break;
         pr.repushed = e.t;
         pr.fixing = false;
+        pr.rerunning = false;
         break;
       }
       case "withdraw":
@@ -606,6 +626,7 @@ class World {
           if (!pr) break;
           pr.place = "with_base";
           pr.on = e.on;
+          pr.rerunning = false;
           this.queued.delete(e.pr);
         }
         break;
@@ -1084,6 +1105,7 @@ function prText(world, pr) {
     if (world.queued.has(pr.pr)) {
       if (world.held(pr)) {
         if (pr.fixing) lines.push("held: its own CI failed; its author is fixing it");
+        else if (pr.rerunning) lines.push("held: its own CI failed for trunk or an outage; its author will re-run it once CI is back and trunk is green");
         else lines.push(`held: its own CI has not passed on this head${pr.ci.billed ? " (a re-run billed to the queue)" : ""}`);
       }
     } else {
