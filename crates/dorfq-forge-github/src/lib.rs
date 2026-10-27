@@ -58,12 +58,23 @@
 //!
 //! # Staleness
 //!
+//! [`Observation::trunk_position`] is 0 at the first observation this
+//! process makes and counts every move of trunk after it: a batch the queue
+//! landed by its members, a move by another hand by the commits it brought,
+//! read by one `compare` from the trunk last counted. Every trunk counted is
+//! kept with its position.
+//!
 //! GitHub's checks on a head do not say what trunk the run merged with, so a
-//! pull request's [`PrSnapshot::behind`] is the commits trunk has that its
-//! head does not: the changes since the head's merge base with trunk, read
-//! fresh at every observation. It counts commits, not pull requests, so it
-//! overstates by the commits each landing brings; and it does not fall when
-//! a check re-runs on the same head.
+//! pull request's [`PrSnapshot::behind`] is taken from its head's merge base
+//! with trunk, read by one `compare` the first time the process sees the
+//! head: where the merge base is a trunk this process counted, the run
+//! covered that trunk's position exactly; otherwise it covered at most the
+//! position less the commits trunk has that the head does not, which is
+//! never fewer changes than the truth. From then on `behind` grows with the
+//! position, by pull request for the queue's landings. A push to the head
+//! reads it again; a check re-run on the same head changes nothing. Both
+//! the position and what each head covered start over with the process,
+//! and both are kept only once an observation succeeds.
 //!
 //! # Recovery
 //!
@@ -162,6 +173,9 @@ pub struct GitHubForge {
     /// What the effects need about the pull requests enqueued at the latest
     /// observation.
     enqueued: BTreeMap<PrNumber, Enqueued>,
+    /// The trunk position and what each enqueued head covered, as of the
+    /// latest observation.
+    counted: Counted,
     /// Comments not yet posted, in order.
     outbox: VecDeque<Message>,
     /// One line per message posted.
@@ -178,10 +192,103 @@ struct Enqueued {
     head_branch: Option<String>,
 }
 
+/// The trunk position this process has counted, and what it knows of the
+/// trunk each enqueued head's own CI covered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Counted {
+    /// The trunk position, counted to `counted`: pull requests that reached
+    /// trunk since this process's first observation.
+    position: u64,
+    /// The trunk sha `position` counts to; `None` before the first read.
+    counted: Option<Sha>,
+    /// Every trunk this process has counted, with its position: where a
+    /// pull request's merge base with trunk is one of them, the trunk its
+    /// own CI covered is known exactly.
+    history: BTreeMap<Sha, u64>,
+    /// Each enqueued pull request's head and the position its own CI
+    /// covered at that head, so the merge base is read once per head.
+    covered: BTreeMap<PrNumber, (Sha, i64)>,
+}
+
+impl Counted {
+    /// Counts trunk up to `trunk`: the first read is position 0; after it,
+    /// each batch in `batches` landed on the trunk last counted adds its
+    /// members, and whatever else moved trunk adds the commits it brought.
+    fn advance(
+        &mut self,
+        api: &mut dyn GitHubApi,
+        trunk: &Sha,
+        batches: &[BatchStatus],
+    ) -> Result<(), ApiError> {
+        let Some(mut at) = self.counted.clone() else {
+            self.position = 0;
+            self.counted = Some(trunk.clone());
+            self.history.insert(trunk.clone(), 0);
+            return Ok(());
+        };
+        // Each batch is taken at most once, so the walk ends whatever the
+        // batches' tips are.
+        let mut taken = BTreeSet::new();
+        while at != *trunk {
+            let landed = batches
+                .iter()
+                .filter(|b| b.base == at && !taken.contains(&b.id))
+                .filter_map(|b| match &b.state {
+                    BatchState::Landed { tip } => Some((b.id, tip, b.members.len())),
+                    _ => None,
+                })
+                .min_by_key(|&(id, ..)| id);
+            match landed {
+                Some((id, tip, members)) => {
+                    taken.insert(id);
+                    self.position += u64::try_from(members).expect("a batch's members fit u64");
+                    at = tip.clone();
+                }
+                None => {
+                    self.position += u64::from(api.compare(&at, trunk)?.ahead_by);
+                    at = trunk.clone();
+                }
+            }
+            self.history.insert(at.clone(), self.position);
+        }
+        self.counted = Some(at);
+        Ok(())
+    }
+
+    /// `head`'s staleness: the position less the position its own CI
+    /// covered. The covered position is read once per head: that of its
+    /// merge base with `trunk` where that is a trunk this process counted,
+    /// else the position less the commits trunk has that the head does not.
+    fn behind(
+        &mut self,
+        api: &mut dyn GitHubApi,
+        number: PrNumber,
+        head: &Sha,
+        trunk: &Sha,
+    ) -> Result<u32, ApiError> {
+        let position = i64::try_from(self.position).expect("a trunk position fits i64");
+        let covered = match self.covered.get(&number) {
+            Some((seen, covered)) if seen == head => *covered,
+            _ => {
+                let compared = api.compare(head, trunk)?;
+                let covered = match self.history.get(&compared.merge_base) {
+                    Some(&at) => i64::try_from(at).expect("a trunk position fits i64"),
+                    None => position - i64::from(compared.ahead_by),
+                };
+                self.covered.insert(number, (head.clone(), covered));
+                covered
+            }
+        };
+        Ok(u32::try_from(position - covered).expect("a head's staleness fits u32"))
+    }
+}
+
 /// What one read of the repository found.
 struct World {
     observation: Observation,
     enqueued: BTreeMap<PrNumber, Enqueued>,
+    /// The count advanced to this read, kept once the observation is.
+    counted: Counted,
     /// Every labelled open pull request in the listing that is not
     /// enqueued, with the reason.
     blocked: BTreeMap<PrNumber, Blocker>,
@@ -294,6 +401,7 @@ impl GitHubForge {
             ledger: Ledger::new(),
             completed: BTreeMap::new(),
             enqueued: BTreeMap::new(),
+            counted: Counted::default(),
             outbox: VecDeque::new(),
             sink,
         })
@@ -356,6 +464,10 @@ impl GitHubForge {
             .filter(|b| matches!(b.state, BatchState::Landed { .. }))
             .flat_map(|b| b.members.iter().map(|m| m.pr))
             .collect();
+        // Advanced on a copy, so a read that fails later leaves the count as
+        // the latest observation left it.
+        let mut counted = self.counted.clone();
+        counted.advance(self.api.as_mut(), &trunk, &batches)?;
 
         // A merged base retargeted onto trunk can carry pull requests of its
         // own, so the enqueued set is computed again after every retarget. A
@@ -464,10 +576,7 @@ impl GitHubForge {
                     head_branch: summary.head_branch.clone(),
                 },
             );
-            // TODO(trunk-position-ownership): one `compare` per enqueued
-            // pull request per observation, in commits, from the merge base,
-            // for what the queue's own landings mostly determine.
-            let behind = self.api.compare(&summary.head, &trunk)?.ahead_by;
+            let behind = counted.behind(self.api.as_mut(), number, &summary.head, &trunk)?;
             prs.push(PrSnapshot::new(
                 number,
                 summary.head.clone(),
@@ -477,6 +586,7 @@ impl GitHubForge {
             ));
         }
 
+        counted.covered.retain(|n, _| bases.contains_key(n));
         prs.sort_by_key(|pr| pr.number);
         batches.sort_by_key(|batch| batch.id);
         let departed = self.ledger.departures(&prs, &batches, |gone| {
@@ -538,8 +648,9 @@ impl GitHubForge {
             })
         })?;
         Ok(World {
-            observation: Observation::new(now, trunk, prs, batches, departed),
+            observation: Observation::new(now, trunk, counted.position, prs, batches, departed),
             enqueued,
+            counted,
             blocked,
         })
     }
@@ -952,6 +1063,7 @@ impl Forge for GitHubForge {
         let World {
             observation,
             enqueued,
+            counted,
             blocked,
         } = self.fetch_world()?;
         let entered: BTreeSet<PrNumber> = observation
@@ -966,6 +1078,7 @@ impl Forge for GitHubForge {
         self.ledger.observed(&observation)?;
         self.completed.clear();
         self.enqueued = enqueued;
+        self.counted = counted;
         self.outbox.extend(messages);
         Ok(observation)
     }

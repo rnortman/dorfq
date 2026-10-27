@@ -3302,8 +3302,29 @@ fn behind(observation: &Observation) -> Vec<(u64, u32)> {
         .collect()
 }
 
+/// The `compare` calls made since `since` of them had been.
+fn compares_since(fake: &FakeGitHub, since: usize) -> Vec<String> {
+    fake.calls_to(&["compare"]).split_off(since)
+}
+
+fn compares(fake: &FakeGitHub) -> usize {
+    fake.calls_to(&["compare"]).len()
+}
+
+/// Starts batch `id` over `prs` on trunk, passes it and lands it; trunk is
+/// then its tip, which is returned.
+fn land_batch(fake: &FakeGitHub, forge: &mut GitHubForge, id: u64, prs: &[u64]) -> Sha {
+    forge.start_batch(&start(id, &fake.trunk(), prs)).unwrap();
+    let tip = fake.get(&batch_ref(id)).expect("published");
+    passed(fake, &tip);
+    forge.observe().unwrap();
+    forge.land(BatchId(id)).unwrap();
+    assert_eq!(fake.trunk(), tip);
+    tip
+}
+
 #[test]
-fn behind_is_the_commits_trunk_has_that_the_head_does_not() {
+fn behind_counts_the_queue_s_landings_by_pull_request_and_the_trunk_position_rises_with_them() {
     let fake = FakeGitHub::new();
     queued(&fake, 1);
     fake.advance_trunk();
@@ -3312,23 +3333,251 @@ fn behind_is_the_commits_trunk_has_that_the_head_does_not() {
     passed(&fake, &head);
     fake.state().comments.insert(2, vec![marker("queued")]);
     let (mut forge, _) = forge(&fake);
-    let compares = fake.calls_to(&["compare"]).len();
+    let before = compares(&fake);
     let observation = forge.observe().unwrap();
+    assert_eq!(observation.trunk_position, 0);
+    // 1 forked before the first trunk counted: commits since its merge base.
     assert_eq!(behind(&observation), [(1, 2), (2, 0)]);
-    // One compare per enqueued pull request.
-    assert_eq!(fake.calls_to(&["compare"]).len() - compares, 2);
+    assert_eq!(compares_since(&fake, before).len(), 2);
 
-    // The queue lands 2: trunk gains its head and the batch's merge.
-    forge.start_batch(&start(1, &fake.trunk(), &[2])).unwrap();
-    let tip = fake.get(&batch_ref(1)).expect("published");
-    passed(&fake, &tip);
-    forge.observe().unwrap();
-    forge.land(BatchId(1)).unwrap();
-    assert_eq!(behind(&forge.observe().unwrap()), [(1, 4)]);
+    // The queue lands 2: trunk gains its head and the batch's merge, one
+    // pull request.
+    land_batch(&fake, &mut forge, 1, &[2]);
+    let before = compares(&fake);
+    let observation = forge.observe().unwrap();
+    assert_eq!(observation.trunk_position, 1);
+    assert_eq!(behind(&observation), [(1, 3)]);
+    assert_eq!(compares_since(&fake, before), Vec::<String>::new());
 
     // A re-push onto today's trunk covers it.
     let pushed = fake.commit(&[fake.trunk()]);
     fake.push(1, &pushed);
     passed(&fake, &pushed);
+    let before = compares(&fake);
     assert_eq!(behind(&forge.observe().unwrap()), [(1, 0)]);
+    assert_eq!(compares_since(&fake, before).len(), 1);
+}
+
+#[test]
+fn a_head_forked_from_a_trunk_the_process_counted_is_covered_exactly() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 2);
+    // 3's branch forks from the first trunk, and is labelled later.
+    let head = fake.open_pr(3);
+    passed(&fake, &head);
+    fake.pr(3).labels.clear();
+    let (mut forge, _) = observed(&fake);
+    land_batch(&fake, &mut forge, 1, &[2]);
+    fake.pr(3).labels.push("queue".to_owned());
+    let observation = forge.observe().unwrap();
+    assert_eq!(observation.trunk_position, 1);
+    assert_eq!(behind(&observation), [(1, 1), (3, 1)]);
+}
+
+#[test]
+fn two_stacked_landings_between_reads_are_counted_by_members_and_each_tip_is_a_counted_trunk() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 4);
+    let (mut forge, _) = observed(&fake);
+    forge.start_batch(&start(1, &fake.trunk(), &[1])).unwrap();
+    let first = fake.get(&batch_ref(1)).expect("published");
+    forge.observe().unwrap();
+    forge.start_batch(&start(2, &first, &[2, 3])).unwrap();
+    let second = fake.get(&batch_ref(2)).expect("published");
+    passed(&fake, &first);
+    passed(&fake, &second);
+    forge.observe().unwrap();
+    forge.land(BatchId(1)).unwrap();
+    forge.land(BatchId(2)).unwrap();
+    assert_eq!(fake.trunk(), second);
+    // 4 is re-pushed onto the first landing's tip, one pull request behind
+    // the second tip; trunk has four commits its head does not.
+    let pushed = fake.commit(std::slice::from_ref(&first));
+    fake.push(4, &pushed);
+    passed(&fake, &pushed);
+
+    let before = compares(&fake);
+    let observation = forge.observe().unwrap();
+    assert_eq!(observation.trunk_position, 3);
+    assert_eq!(behind(&observation), [(4, 2)]);
+    assert_eq!(
+        compares_since(&fake, before),
+        [format!("compare {pushed} {second}")]
+    );
+}
+
+#[test]
+fn a_push_to_trunk_by_another_hand_raises_the_position_and_every_behind_with_no_departure() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    let (mut forge, _) = forge(&fake);
+    let observation = forge.observe().unwrap();
+    assert_eq!(
+        (observation.trunk_position, behind(&observation)),
+        (0, vec![(1, 0)])
+    );
+    let from = fake.trunk();
+    fake.advance_trunk();
+    let to = fake.advance_trunk();
+    let before = compares(&fake);
+    let observation = forge.observe().unwrap();
+    assert_eq!(observation.trunk_position, 2);
+    assert_eq!(behind(&observation), [(1, 2)]);
+    assert_eq!(observation.departed, []);
+    assert_eq!(
+        compares_since(&fake, before),
+        [format!("compare {from} {to}")]
+    );
+    let before = compares(&fake);
+    assert_eq!(forge.observe().unwrap().trunk_position, 2);
+    assert_eq!(compares_since(&fake, before), Vec::<String>::new());
+}
+
+#[test]
+fn a_landing_followed_by_a_push_is_counted_by_members_then_by_compare() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 2);
+    let (mut forge, _) = observed(&fake);
+    let tip = land_batch(&fake, &mut forge, 1, &[1, 2]);
+    let to = fake.advance_trunk();
+    let before = compares(&fake);
+    let observation = forge.observe().unwrap();
+    assert_eq!(observation.trunk_position, 3);
+    assert_eq!(
+        compares_since(&fake, before),
+        [format!("compare {tip} {to}")]
+    );
+}
+
+#[test]
+fn a_landing_record_recovered_as_landed_is_counted_by_members() {
+    // A first read finds the record already landed: position 0.
+    let fake = FakeGitHub::new();
+    fake.open_pr(1);
+    let tip = tip_over(&fake, &[1]);
+    put_record(&fake, 6, &[1], RecordState::Landing { tip: tip.clone() });
+    fake.set_ref(&batch_ref(6), &tip);
+    fake.set_ref(&branch("main"), &tip);
+    let (mut forge, _) = forge(&fake);
+    assert_eq!(forge.observe().unwrap().trunk_position, 0);
+
+    // A forge that counted the trunk before the record and the fast-forward
+    // were put in place, as a crashed process leaves them, counts the
+    // members; with trunk pushed on past the tip, the push by `compare`.
+    for trunk_moved_on in [false, true] {
+        let fake = FakeGitHub::new();
+        fake.open_pr(1);
+        fake.open_pr(2);
+        let (mut forge, _) = observed(&fake);
+        let tip = tip_over(&fake, &[1, 2]);
+        put_record(&fake, 6, &[1, 2], RecordState::Landing { tip: tip.clone() });
+        fake.set_ref(&batch_ref(6), &tip);
+        fake.set_ref(&branch("main"), &tip);
+        let to = if trunk_moved_on {
+            fake.advance_trunk()
+        } else {
+            tip.clone()
+        };
+        let before = compares(&fake);
+        let observation = forge.observe().unwrap();
+        assert_eq!(
+            observation.batches[0].state,
+            BatchState::Landed { tip: tip.clone() }
+        );
+        if trunk_moved_on {
+            assert_eq!(observation.trunk_position, 3);
+            assert_eq!(
+                compares_since(&fake, before),
+                [format!("compare {tip} {to}")]
+            );
+        } else {
+            assert_eq!(observation.trunk_position, 2);
+            assert_eq!(compares_since(&fake, before), Vec::<String>::new());
+        }
+    }
+}
+
+#[test]
+fn a_restarted_forge_starts_its_position_at_zero_and_reads_each_head_once() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    fake.advance_trunk();
+    let head = fake.open_pr(2);
+    passed(&fake, &head);
+    fake.state().comments.insert(2, vec![marker("queued")]);
+    let (mut first, _) = observed(&fake);
+    fake.advance_trunk();
+    assert_eq!(first.observe().unwrap().trunk_position, 1);
+
+    let (mut forge, _) = forge(&fake);
+    let before = compares(&fake);
+    let observation = forge.observe().unwrap();
+    assert_eq!(observation.trunk_position, 0);
+    assert_eq!(behind(&observation), [(1, 2), (2, 1)]);
+    assert_eq!(compares_since(&fake, before).len(), 2);
+    let before = compares(&fake);
+    assert_eq!(behind(&forge.observe().unwrap()), [(1, 2), (2, 1)]);
+    assert_eq!(compares_since(&fake, before), Vec::<String>::new());
+}
+
+#[test]
+fn a_failed_first_read_commits_no_count() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    let (mut forge, _) = forge(&fake);
+    let before = compares(&fake);
+    fake.fail("get_pr", Failure::Transient);
+    assert!(matches!(forge.observe(), Err(ForgeError::Transient(_))));
+    let to = fake.advance_trunk();
+    let observation = forge.observe().unwrap();
+    // A first read again: the walk the failed tick made counted nothing.
+    assert_eq!(observation.trunk_position, 0);
+    assert_eq!(behind(&observation), [(1, 1)]);
+    let head = fake.pr(1).head.clone();
+    assert_eq!(
+        compares_since(&fake, before),
+        [format!("compare {head} {to}")]
+    );
+}
+
+#[test]
+fn a_failed_read_commits_no_covered_cache() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 2);
+    let (mut forge, _) = forge(&fake);
+    fake.fail_on("get_pr", "2", Failure::Transient);
+    assert!(matches!(forge.observe(), Err(ForgeError::Transient(_))));
+    fake.advance_trunk();
+    let before = compares(&fake);
+    let observation = forge.observe().unwrap();
+    assert_eq!(observation.trunk_position, 0);
+    // Both heads read again against the new first trunk, 1's included.
+    assert_eq!(behind(&observation), [(1, 1), (2, 1)]);
+    assert_eq!(compares_since(&fake, before).len(), 2);
+}
+
+#[test]
+fn a_failed_tick_s_walk_is_discarded_and_the_retry_walks_from_the_committed_trunk() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    let first = fake.trunk();
+    let (mut forge, _) = forge(&fake);
+    let before = compares(&fake);
+    assert_eq!(forge.observe().unwrap().trunk_position, 0);
+    assert_eq!(compares_since(&fake, before).len(), 1);
+    let second = fake.advance_trunk();
+    fake.fail("get_pr", Failure::Transient);
+    let before = compares(&fake);
+    assert!(matches!(forge.observe(), Err(ForgeError::Transient(_))));
+    let third = fake.advance_trunk();
+    let observation = forge.observe().unwrap();
+    assert_eq!(observation.trunk_position, 2);
+    assert_eq!(behind(&observation), [(1, 2)]);
+    assert_eq!(
+        compares_since(&fake, before),
+        [
+            format!("compare {first} {second}"),
+            format!("compare {first} {third}")
+        ]
+    );
 }

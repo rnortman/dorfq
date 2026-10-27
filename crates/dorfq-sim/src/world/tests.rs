@@ -2482,6 +2482,19 @@ fn behind_counts_the_landings_since_each_own_ci_run_started() {
 }
 
 #[test]
+fn the_trunk_position_is_the_count_of_landed_pull_requests() {
+    let mut w = pr_ci_world(20);
+    let p = add(&mut w, false, 1);
+    let q = add(&mut w, false, 2);
+    w.advance_to(1200);
+    assert_eq!(w.observe().unwrap().trunk_position, 0);
+    land_now(&mut w, 1, &[p, q]);
+    let o = w.observe().unwrap();
+    assert_eq!(o.trunk_position, 2);
+    assert_eq!(w.landed_count, 2);
+}
+
+#[test]
 fn under_github_a_pull_request_appears_behind_by_the_landings_during_its_run() {
     let mut w = admitting(Admission::Github, 30, 0);
     let q = add(&mut w, false, 1);

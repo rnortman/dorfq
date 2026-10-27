@@ -156,6 +156,9 @@ user unit expects it and restarts the unit if it is running.
   fault and stops. Batch ids in those names are decimal.
 - Trunk moves only by fast-forward. A push to trunk by another hand makes
   every batch built on the old trunk refuse to land.
+- A push to trunk by another hand also counts as trunk changes against every
+  queued pull request, so one that the push broke is found by its next failed
+  batch rather than batched again.
 - A queue that stops with "batch <id>'s tip is its base" is tracking a batch
   that an earlier build published at its own base, because every member was
   already in trunk. Stop the queue, delete `refs/dorfq/batches/<id>` and the

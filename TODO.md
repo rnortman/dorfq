@@ -317,19 +317,6 @@ rewrites the gate's own workflow, so it waits for a moment when no other
 branch is editing `ci.yml`.
 The `TODO(quality-pages-workflow-copies-ci-bazel-setup)` comment sits above the cache steps in `.github/workflows/pages.yml`.
 
-### quality-untested-parallel-map-to-trees
-
-`Bayes` in `crates/dorfq-scheduler/src/bayes/mod.rs` keeps `untested`, each
-tracked batch's count of landings its run did not test, as a second map over
-exactly the batches in `trees`. `ingest` in `bayes/policy.rs` inserts and
-retains it beside `trees`, and reads it with `get_mut(..).expect` and an
-index that are safe only because `trees` was filled first. Make the `trees`
-value one struct holding a batch's tree members and its untested count, so
-one insert and one retain cover both and the `expect` and the index go.
-`finders` and `read` are subsets of the tracked batches, not data held for
-each, and stay sets. Behaviour does not change: the sweep's and the
-examples' JSON output is byte-identical before and after.
-
 ### security-label-grants-unreviewed-landing-on-any-later-head
 
 The GitHub forge in `crates/dorfq-forge-github/src/lib.rs` enqueues an open

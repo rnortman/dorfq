@@ -1,5 +1,7 @@
 //! The hidden-truth world: pull requests, CI runs, events, and the
-//! [`Forge`] a scheduler acts through.
+//! [`Forge`] a scheduler acts through. Trunk moves only by the queue's
+//! landings, so the trunk position it reports is its count of landed pull
+//! requests.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1270,6 +1272,7 @@ impl World {
         Ok(Observation::new(
             Timestamp(self.now),
             self.trunk.clone(),
+            u64::try_from(self.landed_count).expect("a landed count fits u64"),
             prs,
             batches,
             departed,

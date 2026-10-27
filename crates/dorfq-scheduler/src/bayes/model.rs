@@ -89,8 +89,9 @@ impl Held {
 /// One cleared position per queued pull request, materialised pairs, and
 /// the failed runs that are evidence about them.
 ///
-/// Positions count the pull requests that reached trunk since the scheduler
-/// started; one cleared before that is at a negative position.
+/// Positions are the forge's count of the pull requests that reached trunk
+/// since its first observation; one cleared before that is at a negative
+/// position.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Model {
     pub(crate) priors: Priors,
@@ -154,13 +155,6 @@ impl Model {
             self.pairs.retain(|cause, _| !cause.involves(pr));
             self.bad.remove(&pr);
         }
-        // TODO(trunk-position-ownership): `behind` is read here at
-        // first sight and afterwards only as an alibi (`clear` is a `max`);
-        // a rise on an unchanged head — a trunk change the queue did not
-        // make — never moves a cleared position back, and the trunk
-        // position counts only observed departures, so a pull request
-        // cleared at the current trunk cannot be blamed for anything that
-        // breaks it after that.
         for pr in prs {
             let own = position - i64::from(pr.behind);
             let held = self.bad.entry(pr.number).or_insert_with(|| Held {

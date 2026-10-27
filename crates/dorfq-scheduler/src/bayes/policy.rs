@@ -8,9 +8,9 @@ use dorfq_core::{
     Plan, PrNumber, Scheduler, SchedulerError, Sha,
 };
 
-use super::Bayes;
 use super::infer::{Inference, RunPosteriors, Unresolved};
 use super::model::Cause;
+use super::{Bayes, Tracked};
 use crate::stacks::{Footing, Stacks};
 use crate::{Ejections, Member, Speculation, is_pending};
 
@@ -98,49 +98,16 @@ impl Bayes {
     /// and each new verdict, read at the position its run started on.
     /// `heads` is each queued pull request's head.
     fn ingest(&mut self, observation: &Observation, heads: &BTreeMap<PrNumber, &Sha>) {
-        let tracked: BTreeSet<BatchId> = observation.batches.iter().map(|b| b.id).collect();
-        self.finders.retain(|id| tracked.contains(id));
-        self.read.retain(|id| tracked.contains(id));
-        self.trees.retain(|id, _| tracked.contains(id));
-        // TODO(quality-untested-parallel-map-to-trees): `untested` holds an
-        // entry for exactly the batches in `trees`, inserted and retained
-        // beside it and read with `expect` and an index.
-        self.untested.retain(|id, _| tracked.contains(id));
-
-        let tips: BTreeMap<&Sha, &BatchStatus> = observation
-            .batches
-            .iter()
-            .filter_map(|b| b.state.tip().map(|tip| (tip, b)))
-            .collect();
-        // New batches whose tree reaches this observation's trunk: they were
-        // started on its landings.
-        let mut on_trunk: BTreeSet<BatchId> = BTreeSet::new();
-        for batch in &observation.batches {
-            if self.trees.contains_key(&batch.id) {
-                continue;
-            }
-            let mut tree: Vec<Member> = Vec::new();
-            let mut node = Some(batch);
-            while let Some(b) = node {
-                tree.extend(b.members.iter().map(|m| (m.pr, m.head.clone())));
-                // A landed tip is in trunk, and so is everything below it.
-                node = if b.base == observation.trunk {
-                    on_trunk.insert(batch.id);
-                    None
-                } else {
-                    tips.get(&b.base)
-                        .copied()
-                        .filter(|p| !matches!(p.state, BatchState::Landed { .. }))
-                };
-            }
-            self.trees.insert(batch.id, tree);
-            self.untested.insert(batch.id, 0);
-        }
+        let observed: BTreeSet<BatchId> = observation.batches.iter().map(|b| b.id).collect();
+        self.finders.retain(|id| observed.contains(id));
+        self.read.retain(|id| observed.contains(id));
+        self.tracked.retain(|id, _| observed.contains(id));
+        let position =
+            i64::try_from(observation.trunk_position).expect("a trunk position fits i64");
 
         // What reached trunk, landed by the queue or merged by another hand,
-        // is trunk now: it leaves every tree, and its causes leave the runs it
-        // was in while the runs stay. Outside a tree, it is a landing that
-        // tree's run did not test.
+        // is trunk now: it leaves every tree, crediting the tree's run with
+        // it, and its causes leave the runs it was in while the runs stay.
         let landed: BTreeSet<Member> = observation
             .departed
             .iter()
@@ -150,45 +117,82 @@ impl Bayes {
             })
             .map(|d| (d.pr, d.head.clone()))
             .collect();
-        for (id, tree) in &mut self.trees {
-            if !on_trunk.contains(id) {
-                let outside = landed.iter().filter(|m| !tree.contains(m)).count();
-                let untested = self.untested.get_mut(id).expect("tracked");
-                *untested = untested.saturating_add(
-                    u32::try_from(outside).expect("one observation's landings fit u32"),
-                );
+        for tracked in self.tracked.values_mut() {
+            let before = tracked.tree.len();
+            tracked.tree.retain(|member| !landed.contains(member));
+            tracked.covered +=
+                i64::try_from(before - tracked.tree.len()).expect("landings fit i64");
+        }
+
+        let tips: BTreeMap<&Sha, &BatchStatus> = observation
+            .batches
+            .iter()
+            .filter_map(|b| b.state.tip().map(|tip| (tip, b)))
+            .collect();
+        for batch in &observation.batches {
+            if self.tracked.contains_key(&batch.id) {
+                continue;
+            }
+            let mut tree: Vec<Member> = Vec::new();
+            let mut node = Some(batch);
+            while let Some(b) = node {
+                tree.extend(b.members.iter().map(|m| (m.pr, m.head.clone())));
+                // A landed tip is in trunk, and so is everything below it.
+                node = if b.base == observation.trunk {
+                    None
+                } else {
+                    tips.get(&b.base)
+                        .copied()
+                        .filter(|p| !matches!(p.state, BatchState::Landed { .. }))
+                };
             }
             tree.retain(|member| !landed.contains(member));
+            // On trunk, the run tests the position now; on a tracked tip,
+            // the trunk that tip's run tests; on the previous observation's
+            // trunk, that trunk's position. Any other base is one this
+            // process never saw, a batch inherited at a restart, whose first
+            // observation is at the lowest position: it is taken at the
+            // position now.
+            let covered = if batch.base == observation.trunk {
+                position
+            } else if let Some(base) = tips
+                .get(&batch.base)
+                .and_then(|base| self.tracked.get(&base.id))
+            {
+                base.covered
+            } else {
+                match &self.last_trunk {
+                    Some((trunk, at)) if *trunk == batch.base => *at,
+                    _ => position,
+                }
+            };
+            self.tracked.insert(batch.id, Tracked { tree, covered });
         }
-        // TODO(trunk-position-ownership): the trunk position
-        // is kept here and again in the model, which `sync` sets from this one.
-        self.position += i64::try_from(landed.len()).expect("landings fit i64");
+        self.last_trunk = Some((observation.trunk.clone(), position));
+
         self.model.sync(
             &observation.prs,
             &landed.iter().map(|m| m.0).collect(),
-            self.position,
+            position,
         );
         self.age(observation);
 
         for batch in &observation.batches {
-            // The trunk the run started on, credited with its own tree's
-            // landings since.
-            let covered = self.position - i64::from(self.untested[&batch.id]);
+            let Tracked { tree, covered } = &self.tracked[&batch.id];
             match &batch.state {
                 BatchState::Testing {
                     ci: CiStatus::Passed,
                     ..
                 } if self.read.insert(batch.id) => {
-                    self.model.passed(&self.trees[&batch.id], covered);
+                    self.model.passed(tree, *covered);
                 }
                 // A failure over a head that has gone teaches nothing.
                 BatchState::Testing {
                     ci: CiStatus::Failed(_),
                     ..
                 } if self.read.insert(batch.id) => {
-                    let tree = &self.trees[&batch.id];
                     if tree.iter().all(|(pr, head)| heads.get(pr) == Some(&head)) {
-                        self.model.failed(batch.id, tree, covered);
+                        self.model.failed(batch.id, tree, *covered);
                     }
                 }
                 BatchState::Testing { .. }
@@ -611,6 +615,17 @@ mod tests {
         assert_eq!(bayes.finders, BTreeSet::from([BatchId(3)]));
     }
 
+    /// [`with_finder`]'s chain root (batch 2) and finder (batch 3) seen
+    /// running on trunk, before anything lands.
+    fn both_running(bayes: &mut Bayes) {
+        let running = vec![
+            testing(2, trunk(), &[1], CiStatus::Pending),
+            testing(3, trunk(), &[2], CiStatus::Pending),
+        ];
+        let plan = step(bayes, &observation(ready_all(&[1, 2]), running));
+        assert!(plan.start.is_empty(), "{plan:?}");
+    }
+
     #[test]
     fn ingest_walks_through_probes_on_trunk_and_on_a_tracked_tip() {
         let mut bayes = bayes();
@@ -620,9 +635,9 @@ mod tests {
             testing(3, tip(2), &[], CiStatus::Passed),
         ];
         step(&mut bayes, &observation(ready_all(&[1, 2]), batches));
-        assert_eq!(bayes.trees[&BatchId(1)], vec![]);
-        assert_eq!(bayes.trees[&BatchId(2)], members(&[1]));
-        assert_eq!(bayes.trees[&BatchId(3)], members(&[1]));
+        assert_eq!(bayes.tracked[&BatchId(1)].tree, vec![]);
+        assert_eq!(bayes.tracked[&BatchId(2)].tree, members(&[1]));
+        assert_eq!(bayes.tracked[&BatchId(3)].tree, members(&[1]));
     }
 
     /// An observation at `hours` past the start of the clock.
@@ -936,6 +951,7 @@ mod tests {
         let batch = batch(2, trunk(), &[1], BatchState::Landed { tip: tip(2) });
         let mut input = observation(ready_after(&[2], 1), vec![batch]);
         input.trunk = tip(2);
+        input.trunk_position = 1;
         input.departed = vec![landed(1, 2)];
         step(&mut bayes, &input);
         let exercised: Vec<&BTreeSet<Cause>> = bayes
@@ -962,10 +978,11 @@ mod tests {
         let batch = batch(2, trunk(), &[1], BatchState::Landed { tip: tip(2) });
         let mut input = observation(vec![fresh(2), stale(ready(3), BEHIND + 1)], vec![batch]);
         input.trunk = tip(2);
+        input.trunk_position = 1;
         input.departed = vec![landed(1, 2)];
         step(&mut bayes, &input);
         // 2's own CI started on the new trunk; 3's staleness counts 1.
-        assert_eq!(bayes.position, 1);
+        assert_eq!(bayes.model.position(), 1);
         assert_eq!(bayes.model.cleared(PrNumber(2)), Some(1));
         assert_eq!(belief(&bayes, bad(2)), 0.0);
         let regrown = bayes.model.regrown(i64::from(BEHIND) + 1);
@@ -980,6 +997,7 @@ mod tests {
             step(&mut bayes, &observation(ready_all(&[1, 2]), vec![failed()]));
             let mut input = observation(ready_all(&[2]), vec![failed()]);
             input.trunk = tip(9);
+            input.trunk_position = u64::from(matches!(how, Departed::Merged));
             input.departed = vec![Departure::new(PrNumber(1), sha(1), how)];
             step(&mut bayes, &input);
             let runs: Vec<BTreeSet<Cause>> = bayes
@@ -1006,6 +1024,7 @@ mod tests {
         let batch = batch(1, trunk(), &[1], BatchState::Landed { tip: tip(1) });
         let mut input = observation(ready_after(&[2], 1), vec![batch]);
         input.trunk = tip(1);
+        input.trunk_position = 1;
         input.departed = vec![landed(1, 1)];
         step(&mut queue, &input);
         let regrown = 1.0 - (1.0 - prior()) * 0.998;
@@ -1015,6 +1034,7 @@ mod tests {
             step(&mut bayes, &observation(ready_all(&[1, 2]), vec![]));
             let mut input = observation(ready_after(&[2], 1), vec![]);
             input.trunk = tip(9);
+            input.trunk_position = 1;
             input.departed = vec![Departure::new(PrNumber(1), sha(1), Departed::Merged)];
             step(&mut bayes, &input);
             belief(&bayes, bad(2))
@@ -1050,14 +1070,17 @@ mod tests {
         let parent = batch(1, trunk(), &[1], BatchState::Landed { tip: tip(1) });
         let mut input = observation(ready_all(&[2]), vec![parent, child(CiStatus::Pending)]);
         input.trunk = tip(1);
+        input.trunk_position = 1;
         input.departed = vec![landed(1, 1)];
         let plan = step(&mut bayes, &input);
         assert_eq!(plan.retire, ids(&[1]));
         let mut input = observation(ready_all(&[2]), vec![child(CiStatus::Pending)]);
         input.trunk = tip(1);
+        input.trunk_position = 1;
         step(&mut bayes, &input);
         let mut input = observation(ready_all(&[2]), vec![child(ci_failed())]);
         input.trunk = tip(1);
+        input.trunk_position = 1;
         step(&mut bayes, &input);
         let exercised: Vec<&BTreeSet<Cause>> = bayes
             .model
@@ -1493,6 +1516,7 @@ mod tests {
             })
             .collect();
         let mut input = observation(prs, batches);
+        input.trunk_position = 1;
         input.departed = vec![landed(6, 2)];
         let plan = step(&mut bayes, &input);
         assert_eq!(
@@ -1523,11 +1547,13 @@ mod tests {
     fn a_pending_finder_on_a_stale_base_holds_its_lane_and_is_read() {
         let mut bayes = bayes();
         with_finder(&mut bayes);
+        both_running(&mut bayes);
         // The chain's root landed: trunk moved under the finder.
         let root = batch(2, trunk(), &[1], BatchState::Landed { tip: tip(2) });
         let finder = testing(3, trunk(), &[2], CiStatus::Pending);
         let mut input = observation(ready_all(&[2, 4]), vec![root, finder]);
         input.trunk = tip(2);
+        input.trunk_position = 1;
         input.departed = vec![landed(1, 2)];
         let plan = step(&mut bayes, &input);
         assert_eq!(plan.retire, ids(&[2]));
@@ -1537,6 +1563,7 @@ mod tests {
         let finder = testing(3, trunk(), &[2], ci_failed());
         let mut input = observation(ready_all(&[2, 4]), vec![finder]);
         input.trunk = tip(2);
+        input.trunk_position = 1;
         let plan = step(&mut bayes, &input);
         assert_eq!(plan.retire, ids(&[3]));
         assert_eq!(plan.eject, vec![ejection(2, failed_by(3))]);
@@ -1546,17 +1573,20 @@ mod tests {
     fn a_finder_passing_after_trunk_moved_under_it_leaves_its_suspect_regrown() {
         let mut bayes = bayes();
         with_finder(&mut bayes);
+        both_running(&mut bayes);
         // The chain's root landed while the finder ran on the old trunk.
         let root = batch(2, trunk(), &[1], BatchState::Landed { tip: tip(2) });
         let finder = testing(3, trunk(), &[2], CiStatus::Pending);
         let mut input = observation(ready_all(&[2, 4]), vec![root, finder]);
         input.trunk = tip(2);
+        input.trunk_position = 1;
         input.departed = vec![landed(1, 2)];
         step(&mut bayes, &input);
 
         let finder = testing(3, trunk(), &[2], CiStatus::Passed);
         let mut input = observation(ready_all(&[2, 4]), vec![finder]);
         input.trunk = tip(2);
+        input.trunk_position = 1;
         step(&mut bayes, &input);
         // Cleared of the old trunk, not of 1's landing.
         assert_eq!(bayes.model.cleared(PrNumber(2)), Some(0));
@@ -1660,6 +1690,7 @@ mod tests {
             }
             let mut input = observation(prs.clone(), batches);
             input.trunk = tip(2);
+            input.trunk_position = 1;
             let plan = step(&mut bayes, &input);
             assert!(plan.land.is_empty(), "{chain}");
             assert_eq!(plan.retire, ids(&[2, 3]));
@@ -1675,6 +1706,7 @@ mod tests {
             }
             let mut input = observation(prs, batches);
             input.trunk = tip(2);
+            input.trunk_position = 1;
             assert!(step(&mut bayes, &input).land.is_empty());
         }
     }
@@ -2021,19 +2053,20 @@ mod tests {
     ) -> Observation {
         let mut input = observation(prs, batches);
         input.trunk = tip(1000 + at);
+        input.trunk_position = at;
         input.departed = departed;
         input
     }
 
     #[test]
-    fn the_trunk_position_counts_landings_and_merges_and_a_run_is_read_where_it_started() {
+    fn the_trunk_position_is_the_observation_s_and_a_run_is_read_where_it_started() {
         let mut bayes = bayes();
         let prs = |at: u32| vec![stale(ready(1), at), stale(ready(2), BEHIND + at)];
         let mut departed = merges(900, 1);
         departed.push(landed(9, 7));
         departed.push(Departure::new(PrNumber(8), sha(8), Departed::Ejected));
         bayes.step(&on(2, prs(2), vec![], departed)).unwrap();
-        assert_eq!(bayes.position, 2);
+        assert_eq!(bayes.model.position(), 2);
         let run = |ci| testing(5, tip(1002), &[2], ci);
         bayes
             .step(&on(2, prs(2), vec![run(CiStatus::Pending)], vec![]))
@@ -2042,10 +2075,90 @@ mod tests {
         bayes
             .step(&on(5, prs(5), vec![run(CiStatus::Passed)], merges(910, 3)))
             .unwrap();
-        assert_eq!(bayes.position, 5);
-        assert_eq!(bayes.untested[&BatchId(5)], 3);
+        assert_eq!(bayes.model.position(), 5);
+        assert_eq!(bayes.tracked[&BatchId(5)].covered, 2);
         assert_eq!(bayes.model.cleared(PrNumber(2)), Some(2));
         assert_eq!(bayes.model.cleared(PrNumber(1)), Some(0));
+    }
+
+    #[test]
+    fn a_trunk_change_the_queue_did_not_make_regrows_every_queued_pull_request_and_keeps_its_failed_runs_until_it_is_ejected()
+     {
+        let mut bayes = bayes();
+        step(&mut bayes, &on(0, vec![fresh(1), fresh(2)], vec![], vec![]));
+        assert_eq!(belief(&bayes, bad(1)), 0.0);
+        // Another hand moved trunk by 3: no departure, every `behind` rises.
+        let prs = || vec![stale(ready(1), 3), stale(ready(2), 3)];
+        step(&mut bayes, &on(3, prs(), vec![], vec![]));
+        assert_eq!(bayes.model.cleared(PrNumber(1)), Some(0));
+        assert_eq!(belief(&bayes, bad(1)), bayes.model.regrown(3));
+
+        let failed = |id| testing(id, tip(1003), &[1], ci_failed());
+        let plan = step(&mut bayes, &on(3, prs(), vec![failed(50)], vec![]));
+        assert!(plan.eject.is_empty(), "{plan:?}");
+        let runs: Vec<(BatchId, &BTreeSet<Cause>)> = bayes
+            .model
+            .evidence()
+            .iter()
+            .map(|run| (run.batch, &run.exercised))
+            .collect();
+        assert_eq!(runs, vec![(BatchId(50), &BTreeSet::from([bad(1)]))]);
+
+        let plan = step(&mut bayes, &on(3, prs(), vec![failed(51)], vec![]));
+        assert_eq!(plan.eject, vec![ejection(1, failed_by(51))]);
+    }
+
+    #[test]
+    fn a_batch_inherited_on_a_base_the_scheduler_never_saw_is_covered_at_the_position_now_and_retired()
+     {
+        for speculation in [Speculation::Chain, Speculation::Tree] {
+            let mut bayes = Bayes::new(BayesConfig {
+                speculation,
+                ..params()
+            });
+            let inherited = testing(1, moved(), &[1], CiStatus::Pending);
+            let plan = step(
+                &mut bayes,
+                &observation(ready_all(&[1, 2]), vec![inherited]),
+            );
+            assert_eq!(bayes.tracked[&BatchId(1)].covered, 0, "{speculation:?}");
+            assert_eq!(plan.retire, ids(&[1]), "{speculation:?}");
+        }
+    }
+
+    #[test]
+    fn a_batch_first_seen_after_another_hand_moved_trunk_is_covered_at_the_trunk_it_started_on() {
+        let mut bayes = bayes();
+        step(&mut bayes, &on(0, vec![fresh(1), fresh(2)], vec![], vec![]));
+        // A batch started on that trunk passed, and another hand moved trunk
+        // by 3, before the next read.
+        let passed = testing(5, tip(1000), &[1], CiStatus::Passed);
+        let prs = vec![stale(ready(1), 3), stale(ready(2), 3)];
+        step(&mut bayes, &on(3, prs, vec![passed], vec![]));
+        assert_eq!(bayes.tracked[&BatchId(5)].covered, 0);
+        assert_eq!(bayes.model.cleared(PrNumber(1)), Some(0));
+        assert_eq!(belief(&bayes, bad(1)), bayes.model.regrown(3));
+    }
+
+    #[test]
+    fn a_batch_on_a_landed_tip_is_covered_at_that_tip_s_position() {
+        let mut bayes = bayes();
+        let passed = testing(2, trunk(), &[1], CiStatus::Passed);
+        let plan = step(&mut bayes, &observation(ready_all(&[1, 3]), vec![passed]));
+        assert_eq!(plan.land, ids(&[2]));
+        // 2 landed and batch 3 started on its tip; another hand then pushed
+        // two changes on top before the read.
+        let landed_batch = batch(2, trunk(), &[1], BatchState::Landed { tip: tip(2) });
+        let child = testing(3, tip(2), &[3], CiStatus::Pending);
+        let input = on(
+            3,
+            ready_all(&[3]),
+            vec![landed_batch, child],
+            vec![landed(1, 2)],
+        );
+        step(&mut bayes, &input);
+        assert_eq!(bayes.tracked[&BatchId(2)].covered, 1);
+        assert_eq!(bayes.tracked[&BatchId(3)].covered, 1);
     }
 
     #[test]

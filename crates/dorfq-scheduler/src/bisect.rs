@@ -711,6 +711,7 @@ mod tests {
             &Observation::new(
                 Timestamp(0),
                 tip(3),
+                1,
                 ready_all(&[2, 3, 4]),
                 vec![
                     batch(3, trunk(), &[1], BatchState::Landed { tip: tip(3) }),
@@ -756,6 +757,7 @@ mod tests {
             &Observation::new(
                 Timestamp(0),
                 tip(1),
+                1,
                 ready_all(&[2, 3]),
                 vec![
                     batch(1, trunk(), &[1], BatchState::Landed { tip: tip(1) }),
@@ -940,6 +942,7 @@ mod tests {
             &Observation::new(
                 Timestamp(0),
                 tip(2),
+                1,
                 ready_all(&[2]),
                 vec![
                     batch(2, trunk(), &[1], BatchState::Landed { tip: tip(2) }),

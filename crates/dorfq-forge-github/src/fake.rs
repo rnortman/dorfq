@@ -433,9 +433,18 @@ impl GitHubApi for FakeGitHub {
             (false, false) => CompareStatus::Diverged,
         };
         let ahead_by = of_head.difference(&of_base).count();
+        // Shas are minted in order and a commit after its parents, so the
+        // greatest common ancestor has no other common ancestor descending
+        // from it.
+        let merge_base = of_base
+            .intersection(&of_head)
+            .max()
+            .expect("fake histories share a root")
+            .clone();
         Ok(Compare {
             status,
             ahead_by: u32::try_from(ahead_by).expect("a fake history fits u32"),
+            merge_base,
         })
     }
 
@@ -544,5 +553,25 @@ impl GitHubApi for FakeGitHub {
     fn label_exists(&mut self, label: &str) -> Result<bool, ApiError> {
         self.enter("label_exists", label.to_owned())?;
         Ok(self.state().labels.contains(label))
+    }
+}
+
+mod tests {
+    use super::FakeGitHub;
+    use crate::api::GitHubApi;
+
+    #[test]
+    fn merge_base_is_the_fork_point_or_the_ancestor_itself() {
+        let mut fake = FakeGitHub::new();
+        let fork = fake.trunk();
+        let head = fake.open_pr(1);
+        let ahead = fake.commit(std::slice::from_ref(&head));
+        let trunk = fake.advance_trunk();
+        fake.advance_trunk();
+        let trunk_now = fake.trunk();
+        assert_eq!(fake.compare(&ahead, &trunk_now).unwrap().merge_base, fork);
+        assert_eq!(fake.compare(&trunk_now, &ahead).unwrap().merge_base, fork);
+        assert_eq!(fake.compare(&trunk, &trunk_now).unwrap().merge_base, trunk);
+        assert_eq!(fake.compare(&head, &ahead).unwrap().merge_base, head);
     }
 }

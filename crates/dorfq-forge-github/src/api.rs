@@ -34,8 +34,8 @@ pub trait GitHubApi {
     fn merge(&mut self, base_branch: &str, head: &Sha, message: &str) -> Result<Merge, ApiError>;
     /// True when `descendant` is `ancestor` or has it in its history.
     fn is_ancestor(&mut self, ancestor: &Sha, descendant: &Sha) -> Result<bool, ApiError>;
-    /// How `head` stands to `base`, and the commits `head` has that `base`
-    /// does not.
+    /// How `head` stands to `base`, the commits `head` has that `base` does
+    /// not, and their merge base.
     fn compare(&mut self, base: &Sha, head: &Sha) -> Result<Compare, ApiError>;
     /// Every open pull request in the repository.
     fn list_open_prs(&mut self) -> Result<Vec<PrSummary>, ApiError>;
@@ -91,11 +91,13 @@ pub enum Merge {
 }
 
 /// Two commits compared.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compare {
     pub status: CompareStatus,
     /// Commits in the head's history that are not in the base's.
     pub ahead_by: u32,
+    /// The best common ancestor of the two.
+    pub merge_base: Sha,
 }
 
 /// Where the head of a comparison stands to its base.
@@ -1084,6 +1086,7 @@ struct CommitJson {
 struct CompareJson {
     status: String,
     ahead_by: u32,
+    merge_base_commit: ShaJson,
 }
 
 /// A compare response as a [`Compare`]; an unknown status is permanent.
@@ -1102,6 +1105,7 @@ fn compare_of(what: &str, compared: CompareJson) -> Result<Compare, ApiError> {
     Ok(Compare {
         status,
         ahead_by: compared.ahead_by,
+        merge_base: parse_sha(what, &compared.merge_base_commit.sha)?,
     })
 }
 
