@@ -597,7 +597,7 @@ fn run() -> Result<(), String> {
     })?;
     drop(restarted);
     repo.pass(&tip)?;
-    observe_until(&mut forge, "batch 2 passed", |o| {
+    let passed = observe_until(&mut forge, "batch 2 passed", |o| {
         batch(o, 2)
             == Some(&BatchState::Testing {
                 tip: tip.clone(),
@@ -605,7 +605,8 @@ fn run() -> Result<(), String> {
             })
     })?;
 
-    // 6. Batch 2 lands: trunk is its tip, A and B are told.
+    // 6. Batch 2 lands: trunk is its tip, A and B are told, and the trunk
+    // position rises by its two members.
     forge.land(BatchId(2)).map_err(at("landing batch 2"))?;
     let observation = observe_until(&mut forge, "batch 2 landed, nothing enqueued", |o| {
         batch(o, 2) == Some(&BatchState::Landed { tip: tip.clone() }) && o.prs.is_empty()
@@ -613,6 +614,15 @@ fn run() -> Result<(), String> {
     check(observation.trunk == tip, || {
         format!("trunk is {}, expected {tip}", observation.trunk)
     })?;
+    check(
+        observation.trunk_position == passed.trunk_position + 2,
+        || {
+            format!(
+                "the trunk position went from {} to {} at a landing of two",
+                passed.trunk_position, observation.trunk_position
+            )
+        },
+    )?;
     repo.wait_for_marker(a.number, Marker::Landed)?;
     repo.wait_for_marker(b.number, Marker::Landed)?;
     forge.retire(BatchId(2)).map_err(at("retiring batch 2"))?;
@@ -777,9 +787,19 @@ fn run() -> Result<(), String> {
             trunk: pushed.clone(),
         },
     };
-    observe_until(&mut forge, "batch 5 refused, trunk moved", |o| {
+    let moved = observe_until(&mut forge, "batch 5 refused, trunk moved", |o| {
         batch(o, 5) == Some(&refused)
     })?;
+    // The push brought one commit, and nothing departed for it.
+    check(
+        moved.trunk_position == observation.trunk_position + 1,
+        || {
+            format!(
+                "the trunk position went from {} to {} at a direct push of one commit",
+                observation.trunk_position, moved.trunk_position
+            )
+        },
+    )?;
     forge.retire(BatchId(5)).map_err(at("retiring batch 5"))?;
 
     // 9. Clean up the run's fixtures; trunk keeps what landed on it.

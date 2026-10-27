@@ -113,7 +113,7 @@ pub(crate) fn testing(id: u64, base: Sha, members: &[u64], ci: CiStatus) -> Batc
 }
 
 pub(crate) fn observation(prs: Vec<PrSnapshot>, batches: Vec<BatchStatus>) -> Observation {
-    Observation::new(Timestamp(0), trunk(), prs, batches, Vec::new())
+    Observation::new(Timestamp(0), trunk(), 0, prs, batches, Vec::new())
 }
 
 /// A failed CI verdict with no per-check detail.

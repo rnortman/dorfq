@@ -56,7 +56,7 @@ impl Ledger {
     /// malformed observation leaves the ledger as it was.
     pub fn observed(&mut self, observation: &Observation) -> Result<(), Malformed> {
         check_observation(observation)?;
-        check_departed(self.latest.as_ref(), observation)?;
+        check_against_previous(self.latest.as_ref(), observation)?;
         *self = Ledger {
             latest: Some(observation.clone()),
             ..Ledger::default()
@@ -462,6 +462,8 @@ pub enum Malformed {
     /// Following bases from `batch` through the batches whose tips they are
     /// never reaches a sha that no batch has as tip.
     BatchBaseCycle { batch: BatchId },
+    /// `trunk_position` is below the previous observation's.
+    TrunkPositionFell { from: u64, to: u64 },
 }
 
 impl fmt::Display for Malformed {
@@ -508,6 +510,9 @@ impl fmt::Display for Malformed {
                 "observation: the bases from batch {} lead back to it",
                 batch.0
             ),
+            Malformed::TrunkPositionFell { from, to } => {
+                write!(f, "observation: trunk position fell from {from} to {to}")
+            }
         }
     }
 }
@@ -520,13 +525,21 @@ impl From<Malformed> for ForgeError {
     }
 }
 
-/// Rule 8's `departed` clause against the observation before it: sorted
-/// by number, and exactly `previous.prs` minus `observation.prs`, each at its
-/// previous head.
-fn check_departed(
+/// Rule 8's clauses against the observation before it: `trunk_position`
+/// not below the previous one, and `departed` sorted by number and exactly
+/// `previous.prs` minus `observation.prs`, each at its previous head.
+fn check_against_previous(
     previous: Option<&Observation>,
     observation: &Observation,
 ) -> Result<(), Malformed> {
+    if let Some(previous) = previous
+        && observation.trunk_position < previous.trunk_position
+    {
+        return Err(Malformed::TrunkPositionFell {
+            from: previous.trunk_position,
+            to: observation.trunk_position,
+        });
+    }
     for pair in observation.departed.windows(2) {
         let (a, b) = (pair[0].pr, pair[1].pr);
         if a == b {
@@ -558,11 +571,12 @@ fn check_departed(
     }
 }
 
-/// Rule 8's clauses, first violation first: `prs` by number and `batches`
-/// by id, strictly increasing; each pull request's status consistent with
-/// its base, and every base reported; the base relation over `prs`
-/// acyclic; every tip distinct from its batch's base and from every other
-/// tip; the base relation over batches acyclic.
+/// Rule 8's clauses on one observation alone (those against the previous
+/// one are `check_against_previous`'s), first violation first: `prs` by
+/// number and `batches` by id, strictly increasing; each pull request's
+/// status consistent with its base, and every base reported; the base
+/// relation over `prs` acyclic; every tip distinct from its batch's base
+/// and from every other tip; the base relation over batches acyclic.
 fn check_observation(observation: &Observation) -> Result<(), Malformed> {
     for pair in observation.prs.windows(2) {
         let (a, b) = (pair[0].number, pair[1].number);
@@ -716,6 +730,7 @@ mod tests {
             .observed(&Observation {
                 now: crate::Timestamp(0),
                 trunk: sha(1),
+                trunk_position: 0,
                 prs: (1..=4).map(pr).collect(),
                 batches: vec![
                     batch(1, &[1, 2], passed(10)),
@@ -1188,6 +1203,7 @@ mod tests {
         Observation {
             now: crate::Timestamp(0),
             trunk: sha(1),
+            trunk_position: 0,
             prs: prs.iter().map(|&n| pr(n)).collect(),
             batches,
             departed: vec![],
@@ -1490,6 +1506,32 @@ mod tests {
             Ledger::new().observed(&with_departed(&[], vec![gone(1)])),
             Err(Malformed::DepartedMismatch { pr: PrNumber(1) }),
             "a first observation has no departures"
+        );
+    }
+
+    #[test]
+    fn observed_rejects_a_trunk_position_that_fell() {
+        let at = |trunk_position| Observation {
+            trunk_position,
+            ..observation(&[1], vec![])
+        };
+        let mut ledger = Ledger::new();
+        assert_eq!(
+            ledger.observed(&at(5)),
+            Ok(()),
+            "a first observation is at any position"
+        );
+        assert_eq!(
+            ledger.observed(&at(4)),
+            Err(Malformed::TrunkPositionFell { from: 5, to: 4 })
+        );
+        assert_eq!(ledger.latest(), Some(&at(5)));
+        assert_eq!(ledger.observed(&at(5)), Ok(()));
+        assert_eq!(ledger.observed(&at(7)), Ok(()));
+        assert_eq!(ledger.latest(), Some(&at(7)));
+        assert_eq!(
+            Malformed::TrunkPositionFell { from: 5, to: 4 }.to_string(),
+            "observation: trunk position fell from 5 to 4"
         );
     }
 

@@ -23,11 +23,11 @@
 //!    facts. Effects return `Ok(())`; their consequences appear in the next
 //!    observation. A forge keeps a batch in [`Observation::batches`] from
 //!    [`Forge::start_batch`] until [`Forge::retire`], whatever its state.
-//!    What a pull request's own CI covered is the forge's to report,
-//!    through [`PrSnapshot::behind`], which grows with every change to
-//!    trunk whether or not the queue made it: a scheduler counts the
-//!    landings it observes, and `behind` is the only fact it has about the
-//!    trunk changes it did not.
+//!    What trunk a pull request's own CI covered is the forge's to report,
+//!    through [`Observation::trunk_position`] and [`PrSnapshot::behind`]:
+//!    the position grows with every change to trunk whether or not the
+//!    queue made it, and a scheduler keeps no count of its own — the
+//!    observation is its only fact about the trunk changes it did not make.
 //!    *Enforced by* the types (an effect returns `Result<(), ForgeError>`)
 //!    and each forge's tests, which observe a batch after every effect
 //!    until it is retired.
@@ -110,7 +110,9 @@
 //!    `PrBase::Pr(b)`). [`Observation::departed`] is sorted by number and
 //!    names exactly the pull requests the previous observation reported and
 //!    this one does not, each at the head the previous observation gave it;
-//!    it is empty when there is no previous observation. **Tips:** a batch
+//!    it is empty when there is no previous observation.
+//!    [`Observation::trunk_position`] is never below the previous
+//!    observation's. **Tips:** a batch
 //!    that has a tip (`Testing`, `Landed`, `LandRefused`) has one that is
 //!    not its own base and that no other batch has, and following bases from
 //!    a batch through the batches whose tips they are always ends at a sha
@@ -259,6 +261,14 @@ pub struct Observation {
     /// the previous observation's and from every tracked batch's `Landed`
     /// tip was moved by a hand other than the queue's.
     pub trunk: Sha,
+    /// The trunk position: how many pull requests have reached trunk, by
+    /// the queue's hand or any other, since this forge's first observation,
+    /// where it is 0. The forge counts its own landings exactly, by batch
+    /// members; a change it did not make it counts as best it can and never
+    /// fewer than the changes it brought.
+    /// It never falls (rule 8). A scheduler reads positions from one forge
+    /// and compares nothing across forges or restarts.
+    pub trunk_position: u64,
     /// Every enqueued pull request, sorted by number, closed under
     /// [`PrSnapshot::base`]: every `PrBase::Pr(n)` names a pull request in
     /// `prs`.
@@ -276,6 +286,7 @@ impl Observation {
     pub fn new(
         now: Timestamp,
         trunk: Sha,
+        trunk_position: u64,
         prs: Vec<PrSnapshot>,
         batches: Vec<BatchStatus>,
         departed: Vec<Departure>,
@@ -283,6 +294,7 @@ impl Observation {
         Observation {
             now,
             trunk,
+            trunk_position,
             prs,
             batches,
             departed,
@@ -339,6 +351,8 @@ pub struct PrSnapshot {
     /// stand; falls when a newer own-CI run starts on the same head. A forge
     /// that cannot tell what a run covered reports the changes since the
     /// head's merge base with trunk, which is never fewer.
+    /// `trunk_position − behind` is the position the run covered, so the two
+    /// are reported in one unit.
     pub behind: u32,
 }
 
@@ -972,6 +986,7 @@ mod tests {
         let observation = Observation::new(
             Timestamp(9),
             sha.clone(),
+            11,
             vec![pr.clone()],
             vec![],
             vec![departure.clone()],
@@ -980,10 +995,17 @@ mod tests {
             (
                 observation.now,
                 &observation.trunk,
+                observation.trunk_position,
                 observation.prs.as_slice(),
                 observation.departed.as_slice()
             ),
-            (Timestamp(9), &sha, [pr].as_slice(), [departure].as_slice())
+            (
+                Timestamp(9),
+                &sha,
+                11,
+                [pr].as_slice(),
+                [departure].as_slice()
+            )
         );
         let checks = BTreeSet::from([CheckName("build".into())]);
         assert_eq!(Failure::new(checks.clone()).checks, checks);

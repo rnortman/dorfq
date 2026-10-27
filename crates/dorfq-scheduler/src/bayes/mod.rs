@@ -13,16 +13,16 @@
 //! enqueued ancestors are never a pair: the forge reports a stacked pull
 //! request ready only when its own CI covered its ancestors.
 //!
-//! Trunk positions count the pull requests that reached trunk, landed by the
-//! queue or merged by another hand. A run exercises `Bad` of every member of
-//! its tree (its own members and every ancestor batch's) and every pair of
-//! them. A passing run is an alibi: it clears every `Bad` it exercised at the
-//! trunk it started on, credited with its own tree's landings since, and
-//! sets every pair it exercised to a floor that inference treats as false.
-//! A pull request's own CI passing on its head is an alibi for its `Bad`
-//! alone, against the trunk that run started on. Each landing since a
-//! cleared position may have broken the pull request, with probability
-//! `p_interact` per pull request that reached trunk.
+//! Trunk positions are the forge's count of the pull requests that reached
+//! trunk, landed by the queue or by any other hand. A run exercises `Bad` of
+//! every member of its tree (its own members and every ancestor batch's) and
+//! every pair of them. A passing run is an alibi: it clears every `Bad` it
+//! exercised at the trunk it started on, credited with its own tree's landings
+//! since, and sets every pair it exercised to a floor that inference treats as
+//! false. A pull request's own CI passing on its head is an alibi for its `Bad`
+//! alone, against the trunk that run started on. Each landing since a cleared
+//! position may have broken the pull request, with probability `p_interact` per
+//! pull request that reached trunk.
 //!
 //! A failing run is evidence. A failed run is read at the trunk it started
 //! on: it blames a pull request only if its cleared position is behind that
@@ -54,7 +54,7 @@ mod tree;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use dorfq_core::{BatchId, PrNumber, Timestamp};
+use dorfq_core::{BatchId, PrNumber, Sha, Timestamp};
 
 use crate::{BayesConfig, Ids, Member};
 use model::Model;
@@ -79,13 +79,12 @@ pub(crate) struct Bayes {
     /// Culprit finders started and still tracked; every other tracked batch,
     /// started here or not, is a chain batch. Empty under the tree.
     finders: BTreeSet<BatchId>,
-    /// Each tracked batch's tree members, taken when it was first observed.
-    trees: BTreeMap<BatchId, Vec<Member>>,
-    /// For each tracked batch, the pull requests that reached trunk outside
-    /// its tree since it started: landings its run did not test.
-    untested: BTreeMap<BatchId, u32>,
-    /// How many pull requests the scheduler has seen reach trunk.
-    position: i64,
+    /// Every batch in the latest observation: its tree and the trunk its
+    /// run tested.
+    tracked: BTreeMap<BatchId, Tracked>,
+    /// The latest observation's trunk and position: every batch the plan
+    /// made from it starts on that trunk or on a tracked tip.
+    last_trunk: Option<(Sha, i64)>,
     /// Batches whose verdict has been taken in.
     read: BTreeSet<BatchId>,
     /// When each queued pull request's number first appeared, kept across
@@ -96,6 +95,16 @@ pub(crate) struct Bayes {
     values: BTreeMap<PrNumber, f64>,
 }
 
+/// A tracked batch: what its run exercises and the trunk it tested.
+#[derive(Debug, Clone, PartialEq)]
+struct Tracked {
+    /// Its tree members still queued, taken when it was first observed.
+    tree: Vec<Member>,
+    /// The trunk position its run tests: the position its tree stands on,
+    /// credited with every member of its tree that has reached trunk since.
+    covered: i64,
+}
+
 impl Bayes {
     pub(crate) fn new(params: BayesConfig) -> Bayes {
         Bayes {
@@ -103,9 +112,8 @@ impl Bayes {
             ids: Ids::new(),
             model: Model::new(params.priors()),
             finders: BTreeSet::new(),
-            trees: BTreeMap::new(),
-            untested: BTreeMap::new(),
-            position: 0,
+            tracked: BTreeMap::new(),
+            last_trunk: None,
             read: BTreeSet::new(),
             since: BTreeMap::new(),
             values: BTreeMap::new(),

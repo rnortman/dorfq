@@ -1132,6 +1132,7 @@ fn behind_starts_from_the_scenario_grows_by_each_landing_and_resets_at_a_repush(
     };
     let first = forge.observe().unwrap();
     assert_eq!(behind(&first), [(1, 0), (2, 4), (3, 1)]);
+    assert_eq!(first.trunk_position, 0);
     forge.start_batch(&start(1, &first.trunk, &[1, 2])).unwrap();
     let decided = forge.observe().unwrap();
     assert!(matches!(
@@ -1142,7 +1143,11 @@ fn behind_starts_from_the_scenario_grows_by_each_landing_and_resets_at_a_repush(
         }
     ));
     forge.land(BatchId(1)).unwrap();
-    assert_eq!(behind(&forge.observe().unwrap()), [(3, 3)]);
+    let landed = forge.observe().unwrap();
+    assert_eq!(behind(&landed), [(3, 3)]);
+    assert_eq!(landed.trunk_position, 2);
     // 3's re-push runs its own CI on today's trunk; 4 arrives with its own.
-    assert_eq!(behind(&forge.observe().unwrap()), [(3, 0), (4, 2)]);
+    let repushed = forge.observe().unwrap();
+    assert_eq!(behind(&repushed), [(3, 0), (4, 2)]);
+    assert_eq!(repushed.trunk_position, 2);
 }

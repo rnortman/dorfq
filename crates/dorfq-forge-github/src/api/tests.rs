@@ -394,7 +394,12 @@ fn compare_status_maps_to_ancestry() {
         let (mut api, _) = client(vec![route(
             "GET",
             &format!("/compare/{A}...{B}"),
-            ok(json!({ "status": status, "ahead_by": 1, "behind_by": 0 })),
+            ok(json!({
+                "status": status,
+                "ahead_by": 1,
+                "behind_by": 0,
+                "merge_base_commit": { "sha": A },
+            })),
         )]);
         match (api.is_ancestor(&sha(A), &sha(B)), expected) {
             (Ok(got), Some(want)) => assert_eq!(got, want, "{status}"),
@@ -405,27 +410,49 @@ fn compare_status_maps_to_ancestry() {
 }
 
 #[test]
-fn compare_decodes_status_and_ahead_by() {
+fn compare_decodes_status_ahead_by_and_merge_base() {
     let (mut api, _) = client(vec![route(
         "GET",
         &format!("/compare/{A}...{B}"),
-        ok(json!({ "status": "diverged", "ahead_by": 7, "behind_by": 2 })),
+        ok(json!({
+            "status": "diverged",
+            "ahead_by": 7,
+            "behind_by": 2,
+            "merge_base_commit": { "sha": C, "commit": {} },
+        })),
     )]);
     assert_eq!(
         api.compare(&sha(A), &sha(B)).unwrap(),
         Compare {
             status: CompareStatus::Diverged,
-            ahead_by: 7
+            ahead_by: 7,
+            merge_base: sha(C),
         }
     );
-    let (mut api, _) = client(vec![route(
-        "GET",
-        &format!("/compare/{A}...{B}"),
-        ok(json!({ "status": "ahead" })),
-    )]);
-    let error = api.compare(&sha(A), &sha(B)).unwrap_err();
-    assert!(!is_transient(&error));
-    assert!(error.to_string().contains("ahead_by"), "{error}");
+    let defects = [
+        (
+            json!({ "status": "ahead", "merge_base_commit": { "sha": C } }),
+            "ahead_by",
+        ),
+        (
+            json!({ "status": "ahead", "ahead_by": 1 }),
+            "merge_base_commit",
+        ),
+        (
+            json!({
+                "status": "ahead",
+                "ahead_by": 1,
+                "merge_base_commit": { "sha": "not a sha" },
+            }),
+            "not a sha",
+        ),
+    ];
+    for (body, named) in defects {
+        let (mut api, _) = client(vec![route("GET", &format!("/compare/{A}...{B}"), ok(body))]);
+        let error = api.compare(&sha(A), &sha(B)).unwrap_err();
+        assert!(!is_transient(&error), "{named}");
+        assert!(error.to_string().contains(named), "{error}");
+    }
 }
 
 #[test]

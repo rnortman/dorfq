@@ -4,8 +4,13 @@
 //! at which pull requests arrive, are re-pushed or withdraw as the scenario
 //! says, and pending CI runs count down to their verdict. Commits are
 //! synthetic, minted from a counter, so every run of a scenario is
-//! identical. Observations are checked against rule 8 and effects against
-//! rules 5 and 6 of the [`dorfq_core`] contract through a [`Ledger`], and
+//! identical. Trunk moves only by the queue's landings, so an observation's
+//! `trunk_position` is the count of pull requests landed since the forge was
+//! built, and a pull request's `behind` is in the same unit: the position
+//! less the one its head's CI covered, which is the scenario's `behind`
+//! below the position at arrival and the position at a re-push.
+//! Observations are checked against rule 8 and effects against rules 5 and
+//! 6 of the [`dorfq_core`] contract through a [`Ledger`], and
 //! a defect is answered with [`ForgeError::Permanent`] carrying a
 //! [`Malformed`](dorfq_core::ledger::Malformed) or a
 //! [`Violation`](dorfq_core::ledger::Violation).
@@ -98,9 +103,11 @@ struct MockPr {
     lifecycle: Lifecycle,
     /// Set when the pull request arrives.
     head: Option<Sha>,
-    /// Trunk changes its head's own CI did not cover: the scenario's at
-    /// arrival, 0 at a re-push, raised by every landing while enqueued.
-    behind: u32,
+    /// The trunk position its head's own CI covered, set when it arrives:
+    /// the position less the scenario's `behind` at arrival, the position
+    /// at a re-push. Below 0 where the scenario's `behind` predates the
+    /// forge.
+    covered: i64,
 }
 
 struct MockBatch {
@@ -118,6 +125,8 @@ pub struct MockForge {
     prs: BTreeMap<PrNumber, MockPr>,
     batches: BTreeMap<BatchId, MockBatch>,
     trunk: Sha,
+    /// Pull requests landed since construction: the trunk position.
+    position: u64,
     next_commit: u64,
     tick: u64,
     ledger: Ledger,
@@ -133,10 +142,10 @@ impl MockForge {
             .into_iter()
             .map(|(number, spec)| {
                 let pr = MockPr {
-                    behind: spec.behind,
                     spec,
                     lifecycle: Lifecycle::NotArrived,
                     head: None,
+                    covered: 0,
                 };
                 (number, pr)
             })
@@ -147,6 +156,7 @@ impl MockForge {
             prs,
             batches: BTreeMap::new(),
             trunk: commit(1),
+            position: 0,
             next_commit: 2,
             tick: 0,
             ledger: Ledger::new(),
@@ -175,6 +185,11 @@ impl MockForge {
         sha
     }
 
+    /// The trunk position, signed to compare with a covered position.
+    fn position(&self) -> i64 {
+        i64::try_from(self.position).expect("a trunk position fits i64")
+    }
+
     fn tell(&mut self, pr: PrNumber, event: Event) -> Result<(), ForgeError> {
         let message = Message { pr, event };
         let written = writeln!(self.sink, "{message}");
@@ -200,6 +215,9 @@ impl MockForge {
             if arrives && lifecycle == Lifecycle::NotArrived {
                 let head = self.mint();
                 self.set_pr(number, Lifecycle::Enqueued, Some(head));
+                let position = self.position();
+                let pr = self.prs.get_mut(&number).expect("scenario pull request");
+                pr.covered = position - i64::from(pr.spec.behind);
                 lifecycle = Lifecycle::Enqueued;
                 self.tell(number, Event::Queued)?;
                 let spec = &self.prs[&number].spec;
@@ -213,7 +231,7 @@ impl MockForge {
                 self.prs
                     .get_mut(&number)
                     .expect("scenario pull request")
-                    .behind = 0;
+                    .covered = self.position();
             }
             if dequeues && lifecycle == Lifecycle::Enqueued {
                 self.set_pr(number, Lifecycle::Withdrawn, None);
@@ -274,7 +292,8 @@ impl MockForge {
                         .expect("an enqueued pull request has a head"),
                     base,
                     status(&pr.spec, base),
-                    pr.behind,
+                    u32::try_from(self.position() - pr.covered)
+                        .expect("a head's staleness fits u32"),
                 );
                 Some(if pr.spec.atomic {
                     snapshot.with_stack(StackPolicy::Atomic)
@@ -305,6 +324,7 @@ impl MockForge {
         Ok(Observation::new(
             now,
             self.trunk.clone(),
+            self.position,
             prs,
             batches,
             departed,
@@ -463,12 +483,7 @@ impl Forge for MockForge {
         for member in &status.members {
             self.set_pr(member.pr, Lifecycle::Merged, None);
         }
-        let landed = u32::try_from(status.members.len()).expect("a batch's members fit u32");
-        for pr in self.prs.values_mut() {
-            if pr.lifecycle == Lifecycle::Enqueued {
-                pr.behind += landed;
-            }
-        }
+        self.position += u64::try_from(status.members.len()).expect("a batch's members fit u64");
         self.ledger.landed(batch);
         for member in &status.members {
             self.tell(member.pr, Event::Landed { tip: tip.clone() })?;

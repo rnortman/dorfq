@@ -150,6 +150,7 @@ fn busy_observation() -> Observation {
     Observation::new(
         Timestamp(42),
         sha(1),
+        1,
         vec![pr, held, conflicting],
         vec![batch, failed, silent],
         vec![
@@ -160,7 +161,7 @@ fn busy_observation() -> Observation {
 }
 
 fn empty_observation() -> Observation {
-    Observation::new(Timestamp(7), sha(1), Vec::new(), Vec::new(), Vec::new())
+    Observation::new(Timestamp(7), sha(1), 0, Vec::new(), Vec::new(), Vec::new())
 }
 
 /// A plan with two items of every kind.
