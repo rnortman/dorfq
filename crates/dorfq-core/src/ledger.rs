@@ -29,6 +29,8 @@ pub struct Ledger {
     /// Batches `land` was called on, refused or not.
     landing: BTreeSet<BatchId>,
     retired: BTreeSet<BatchId>,
+    /// Pull requests `notify` was called on.
+    notified: BTreeSet<PrNumber>,
 }
 
 /// What [`Ledger::check_land`] proved about a batch it accepts.
@@ -230,7 +232,8 @@ impl Ledger {
     }
 
     /// Rules 5 and 6 for `eject`: the pull request is not a member of a
-    /// batch landed since the latest observation, and is known.
+    /// batch landed since the latest observation, was not notified since
+    /// it, and is known.
     pub fn check_eject(&self, pr: PrNumber) -> Result<(), Violation> {
         if self.in_landing(pr) {
             return Err(Violation::LandedInPlan {
@@ -238,10 +241,44 @@ impl Ledger {
                 pr,
             });
         }
+        if self.notified.contains(&pr) {
+            return Err(Violation::NotifiedInPlan { pr });
+        }
         if !self.pr_known(pr) {
-            return Err(Violation::UnknownPr { pr });
+            return Err(Violation::UnknownPr {
+                effect: "eject",
+                pr,
+            });
         }
         Ok(())
+    }
+
+    /// Rules 5 and 6 for `notify`: the pull request is not a member of a
+    /// batch landed since the latest observation, is known, and was not
+    /// notified since it. A notice removes nothing from knownness, so the
+    /// second notice is checked here rather than falling out of it.
+    pub fn check_notify(&self, pr: PrNumber) -> Result<(), Violation> {
+        if self.in_landing(pr) {
+            return Err(Violation::LandedInPlan {
+                effect: "notify",
+                pr,
+            });
+        }
+        if !self.pr_known(pr) {
+            return Err(Violation::UnknownPr {
+                effect: "notify",
+                pr,
+            });
+        }
+        if self.notified.contains(&pr) {
+            return Err(Violation::NotifiedTwice { pr });
+        }
+        Ok(())
+    }
+
+    /// Records that `pr` was notified.
+    pub fn notified(&mut self, pr: PrNumber) {
+        self.notified.insert(pr);
     }
 
     /// Records that `pr` was ejected.
@@ -331,9 +368,9 @@ pub enum Violation {
     /// `start_batch` naming a pull request the latest observation did not
     /// report `Ready`.
     MemberNotReady { batch: BatchId, pr: PrNumber },
-    /// `start_batch` or `eject` naming a member of a batch `land` was called
-    /// on since the latest observation, whether or not the landing was
-    /// refused.
+    /// `start_batch`, `notify` or `eject` naming a member of a batch `land`
+    /// was called on since the latest observation, whether or not the
+    /// landing was refused.
     LandedInPlan { effect: &'static str, pr: PrNumber },
     /// `start_batch` naming `pr`, based on `base`, without `base` as an
     /// earlier member or a member of a batch below the new batch's base.
@@ -359,8 +396,12 @@ pub enum Violation {
     SplitsAtomicStack { batch: BatchId, pr: PrNumber },
     /// `land` on the same batch twice after one observation.
     LandedTwice { batch: BatchId },
-    /// `eject` on a pull request that is not known.
-    UnknownPr { pr: PrNumber },
+    /// `eject` or `notify` on a pull request that is not known.
+    UnknownPr { effect: &'static str, pr: PrNumber },
+    /// `notify` on a pull request notified since the latest observation.
+    NotifiedTwice { pr: PrNumber },
+    /// `eject` on a pull request notified since the latest observation.
+    NotifiedInPlan { pr: PrNumber },
     /// `retire` on a batch `land` was called on since the latest
     /// observation: a landed batch is reported `Landed` before it is retired.
     RetiredInPlan { batch: BatchId },
@@ -417,7 +458,15 @@ impl fmt::Display for Violation {
             Violation::LandedTwice { batch } => {
                 write!(f, "land: batch {} was already landed in this plan", batch.0)
             }
-            Violation::UnknownPr { pr } => write!(f, "eject: pr {} is not known", pr.0),
+            Violation::UnknownPr { effect, pr } => {
+                write!(f, "{effect}: pr {} is not known", pr.0)
+            }
+            Violation::NotifiedTwice { pr } => {
+                write!(f, "notify: pr {} was notified in this plan", pr.0)
+            }
+            Violation::NotifiedInPlan { pr } => {
+                write!(f, "eject: pr {} was notified in this plan", pr.0)
+            }
             Violation::RetiredInPlan { batch } => {
                 write!(f, "retire: batch {} is landed in this plan", batch.0)
             }
@@ -794,7 +843,17 @@ mod tests {
         );
         assert_eq!(
             ledger.check_eject(PrNumber(1)),
-            Err(Violation::UnknownPr { pr: PrNumber(1) })
+            Err(Violation::UnknownPr {
+                effect: "eject",
+                pr: PrNumber(1)
+            })
+        );
+        assert_eq!(
+            ledger.check_notify(PrNumber(1)),
+            Err(Violation::UnknownPr {
+                effect: "notify",
+                pr: PrNumber(1)
+            })
         );
     }
 
@@ -885,7 +944,15 @@ mod tests {
                     pr: PrNumber(1)
                 })
             );
+            assert_eq!(
+                ledger.check_notify(PrNumber(2)),
+                Err(Violation::LandedInPlan {
+                    effect: "notify",
+                    pr: PrNumber(2)
+                })
+            );
             assert_eq!(ledger.check_eject(PrNumber(3)), Ok(()));
+            assert_eq!(ledger.check_notify(PrNumber(3)), Ok(()));
         }
     }
 
@@ -1157,12 +1224,72 @@ mod tests {
         let mut ledger = world();
         assert_eq!(
             ledger.check_eject(PrNumber(7)),
-            Err(Violation::UnknownPr { pr: PrNumber(7) })
+            Err(Violation::UnknownPr {
+                effect: "eject",
+                pr: PrNumber(7)
+            })
         );
         ledger.ejected(PrNumber(4));
         assert_eq!(
             ledger.check_eject(PrNumber(4)),
-            Err(Violation::UnknownPr { pr: PrNumber(4) })
+            Err(Violation::UnknownPr {
+                effect: "eject",
+                pr: PrNumber(4)
+            })
+        );
+    }
+
+    #[test]
+    fn notify_accepts_a_known_pr_once_and_rejects_an_unknown_one() {
+        let mut ledger = world();
+        assert_eq!(ledger.check_notify(PrNumber(4)), Ok(()));
+        assert_eq!(
+            ledger.check_notify(PrNumber(7)),
+            Err(Violation::UnknownPr {
+                effect: "notify",
+                pr: PrNumber(7)
+            })
+        );
+        ledger.notified(PrNumber(4));
+        assert!(ledger.pr_known(PrNumber(4)));
+        assert_eq!(
+            ledger.check_notify(PrNumber(4)),
+            Err(Violation::NotifiedTwice { pr: PrNumber(4) })
+        );
+        assert_eq!(
+            ledger.check_eject(PrNumber(4)),
+            Err(Violation::NotifiedInPlan { pr: PrNumber(4) })
+        );
+        ledger.ejected(PrNumber(3));
+        assert_eq!(
+            ledger.check_notify(PrNumber(3)),
+            Err(Violation::UnknownPr {
+                effect: "notify",
+                pr: PrNumber(3)
+            })
+        );
+    }
+
+    #[test]
+    fn notice_violations_name_their_effect() {
+        let words: Vec<String> = [
+            Violation::UnknownPr {
+                effect: "notify",
+                pr: PrNumber(2),
+            },
+            Violation::NotifiedTwice { pr: PrNumber(2) },
+            Violation::NotifiedInPlan { pr: PrNumber(2) },
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(
+            words,
+            [
+                "notify: pr 2 is not known",
+                "notify: pr 2 was notified in this plan",
+                "eject: pr 2 was notified in this plan",
+            ]
         );
     }
 
@@ -1174,6 +1301,7 @@ mod tests {
         ledger.landed(BatchId(1));
         ledger.retired(BatchId(2));
         ledger.ejected(PrNumber(3));
+        ledger.notified(PrNumber(4));
         let latest = ledger.latest().unwrap().clone();
         ledger.observed(&latest).unwrap();
         assert_eq!(ledger.latest(), Some(&latest));
@@ -1181,17 +1309,24 @@ mod tests {
         assert!(ledger.check_land(BatchId(1)).is_ok());
         assert_eq!(ledger.check_retire(BatchId(2)), Ok(()));
         assert_eq!(ledger.check_eject(PrNumber(3)), Ok(()));
+        assert_eq!(ledger.check_notify(PrNumber(4)), Ok(()));
     }
 
     #[test]
     fn a_violation_is_permanent_and_keeps_its_text() {
-        let error = ForgeError::from(Violation::UnknownPr { pr: PrNumber(9) });
+        let error = ForgeError::from(Violation::UnknownPr {
+            effect: "eject",
+            pr: PrNumber(9),
+        });
         let ForgeError::Permanent(cause) = &error else {
             panic!("expected a permanent error, got {error:?}");
         };
         assert_eq!(
             cause.downcast_ref::<Violation>(),
-            Some(&Violation::UnknownPr { pr: PrNumber(9) })
+            Some(&Violation::UnknownPr {
+                effect: "eject",
+                pr: PrNumber(9)
+            })
         );
         assert_eq!(
             error.to_string(),

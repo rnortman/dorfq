@@ -2,7 +2,8 @@ use std::collections::{BTreeSet, VecDeque};
 
 use dorfq_core::{
     BatchId, BatchMember, BatchStart, BatchStatus, CheckName, ConflictWith, Departed, Departure,
-    EjectReason, Ejection, Failure, Hold, PrNumber, PrSnapshot, Sha, Timestamp, Withdrawal,
+    EjectReason, Ejection, Failure, Hold, Notice, NoticeReason, PrNumber, PrSnapshot, Sha,
+    Timestamp, Withdrawal,
 };
 
 use super::*;
@@ -68,6 +69,10 @@ impl Forge for FakeForge {
 
     fn eject(&mut self, pr: PrNumber, _reason: &EjectReason) -> Result<(), ForgeError> {
         self.call("eject", pr.0.to_string())
+    }
+
+    fn notify(&mut self, pr: PrNumber, _reason: &NoticeReason) -> Result<(), ForgeError> {
+        self.call("notify", pr.0.to_string())
     }
 }
 
@@ -181,18 +186,34 @@ fn full_plan() -> Plan {
     plan.eject.push(Ejection::new(PrNumber(7), trunk));
     let failed = EjectReason::BatchFailed { batch: BatchId(3) };
     plan.eject.push(Ejection::new(PrNumber(8), failed));
+    let broken = NoticeReason::Broken { batch: BatchId(2) };
+    plan.notify.push(Notice::new(PrNumber(9), broken));
+    let pair = NoticeReason::InteractsWith {
+        pr: PrNumber(9),
+        batch: BatchId(3),
+    };
+    plan.notify.push(Notice::new(PrNumber(10), pair));
     plan
 }
 
 #[test]
-fn plan_executes_land_start_eject_retire() {
+fn plan_executes_land_notify_start_eject_retire() {
     let mut forge = FakeForge::new(busy_observation());
     let mut scheduler = ScriptedScheduler::new(vec![full_plan()]);
     let report = Driver::new(&mut forge, &mut scheduler).tick().unwrap();
     assert_eq!(
         forge.calls,
         [
-            "observe ", "land 1", "land 2", "start 5", "start 6", "eject 7", "eject 8", "retire 3",
+            "observe ",
+            "land 1",
+            "land 2",
+            "notify 9",
+            "notify 10",
+            "start 5",
+            "start 6",
+            "eject 7",
+            "eject 8",
+            "retire 3",
             "retire 4",
         ]
     );
@@ -220,8 +241,22 @@ fn transient_on_start_abandons_the_plan_and_the_next_tick_proceeds() {
     assert_eq!(
         forge.calls,
         [
-            "observe ", "land 1", "land 2", "start 5", // abandoned here
-            "observe ", "land 1", "land 2", "start 5", "start 6", "eject 7", "eject 8", "retire 3",
+            "observe ",
+            "land 1",
+            "land 2",
+            "notify 9",
+            "notify 10",
+            "start 5", // abandoned here
+            "observe ",
+            "land 1",
+            "land 2",
+            "notify 9",
+            "notify 10",
+            "start 5",
+            "start 6",
+            "eject 7",
+            "eject 8",
+            "retire 3",
             "retire 4",
         ]
     );
@@ -240,9 +275,29 @@ fn transient_on_eject_leaves_retire_uncalled() {
     assert_eq!(
         forge.calls,
         [
-            "observe ", "land 1", "land 2", "start 5", "start 6", "eject 7"
+            "observe ",
+            "land 1",
+            "land 2",
+            "notify 9",
+            "notify 10",
+            "start 5",
+            "start 6",
+            "eject 7"
         ]
     );
+}
+
+#[test]
+fn transient_on_land_leaves_notify_uncalled() {
+    let mut forge = FakeForge::new(busy_observation());
+    forge.fail = Some(("land", Kind::Transient));
+    let mut scheduler = ScriptedScheduler::new(vec![full_plan()]);
+    let error = Driver::new(&mut forge, &mut scheduler).tick().unwrap_err();
+    assert!(matches!(
+        error,
+        DriverError::Forge(ForgeError::Transient(_))
+    ));
+    assert_eq!(forge.calls, ["observe ", "land 1"]);
 }
 
 #[test]
@@ -307,7 +362,7 @@ fn report_renders_one_line_per_tick_and_per_effect() {
     };
     let text = report.to_string();
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 9, "{text}");
+    assert_eq!(lines.len(), 11, "{text}");
     assert_eq!(
         lines[0],
         format!(
@@ -333,10 +388,18 @@ fn report_renders_one_line_per_tick_and_per_effect() {
         )
     );
     assert_eq!(lines[1], "  land batch 1");
-    assert_eq!(lines[3], format!("  start batch 5 [1] on {}", sha(1)));
-    assert_eq!(lines[5], "  eject pr 7: conflicts with trunk");
-    assert_eq!(lines[6], "  eject pr 8: batch 3 failed");
-    assert_eq!(lines[8], "  retire batch 4");
+    assert_eq!(
+        lines[3],
+        "  notify pr 9: probably broken against trunk (batch 2)"
+    );
+    assert_eq!(
+        lines[4],
+        "  notify pr 10: probably fails together with #9 (batch 3)"
+    );
+    assert_eq!(lines[5], format!("  start batch 5 [1] on {}", sha(1)));
+    assert_eq!(lines[7], "  eject pr 7: conflicts with trunk");
+    assert_eq!(lines[8], "  eject pr 8: batch 3 failed");
+    assert_eq!(lines[10], "  retire batch 4");
 
     let idle = TickReport {
         tick: 0,

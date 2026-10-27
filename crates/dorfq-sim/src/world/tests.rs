@@ -10,6 +10,7 @@ fn config(p_interact: f64, p_flake: f64) -> WorldConfig {
         ci_minutes: Minutes { min: 10, max: 10 },
         pr_ci_minutes: Minutes { min: 0, max: 0 },
         rebase_minutes: Minutes { min: 0, max: 0 },
+        p_heed: 0.0,
         pr_ci_on_base_landed: true,
         p_interact,
         p_flake,
@@ -2858,4 +2859,289 @@ fn a_re_run_that_a_landing_turns_into_a_fix_traces_its_rebase() {
     assert_eq!(status(&w.observe().unwrap(), pb), PrStatus::Ready);
     assert_eq!(w.check_invariants(), Ok(()));
     assert_eq!(crate::trace::check_lives(&kept), Ok(()));
+}
+
+/// A world under `admission` as [`admitting`], whose authors act on every
+/// notice that their pull request is probably broken.
+fn heeding(admission: Admission, pr_ci: u64, rebase: u64) -> World {
+    let mut w = admitting(admission, pr_ci, rebase);
+    w.config.p_heed = 1.0;
+    w
+}
+
+fn broken_notice() -> NoticeReason {
+    NoticeReason::Broken { batch: BatchId(9) }
+}
+
+/// The pending answers to a notice of `pr` in the event queue.
+fn heeds(w: &World, pr: u64) -> usize {
+    let pending = w.events.values();
+    pending.filter(|&&e| e == Event::Heed(PrNumber(pr))).count()
+}
+
+fn first_notice(w: &World, pr: u64) -> Option<FirstNotice> {
+    w.prs[&PrNumber(pr)].record.notice
+}
+
+#[test]
+fn a_heeded_notice_to_a_broken_pull_request_is_its_fix_push_when_the_author_acts() {
+    for admission in [Admission::Label, Admission::Github] {
+        let mut w = heeding(admission, 30, 20);
+        let mut kept = Vec::new();
+        let p = add(&mut w, false, 1);
+        w.advance_to(30 * 60);
+        break_now(&mut w, p);
+        w.advance_to(40 * 60);
+        w.observe().unwrap();
+        w.notify(PrNumber(p), &broken_notice()).unwrap();
+        assert_eq!(
+            kept_queue_lines(&mut w, &mut kept),
+            [
+                "arrive 1",
+                "admit 1",
+                "notice 1 justified: probably broken against trunk (batch 9)"
+            ]
+        );
+        let told = FirstNotice {
+            t: 40 * 60,
+            justified: true,
+            waited: Some(10 * 60),
+        };
+        assert_eq!(first_notice(&w, p), Some(told));
+        // Until the author pushes, it is where it was, with no fix pending.
+        assert_eq!(status(&w.observe().unwrap(), p), PrStatus::Ready);
+        assert_eq!((heeds(&w, p), w.prs[&PrNumber(p)].fix), (1, None));
+        assert_eq!(w.check_invariants(), Ok(()));
+        w.advance_to(60 * 60);
+        let mut pushed = vec!["rebase 1 broken", "fixed 1", "repush 1"];
+        if admission == Admission::Github {
+            pushed.push("recheck 1");
+            assert_eq!(w.prs[&PrNumber(p)].out, Some(Out::Checking));
+        } else {
+            assert_eq!(status(&w.observe().unwrap(), p), pending());
+        }
+        assert_eq!(kept_queue_lines(&mut w, &mut kept), pushed);
+        let fixed = &w.prs[&PrNumber(p)];
+        assert_eq!(
+            (fixed.broke_at, fixed.last_fix_push, fixed.heed, fixed.fix),
+            (None, Some(60 * 60), None, None)
+        );
+        assert_eq!(fixed.record.rebases, 1);
+        assert_eq!(own_verdicts(&w, p), [false, false]);
+        assert_eq!(first_notice(&w, p), Some(told));
+        assert_eq!(w.check_invariants(), Ok(()));
+        w.advance_to(90 * 60);
+        assert_eq!(status(&w.observe().unwrap(), p), PrStatus::Ready);
+        kept_lines(&mut w, &mut kept);
+        assert_eq!(crate::trace::check_lives(&kept), Ok(()), "{admission:?}");
+    }
+}
+
+#[test]
+fn a_heeded_notice_to_a_good_pull_request_is_a_needless_push_and_it_lands_after() {
+    for admission in [Admission::Label, Admission::Github] {
+        let mut w = heeding(admission, 30, 20);
+        let mut kept = Vec::new();
+        let p = add(&mut w, false, 1);
+        w.advance_to(30 * 60);
+        w.observe().unwrap();
+        w.notify(PrNumber(p), &broken_notice()).unwrap();
+        let told = FirstNotice {
+            t: 30 * 60,
+            justified: false,
+            waited: None,
+        };
+        assert_eq!(first_notice(&w, p), Some(told));
+        kept_lines(&mut w, &mut kept);
+        w.advance_to(50 * 60);
+        let mut pushed = vec!["rebase 1 broken", "repush 1"];
+        if admission == Admission::Github {
+            pushed.push("recheck 1");
+        }
+        assert_eq!(kept_queue_lines(&mut w, &mut kept), pushed);
+        assert_eq!(w.prs[&PrNumber(p)].record.rebases, 1);
+        assert_eq!(w.check_invariants(), Ok(()));
+        w.advance_to(80 * 60);
+        land_now(&mut w, 1, &[p]);
+        assert!(w.prs[&PrNumber(p)].landed());
+        kept_lines(&mut w, &mut kept);
+        assert_eq!(crate::trace::check_lives(&kept), Ok(()), "{admission:?}");
+        let m = w.metrics(End::drained(w.now()));
+        assert_eq!((m.notices_good, m.notice_p50_hours), (1, None));
+    }
+}
+
+#[test]
+fn under_label_a_told_pull_request_batched_before_its_heed_is_pushed_out_of_the_batch() {
+    let mut w = heeding(Admission::Label, 30, 5);
+    let p = add(&mut w, false, 1);
+    w.advance_to(30 * 60);
+    w.observe().unwrap();
+    w.notify(PrNumber(p), &broken_notice()).unwrap();
+    w.advance_to(31 * 60);
+    let trunk = w.observe().unwrap().trunk;
+    start(&mut w, 1, &trunk, &[p]).unwrap();
+    // The heed at 35 re-heads it while its batch runs to 41.
+    w.advance_to(41 * 60);
+    w.observe().unwrap();
+    w.land(BatchId(1)).unwrap();
+    assert_eq!(
+        checked_lines(&mut w),
+        [
+            "arrive 1",
+            "admit 1",
+            "notice 1 unjustified: probably broken against trunk (batch 9)",
+            "start 1 [1] on trunk",
+            "rebase 1 broken",
+            "repush 1",
+            "ci 1 passed",
+            "refused 1: #1 is gone"
+        ]
+    );
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_told_pull_request_that_lands_before_its_heed_never_pushes() {
+    let mut w = heeding(Admission::Label, 30, 20);
+    let p = add(&mut w, false, 1);
+    w.advance_to(30 * 60);
+    w.observe().unwrap();
+    w.notify(PrNumber(p), &broken_notice()).unwrap();
+    assert_eq!(heeds(&w, p), 1);
+    land_now(&mut w, 1, &[p]);
+    assert_eq!((heeds(&w, p), w.prs[&PrNumber(p)].heed), (0, None));
+    finish(&mut w);
+    let lines = checked_lines(&mut w);
+    assert!(!lines.iter().any(|l| l.starts_with("rebase")), "{lines:?}");
+    assert_eq!(w.prs[&PrNumber(p)].record.rebases, 0);
+}
+
+#[test]
+fn an_author_who_does_not_heed_is_only_told() {
+    let mut w = admitting(Admission::Label, 30, 20);
+    let p = add(&mut w, false, 1);
+    w.advance_to(30 * 60);
+    break_now(&mut w, p);
+    w.observe().unwrap();
+    w.notify(PrNumber(p), &broken_notice()).unwrap();
+    assert_eq!((heeds(&w, p), fixes(&w, p)), (0, 0));
+    let told = first_notice(&w, p).expect("told");
+    assert_eq!((told.justified, told.waited), (true, Some(0)));
+    finish(&mut w);
+    assert_eq!(
+        checked_lines(&mut w),
+        [
+            "arrive 1",
+            "admit 1",
+            "notice 1 justified: probably broken against trunk (batch 9)"
+        ]
+    );
+    assert_eq!(w.prs[&PrNumber(p)].broke_at, Some(30 * 60));
+}
+
+#[test]
+fn a_notice_that_it_fails_together_starts_nothing_and_is_judged_by_the_pair() {
+    let (ka, kb, kc) = only_first_two_conflict();
+    let mut w = world(0.5, 0.0);
+    w.config.p_heed = 1.0;
+    let a = add(&mut w, false, ka);
+    let b = add(&mut w, false, kb);
+    let c = add(&mut w, false, kc);
+    w.observe().unwrap();
+    let with_a = NoticeReason::InteractsWith {
+        pr: PrNumber(a),
+        batch: BatchId(9),
+    };
+    w.notify(PrNumber(b), &with_a).unwrap();
+    w.notify(PrNumber(c), &with_a).unwrap();
+    assert_eq!((heeds(&w, b), heeds(&w, c)), (0, 0));
+    let judged = |pr| first_notice(&w, pr).map(|n| (n.justified, n.waited));
+    assert_eq!(
+        (judged(b), judged(c)),
+        (Some((true, None)), Some((false, None)))
+    );
+    let lines = queue_lines(&mut w);
+    assert_eq!(
+        lines[lines.len() - 2..],
+        [
+            "notice 2 justified: probably fails together with #1 (batch 9)",
+            "notice 3 unjustified: probably fails together with #1 (batch 9)"
+        ]
+    );
+    let m = w.metrics(End::drained(w.now()));
+    assert_eq!((m.notices_good, m.notice_p50_hours), (1, None));
+}
+
+#[test]
+fn only_the_first_notice_is_kept_and_a_push_or_a_departure_cancels_the_heed() {
+    let mut w = heeding(Admission::Label, 30, 20);
+    let p = add(&mut w, false, 1);
+    w.advance_to(30 * 60);
+    w.observe().unwrap();
+    w.notify(PrNumber(p), &broken_notice()).unwrap();
+    let told = first_notice(&w, p);
+    // Told again at the same head: traced, nothing new kept, no second
+    // heed.
+    w.advance_to(35 * 60);
+    w.observe().unwrap();
+    w.notify(PrNumber(p), &broken_notice()).unwrap();
+    assert_eq!((first_notice(&w, p), heeds(&w, p)), (told, 1));
+    // Someone else's push drops the heed and keeps the first notice.
+    w.fire(Event::Repush(PrNumber(p)));
+    assert_eq!((first_notice(&w, p), heeds(&w, p)), (told, 0));
+    assert_eq!(w.prs[&PrNumber(p)].heed, None);
+    w.observe().unwrap();
+    w.notify(PrNumber(p), &broken_notice()).unwrap();
+    assert_eq!(heeds(&w, p), 1);
+    w.fire(Event::Withdraw(PrNumber(p)));
+    assert_eq!((heeds(&w, p), w.prs[&PrNumber(p)].heed), (0, None));
+    let lines = checked_lines(&mut w);
+    let notices = lines.iter().filter(|l| l.starts_with("notice 1"));
+    assert_eq!(notices.count(), 3);
+    assert!(!lines.iter().any(|l| l.starts_with("rebase")), "{lines:?}");
+}
+
+#[test]
+fn a_notice_while_its_author_s_fix_is_pending_schedules_no_heed() {
+    let mut w = heeding(Admission::Label, 30, 40);
+    let p = add(&mut w, false, 1);
+    w.advance_to(30 * 60);
+    break_now(&mut w, p);
+    w.fire(Event::Repush(PrNumber(p)));
+    w.advance_to(60 * 60);
+    assert_eq!(status(&w.observe().unwrap(), p), fixing());
+    let fix = w.prs[&PrNumber(p)].fix;
+    assert!(fix.is_some());
+    w.take_trace();
+    w.notify(PrNumber(p), &broken_notice()).unwrap();
+    assert_eq!(
+        lines(&mut w),
+        ["notice 1 justified: probably broken against trunk (batch 9)"]
+    );
+    assert_eq!((heeds(&w, p), w.prs[&PrNumber(p)].fix), (0, fix));
+    // A heed firing while the fix is pending does nothing: the fix is the
+    // author's push.
+    w.fire(Event::Heed(PrNumber(p)));
+    assert_eq!(lines(&mut w), Vec::<String>::new());
+    assert_eq!(w.prs[&PrNumber(p)].record.rebases, 0);
+    w.advance_to(100 * 60);
+    assert_eq!(queue_lines(&mut w), ["fixed 1", "repush 1"]);
+    let pr = &w.prs[&PrNumber(p)];
+    assert_eq!((pr.record.rebases, pr.fix, pr.heed), (1, None, None));
+    assert_eq!(w.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_heed_firing_while_its_author_is_rebasing_does_nothing() {
+    let mut w = heeding(Admission::Label, 30, 20);
+    let p = add(&mut w, true, 1);
+    w.observe().unwrap();
+    w.eject(PrNumber(p), &conflict()).unwrap();
+    w.take_trace();
+    w.fire(Event::Heed(PrNumber(p)));
+    assert_eq!(lines(&mut w), Vec::<String>::new());
+    let pr = &w.prs[&PrNumber(p)];
+    assert!(matches!(pr.out, Some(Out::Rebasing { .. })));
+    assert_eq!(pr.record.rebases, 0);
 }

@@ -5,8 +5,8 @@ use std::rc::Rc;
 
 use dorfq_core::{
     BatchId, BatchMember, BatchStart, BatchState, CheckName, CiStatus, ConflictWith, Departed,
-    Departure, EjectReason, Forge, ForgeError, Hold, LandRefusal, Observation, PrBase, PrNumber,
-    PrStatus, Sha, Timestamp, Withdrawal,
+    Departure, EjectReason, Forge, ForgeError, Hold, LandRefusal, NoticeReason, Observation,
+    PrBase, PrNumber, PrStatus, Sha, Timestamp, Withdrawal,
 };
 
 use crate::api::{ApiError, CheckOutcome, CheckResult};
@@ -816,6 +816,21 @@ fn a_first_sighting_already_told_held_is_not_told_again() {
 }
 
 #[test]
+fn a_first_sighting_told_held_and_then_notified_is_not_told_held_again() {
+    let fake = FakeGitHub::new();
+    fake.open_pr(1);
+    fake.state()
+        .comments
+        .insert(1, vec![marker("queued"), marker("held"), marker("notice")]);
+    let (mut forge, sink) = forge(&fake);
+
+    forge.observe().unwrap();
+    forge.observe().unwrap();
+    assert_eq!(fake.comments(1).len(), 3);
+    assert!(sink.lines().is_empty());
+}
+
+#[test]
 fn a_last_marker_of_landed_ejected_or_withdrawn_is_greeted() {
     for last in ["landed", "ejected", "withdrawn"] {
         let fake = FakeGitHub::new();
@@ -829,6 +844,21 @@ fn a_last_marker_of_landed_ejected_or_withdrawn_is_greeted() {
         forge.observe().unwrap();
         assert_eq!(sink.lines(), ["message to pr 1: queued"], "{last}");
     }
+}
+
+#[test]
+fn a_last_marker_of_notice_is_not_greeted_again() {
+    let fake = FakeGitHub::new();
+    ready_pr(&fake, 1);
+    fake.state()
+        .comments
+        .insert(1, vec![marker("queued"), marker("notice")]);
+    let (mut forge, sink) = forge(&fake);
+
+    forge.observe().unwrap();
+    forge.observe().unwrap();
+    assert_eq!(fake.comments(1).len(), 2);
+    assert!(sink.lines().is_empty());
 }
 
 #[test]
@@ -2010,6 +2040,125 @@ fn eject_of_an_unknown_pull_request_is_permanent_and_writes_nothing() {
     let error = forge.eject(PrNumber(3), &CONFLICTS_WITH_TRUNK).unwrap_err();
     assert!(is_permanent(&error, "pr 3"), "{error}");
     assert!(fake.writes().is_empty());
+}
+
+const BROKEN: NoticeReason = NoticeReason::Broken { batch: BatchId(5) };
+
+#[test]
+fn notify_tells_the_reason_and_removes_nothing() {
+    let reasons = [
+        (
+            BROKEN,
+            "probably broken against `main`. Batch 5 (`dorfq/batch/5`) failed",
+            "probably broken against trunk (batch 5)",
+        ),
+        (
+            NoticeReason::InteractsWith {
+                pr: PrNumber(2),
+                batch: BatchId(5),
+            },
+            "fails together with #2, last in batch 5 (`dorfq/batch/5`)",
+            "probably fails together with #2 (batch 5)",
+        ),
+    ];
+    for (reason, body, line) in reasons {
+        let fake = FakeGitHub::new();
+        queued(&fake, 2);
+        let (mut forge, sink) = observed(&fake);
+
+        forge.notify(PrNumber(1), &reason).unwrap();
+
+        assert_eq!(fake.pr(1).labels, ["queue"]);
+        let last = fake.comments(1).last().unwrap().clone();
+        assert!(last.starts_with("<!-- dorfq: notice -->"), "{last}");
+        assert!(last.contains(body), "{last}");
+        assert_eq!(sink.lines(), [format!("message to pr 1: notice: {line}")]);
+        let observation = forge.observe().unwrap();
+        assert_eq!(observation.prs[0].number, PrNumber(1));
+        assert!(observation.departed.is_empty());
+        forge.observe().unwrap();
+        assert_eq!(
+            sink.lines().len(),
+            1,
+            "a notice is not followed by a greeting"
+        );
+    }
+}
+
+#[test]
+fn notify_of_an_unknown_pull_request_is_permanent_and_writes_nothing() {
+    let fake = FakeGitHub::new();
+    let (mut forge, _) = observed(&fake);
+    let error = forge.notify(PrNumber(3), &BROKEN).unwrap_err();
+    assert!(is_permanent(&error, "notify: pr 3 is not known"), "{error}");
+    assert!(fake.writes().is_empty());
+}
+
+#[test]
+fn notify_of_a_member_landed_in_this_plan_is_permanent() {
+    let fake = FakeGitHub::new();
+    let (mut forge, _, _) = passed_batch(&fake, 1);
+    forge.land(BatchId(1)).unwrap();
+    let writes = fake.writes().len();
+    let error = forge.notify(PrNumber(1), &BROKEN).unwrap_err();
+    assert!(
+        is_permanent(
+            &error,
+            "notify: pr 1 is a member of a batch this plan lands"
+        ),
+        "{error}"
+    );
+    assert_eq!(fake.writes().len(), writes);
+}
+
+#[test]
+fn notify_of_the_same_pull_request_twice_in_one_plan_is_permanent_and_posts_once() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    let (mut forge, sink) = observed(&fake);
+    forge.notify(PrNumber(1), &BROKEN).unwrap();
+    let error = forge.notify(PrNumber(1), &BROKEN).unwrap_err();
+    assert!(
+        is_permanent(&error, "notify: pr 1 was notified in this plan"),
+        "{error}"
+    );
+    assert_eq!(fake.calls_to(&["create_comment"]).len(), 1);
+    assert_eq!(sink.lines().len(), 1);
+}
+
+#[test]
+fn eject_of_a_pull_request_notified_in_this_plan_is_permanent_and_writes_nothing() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    let (mut forge, _) = observed(&fake);
+    forge.notify(PrNumber(1), &BROKEN).unwrap();
+    let writes = fake.writes().len();
+    let error = forge.eject(PrNumber(1), &CONFLICTS_WITH_TRUNK).unwrap_err();
+    assert!(
+        is_permanent(&error, "eject: pr 1 was notified in this plan"),
+        "{error}"
+    );
+    assert_eq!(fake.writes().len(), writes);
+    assert_eq!(fake.pr(1).labels, ["queue"]);
+}
+
+#[test]
+fn a_notice_posts_through_the_outbox() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    let (mut forge, sink) = observed(&fake);
+
+    fake.fail("create_comment", Failure::Transient);
+    forge.notify(PrNumber(1), &BROKEN).unwrap();
+    assert_eq!(fake.comments(1).len(), 1);
+    assert!(sink.lines().is_empty());
+
+    forge.observe().unwrap();
+    assert_eq!(marks(&fake, 1), ["queued", "notice"]);
+    assert_eq!(
+        sink.lines(),
+        ["message to pr 1: notice: probably broken against trunk (batch 5)"]
+    );
 }
 
 #[test]

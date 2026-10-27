@@ -51,35 +51,6 @@ reserved start after some number of skips) sized in that world against the
 whole wait, selection in `step` included. Deferred because the rule changes
 which batch the extension emits, which is design work.
 
-## `bayes-pair-eject-timing`
-
-When `bayes` singles out a pair of pull requests while both are still
-queued, `culprit` in `crates/dorfq-scheduler/src/bayes/policy.rs` ejects the
-newer at once with `InteractsWith`. Neither is broken against trunk until
-the other lands, so the simulator counts that ejection as `ejected_good`.
-One candidate, not yet traced through: never eject on a `Pair` cause. Once
-the older lands, `Model::sync` strips its causes from every failed run and
-keeps the runs, so a run that held the pair would blame `Bad(newer)` alone,
-and `eject` re-reads every run's posteriors each step and would single it
-out with `BatchFailed`; `EjectReason::InteractsWith` would then be unused.
-Two things that candidate leaves open. A run's `Bad(newer)` is read at the
-run's own position, so an alibi the newer earned between that run and the
-older's landing (a hedge on trunk that passed) discounts it by `p_miss` in
-that run; the run keeps `Bad(newer)` and its stretch's trunk cause and is
-not pruned, but whether the discounted `Bad(newer)` is still singled out, or
-the newer is batched again and fails once more before it is ejected, has not
-been traced. And whether the two are kept apart until the older lands: a batch holding
-both has `p_pass` near zero once the pair is materialised and `grow` stops
-at the first unit that does not raise the score, but `units` sorts by `Bad`
-risk, not pair belief, and that case has not been traced. The other route
-the entry has always named — hold the newer until the older lands, then
-eject — stays open with it. Whichever is taken, the early word the newer's
-author gets today — that it fails together with the older — is
-`soft-eject`'s to give. Done means: in the simulator, no ejection for a
-singled-out pair is counted `ejected_good`, and the newer half of a real
-pair still leaves the queue after the older lands, counted `ejected_bad`.
-The `TODO(bayes-pair-eject-timing)` comment is on `culprit`.
-
 ## `bayes-pair-search`
 
 The `bayes` scheduler's suspect batches search a set of materialised cross
@@ -147,7 +118,7 @@ needs either memory of what the forge emitted, kept in the process, or a
 read of each member's comment thread to reconcile it, carried across
 restarts. The first breaks the forge's property of holding no state beyond
 the latest observation. The second adds reads to every tick. A third is
-bounded: every comment the forge posts begins with a
+bounded: every comment the forge posts, a `notice` included, begins with a
 `<!-- dorfq: <event> -->` marker, and the forge already reads a pull
 request's thread to decide whether it is entering the queue
 (`crates/dorfq-forge-github/src/messages.rs`), so reconciliation can run
@@ -263,40 +234,6 @@ branches, which live where the queue cannot lock; and which list governs
 when branch protection's own required checks differ from the configured one.
 The `TODO(security-label-grants-unreviewed-landing-on-any-later-head)`
 comment sits above the label check in `enqueued_bases`.
-
-## `soft-eject`
-
-A second, lower belief threshold at which the scheduler tells an author that
-their pull request is probably broken against trunk, without ejecting it.
-The threshold is where the tree sets a pull request aside rather than
-running it as a suspect: under `speculation = "tree"` a suspect batch seldom
-beats a fresh extension's score while fresh work is ready, so a bad pull
-request waits for a quiet period, and the chain ejects faster; that is
-accepted, and the author's notice is what closes the gap — a told author
-rebases and re-runs their own CI. In a quiet queue the slowest case is a
-pull request bad at its own origin, alone, and it is slow under the shipped
-`speculation = "chain"` too, where nothing is set aside: the chain re-runs
-it, its failures within one stretch are explained by that stretch's trunk
-cause, its posterior plateaus near 0.8 once a probe has passed, and at the
-shipped priors and inference read limit it takes about a dozen failed runs
-and two probes to eject: the priors set the plateau's height, and the read
-limit sets how long it lasts. That plateau is the confidence the soft
-threshold is for, in either mode — an author told at it rebases and re-runs
-their own CI long before the hard ejection. It needs a contract item beside `Plan.eject` (rule 9 lets the scheduler send
-authors nothing else), emitted once per (pull request, head), and a `Forge`
-method that the GitHub forge relays as a comment and the mock records. In
-the simulator, a told author starts a fix (as a failed own-CI run already
-makes them do) with a configured probability, and the report adds the time
-from `bad_since` to the first notice and a count of notices sent for pull
-requests that were not bad. Once `bayes-pair-eject-timing` stops ejecting
-the newer half of a pair at once — whichever route it takes, the newer no
-longer leaves before the older lands — this is also the only early word the
-newer's author gets, so it is designed after that change. Deferred because
-it is a contract change and a forge behaviour, to be designed as one cycle
-on top of the world that models breakage against trunk. The
-`TODO(soft-eject)` comments sit at `BayesConfig::eject_above` in
-`crates/dorfq-scheduler/src/config.rs` and where the simulated world starts
-an author's fix, `begin_fix` in `crates/dorfq-sim/src/world.rs`.
 
 ## `test-site-app-js-untested-against-report-schema`
 

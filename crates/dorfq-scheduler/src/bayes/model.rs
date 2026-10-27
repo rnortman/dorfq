@@ -98,6 +98,10 @@ struct Held {
     /// or the queue's, each an alibi that lowers by `p_miss` the chance
     /// that a landing at or before it broke the pull request.
     alibis: Vec<i64>,
+    /// Per trunk position, the chance that what reached trunk there broke
+    /// this pull request beyond the regrowth prior: the posterior a pair
+    /// with a pull request that reached trunk there had earned.
+    suspected: BTreeMap<i64, f64>,
 }
 
 impl Held {
@@ -226,6 +230,7 @@ impl Model {
                 origin: own,
                 own,
                 alibis: Vec::new(),
+                suspected: BTreeMap::new(),
             });
             if own_ci_passed(&pr.status) && own > held.own {
                 held.alibi(own);
@@ -284,6 +289,26 @@ impl Model {
         p * miss / (p * miss + 1.0 - p)
     }
 
+    /// The head the model holds queued pull request `pr` at.
+    pub(crate) fn head(&self, pr: PrNumber) -> Option<&Sha> {
+        self.bad.get(&pr).map(|held| &held.head)
+    }
+
+    /// The materialised pair causes.
+    pub(crate) fn pairs(&self) -> impl Iterator<Item = Cause> + '_ {
+        self.pairs.keys().copied()
+    }
+
+    /// What reached trunk at position `at` broke queued pull request `pr`
+    /// with probability `p`, beyond the regrowth prior; a pull request the
+    /// model does not hold is left alone.
+    pub(crate) fn suspected(&mut self, pr: PrNumber, at: i64, p: f64) {
+        if let Some(held) = self.bad.get_mut(&pr) {
+            let s = held.suspected.entry(at).or_insert(0.0);
+            *s = 1.0 - (1.0 - *s) * (1.0 - p);
+        }
+    }
+
     /// The origin of queued pull request `pr`, if the model holds it.
     pub(crate) fn origin(&self, pr: PrNumber) -> Option<i64> {
         self.bad.get(&pr).map(|held| held.origin)
@@ -319,7 +344,8 @@ impl Model {
     /// alibis, the trunk position and every position in `cuts`, each with
     /// its belief, origin window first and then oldest first: the origin
     /// window at `p_interact`, and `(a, b]` at the regrowth of its
-    /// landings, each discounted once per alibi at or after its end.
+    /// landings folded with what is suspected at the positions in it, each
+    /// discounted once per alibi at or after its end.
     pub(crate) fn windows(
         &self,
         pr: PrNumber,
@@ -338,7 +364,13 @@ impl Model {
                 .into_iter()
                 .chain(at.windows(2).map(|w| {
                     let (a, b) = (w[0], w[1]);
-                    (a, b, self.discounted(self.regrown(b - a), covering(b)))
+                    let clear = held
+                        .suspected
+                        .range(a + 1..=b)
+                        .map(|(_, &s)| 1.0 - s)
+                        .product::<f64>();
+                    let p = (1.0 - (1.0 - self.regrown(b - a)) * clear).min(1.0 - FLOOR);
+                    (a, b, self.discounted(p, covering(b)))
                 }))
                 .collect(),
         )
@@ -549,7 +581,7 @@ mod tests {
     use super::super::test_support::{bad, members, model, pair, prior, priors};
     use super::*;
     use crate::test_support::{
-        BEHIND, fresh, held, pr, ready, ready_after, ready_all, repushed, stacked, stale,
+        BEHIND, fresh, held, pr, ready, ready_after, ready_all, repushed, sha, stacked, stale,
     };
     use dorfq_core::PrBase;
 
@@ -1160,5 +1192,49 @@ mod tests {
         }
         assert_eq!(model.evidence().len(), MAX_EVIDENCE);
         assert_eq!(batches(&model), (7..=70).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_suspected_position_folds_into_the_window_that_holds_it() {
+        let mut model = model(&[1]);
+        model.sync(&ready_after(&[1], 3), &none(), 3, 0);
+        model.suspected(PrNumber(1), 2, 0.5);
+        model.suspected(PrNumber(1), 2, 0.5);
+        // Below the origin, at -25: never read.
+        model.suspected(PrNumber(1), -40, 0.9);
+        // Not held: nothing to fold into.
+        model.suspected(PrNumber(9), 2, 0.5);
+        let folded = |k: i64| 1.0 - (1.0 - regrown(k)) * 0.25;
+        assert_eq!(
+            model.windows(PrNumber(1), [1]),
+            Some(vec![
+                (-25, -25, o()),
+                (-25, 1, regrown(26)),
+                (1, 3, folded(2))
+            ])
+        );
+        assert_eq!(
+            model.windows(PrNumber(1), []),
+            Some(vec![(-25, -25, o()), (-25, 3, folded(28))])
+        );
+        assert_eq!(model.windows(PrNumber(9), []), None);
+        // A new head starts with nothing suspected.
+        let mut pushed = repushed(1);
+        pushed.behind = 3;
+        model.sync(&[pushed], &none(), 3, 0);
+        assert_eq!(
+            model.windows(PrNumber(1), []),
+            Some(vec![(0, 0, o()), (0, 3, regrown(3))])
+        );
+    }
+
+    #[test]
+    fn the_model_lists_its_pairs_and_the_heads_it_holds() {
+        let mut model = model(&[1, 2, 3]);
+        assert_eq!(model.pairs().count(), 0);
+        model.failed(BatchId(1), &members(&[1, 3]), 0);
+        assert_eq!(model.pairs().collect::<Vec<_>>(), vec![pair(1, 3)]);
+        assert_eq!(model.head(PrNumber(2)), Some(&sha(2)));
+        assert_eq!(model.head(PrNumber(9)), None);
     }
 }

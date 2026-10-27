@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use dorfq_core::{
-    BatchId, BatchStart, ConflictWith, EjectReason, Ejection, PrNumber, PrStatus, SchedulerError,
-    Sha, Timestamp,
+    BatchId, BatchStart, ConflictWith, EjectReason, Ejection, Notice, NoticeReason, PrNumber,
+    PrStatus, SchedulerError, Sha, Timestamp,
 };
 
 use super::*;
@@ -21,6 +21,7 @@ fn small(p_interact: f64, p_flake: f64, p_conflict: f64) -> WorldConfig {
         ci_minutes: Minutes { min: 20, max: 40 },
         pr_ci_minutes: Minutes { min: 5, max: 15 },
         rebase_minutes: Minutes { min: 15, max: 60 },
+        p_heed: 0.75,
         pr_ci_on_base_landed: true,
         p_interact,
         p_flake,
@@ -68,6 +69,7 @@ fn bayes() -> SchedulerConfig {
         w_reject: 1.0,
         w_age: 0.0,
         eject_above: 0.9,
+        notify_above: 0.5,
         others_below: 0.1,
         speculate_above: 0.0,
         speculation: Speculation::Chain,
@@ -147,6 +149,10 @@ impl Forge for Recorder {
     fn eject(&mut self, _: PrNumber, _: &EjectReason) -> Result<(), ForgeError> {
         self.call("eject")
     }
+
+    fn notify(&mut self, _: PrNumber, _: &NoticeReason) -> Result<(), ForgeError> {
+        self.call("notify")
+    }
 }
 
 fn full_plan(trunk: Sha) -> Plan {
@@ -160,6 +166,10 @@ fn full_plan(trunk: Sha) -> Plan {
         ..Plan::default()
     };
     plan.eject.push(Ejection::new(PrNumber(2), reason));
+    plan.notify.push(Notice::new(
+        PrNumber(3),
+        NoticeReason::Broken { batch: BatchId(2) },
+    ));
     plan
 }
 
@@ -171,13 +181,28 @@ fn trunk() -> Sha {
 fn a_plan_executes_in_rule_seven_order_and_stops_at_the_first_error() {
     let mut forge = Recorder::default();
     execute(&mut forge, &full_plan(trunk())).unwrap();
-    assert_eq!(forge.calls, ["land", "start", "eject", "retire"]);
+    assert_eq!(forge.calls, ["land", "notify", "start", "eject", "retire"]);
     let mut forge = Recorder {
         fail_on: Some("start"),
         ..Recorder::default()
     };
     assert!(execute(&mut forge, &full_plan(trunk())).is_err());
-    assert_eq!(forge.calls, ["land", "start"]);
+    assert_eq!(forge.calls, ["land", "notify", "start"]);
+}
+
+#[test]
+fn a_step_event_carries_the_plans_notices() {
+    let observation = Observation::new(Timestamp(0), trunk(), 0, vec![], vec![], vec![]);
+    let TraceEvent::Step { notify, .. } = step_event(5, &observation, &full_plan(trunk())) else {
+        panic!("a step event");
+    };
+    assert_eq!(
+        notify,
+        [PlannedPr {
+            pr: 3,
+            reason: "probably broken against trunk (batch 2)".to_owned(),
+        }]
+    );
 }
 
 /// Retires whatever it sees and starts the first queued pull request again.
@@ -949,6 +974,117 @@ fn bayes_ejects_only_members_of_failed_runs_it_names_in_a_flake_free_world() {
     assert_eq!(m.ejected_good, 0, "{m:?}");
 }
 
+/// Asserts that every pull request of a pair the world drew that did not
+/// land was ejected bad: after a pull request it conflicts with landed,
+/// this one or another. Returns how many pairs had a half land.
+fn assert_pairs_leave_bad_after_a_landing(world: &World) -> usize {
+    let records = world.pr_records();
+    let mut landed_pairs = 0;
+    for (k, a) in records.iter().enumerate() {
+        for b in &records[k + 1..] {
+            if !world.conflicts(a.number, b.number) {
+                continue;
+            }
+            let mut landed = false;
+            for r in [a, b] {
+                match &r.left {
+                    Some((_, Exit::Landed { bad })) => {
+                        assert!(!bad, "pr {} landed bad", r.number.0);
+                        landed = true;
+                    }
+                    Some((at, Exit::Ejected { bad_since, .. })) => {
+                        let since = bad_since
+                            .unwrap_or_else(|| panic!("pr {} of a pair ejected good", r.number.0));
+                        assert!(since <= *at);
+                    }
+                    other => panic!("pr {} of a pair left {other:?}", r.number.0),
+                }
+            }
+            landed_pairs += usize::from(landed);
+        }
+    }
+    landed_pairs
+}
+
+/// Asserts that `events` hold a justified notice that a pull request fails
+/// together with another, that neither half of any such pair is ejected
+/// before one of them lands, and that one of them does land. Returns how
+/// many such pairs it checked.
+fn assert_told_pairs_stay_until_a_half_lands(events: &[TraceEvent]) -> usize {
+    let mut pairs = BTreeSet::new();
+    let mut landed = BTreeSet::new();
+    for event in events {
+        match event {
+            TraceEvent::Notice {
+                pr,
+                reason,
+                justified: true,
+                ..
+            } => {
+                if let Some(rest) = reason.strip_prefix("probably fails together with #") {
+                    let (other, _) = rest.split_once(' ').expect("a batch follows the partner");
+                    let other: u64 = other.parse().expect("the partner is a number");
+                    pairs.insert((*pr.min(&other), *pr.max(&other)));
+                }
+            }
+            TraceEvent::Land { members, .. } => landed.extend(members.iter().copied()),
+            TraceEvent::Eject { pr, reason, .. } => {
+                assert!(!reason.contains("fails together"), "{event}");
+                for &(a, b) in &pairs {
+                    if *pr == a || *pr == b {
+                        assert!(
+                            landed.contains(&a) || landed.contains(&b),
+                            "{event} before either of {a} and {b} landed"
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(!pairs.is_empty(), "no pair was singled out");
+    for &(a, b) in &pairs {
+        assert!(
+            landed.contains(&a) || landed.contains(&b),
+            "neither of {a} and {b} landed"
+        );
+    }
+    pairs.len()
+}
+
+#[test]
+fn bayes_ejects_a_pair_s_half_only_once_a_landing_has_broken_it() {
+    // Nothing is bad but a drawn pair's half once the other lands, and
+    // authors never act on a notice, so only the queue removes it. Each
+    // seed is pinned to a trace in which a failed run singles a pair out.
+    let config = WorldConfig {
+        hours: 12,
+        p_heed: 0.0,
+        ..small(0.05, 0.0, 0.0)
+    };
+    for (scheduler, seed) in [(bayes(), 3), (bayes_tree(), 5)] {
+        let mut events = Vec::new();
+        let (world, outcome) = replicate(
+            &config,
+            Admission::Label,
+            &scheduler,
+            seed,
+            0,
+            Some(&mut events),
+        );
+        let end = outcome.unwrap_or_else(|e| panic!("{scheduler:?}: {e}"));
+        assert_eq!(world.check_invariants(), Ok(()), "{scheduler:?}");
+        let m = world.metrics(end);
+        assert_eq!(m.ejected_good, 0, "{m:?}");
+        assert!(m.ejected_bad > 0, "{m:?}");
+        assert_told_pairs_stay_until_a_half_lands(&events);
+        assert!(
+            assert_pairs_leave_bad_after_a_landing(&world) > 0,
+            "{scheduler:?}"
+        );
+    }
+}
+
 #[test]
 fn bayes_ejects_no_good_pull_request_where_bisect_does_in_a_flaky_world() {
     let config = flaky();
@@ -1036,7 +1172,7 @@ fn the_json_document_holds_every_policy_and_a_trace_from_time_zero() {
             trace[0],
             serde_json::json!({
                 "kind": "step", "t": 0, "queued": 0, "in_flight": 0,
-                "land": [], "start": [], "eject": [], "retire": []
+                "land": [], "notify": [], "start": [], "eject": [], "retire": []
             })
         );
         let mut arrived = BTreeSet::new();

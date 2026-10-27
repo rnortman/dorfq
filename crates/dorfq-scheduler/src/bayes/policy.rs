@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use dorfq_core::{
-    BatchId, BatchState, BatchStatus, CiStatus, ConflictWith, Departed, EjectReason, Observation,
-    Plan, PrNumber, Scheduler, SchedulerError, Sha,
+    BatchId, BatchState, BatchStatus, CiStatus, ConflictWith, Departed, EjectReason, Notice,
+    NoticeReason, Observation, Plan, PrNumber, Scheduler, SchedulerError, Sha,
 };
 
 use super::infer::{Inference, RunPosteriors, Unresolved};
@@ -65,24 +65,24 @@ pub(super) fn landing_members<'a>(
 }
 
 /// For each cause some run singles out, the last such run in `runs`: the
-/// cause's posterior is at least `eject_above` and every other cause of the
-/// run is below `others_below`. Each run carries its causes' posteriors as
+/// cause's posterior is at least `above` and every other cause of the run
+/// is below `others_below`. Each run carries its causes' posteriors as
 /// of the trunk it started on: a pull request bad then is bad now.
 // TODO(bayes-atomic-unit-resolution): the members of an `Atomic` unit share
 // every run, so when the unit's runs fail their `Bad` causes keep equal
 // posteriors and none is ever singled out.
-fn singled_out(
-    runs: impl Iterator<Item = (Option<BatchId>, RunPosteriors)>,
-    eject_above: f64,
+fn singled_out<'a>(
+    runs: impl IntoIterator<Item = &'a (Option<BatchId>, RunPosteriors)>,
+    above: f64,
     others_below: f64,
 ) -> BTreeMap<Cause, Option<BatchId>> {
     let mut out = BTreeMap::new();
     for (batch, causes) in runs {
         let mut suspects = causes.iter().filter(|&&(_, p)| p >= others_below);
         if let (Some(&(cause, p)), None) = (suspects.next(), suspects.next())
-            && p >= eject_above
+            && p >= above
         {
-            out.insert(cause, batch);
+            out.insert(cause, *batch);
         }
     }
     out
@@ -97,16 +97,13 @@ pub(super) fn probe_pending(observation: &Observation) -> bool {
         .any(|b| is_probe(b) && b.base == observation.trunk && is_pending(&b.state))
 }
 
-/// The pull request ejected for a singled-out cause; trunk has none.
-// TODO(bayes-pair-eject-timing): a pair singled out while both are queued
-// ejects the newer at once, before either is broken against trunk; one
-// candidate is to never eject on a pair and let the older's landing turn the
-// run's blame onto the newer.
+/// The pull request ejected for a singled-out cause: a `Bad` cause's. A
+/// pair ejects nobody, since neither half is broken against trunk until the
+/// other lands; trunk has no culprit.
 fn culprit(cause: Cause) -> Option<PrNumber> {
     match cause {
         Cause::Bad(pr) => Some(pr),
-        Cause::Pair(_, newer) => Some(newer),
-        Cause::Trunk(_) => None,
+        Cause::Pair(..) | Cause::Trunk(_) => None,
     }
 }
 
@@ -114,8 +111,21 @@ fn culprit(cause: Cause) -> Option<PrNumber> {
 fn culprit_reason(cause: Cause, batch: BatchId) -> EjectReason {
     match cause {
         Cause::Bad(_) => EjectReason::BatchFailed { batch },
-        Cause::Pair(older, _) => EjectReason::InteractsWith { pr: older, batch },
-        Cause::Trunk(_) => unreachable!("trunk has no culprit"),
+        Cause::Pair(..) | Cause::Trunk(_) => unreachable!("only a `Bad` cause has a culprit"),
+    }
+}
+
+/// The notices for a cause `batch` singled out: a `Bad` cause's pull
+/// request is probably broken; each half of a pair probably fails together
+/// with the other, lower number first; trunk has no author to tell.
+fn notices(cause: Cause, batch: BatchId) -> Vec<(PrNumber, NoticeReason)> {
+    match cause {
+        Cause::Bad(pr) => vec![(pr, NoticeReason::Broken { batch })],
+        Cause::Pair(i, j) => vec![
+            (i, NoticeReason::InteractsWith { pr: j, batch }),
+            (j, NoticeReason::InteractsWith { pr: i, batch }),
+        ],
+        Cause::Trunk(_) => Vec::new(),
     }
 }
 
@@ -245,12 +255,38 @@ impl Bayes {
         }
         self.last_trunk = Some((observation.trunk.clone(), position));
 
+        // Each pair one of whose halves reached trunk carries its posterior
+        // onto the other at this position, decided against the head the
+        // model holds before `sync` replaces a re-pushed one: a new head
+        // starts clean.
+        let carried: Vec<(PrNumber, f64)> = self
+            .pair_posteriors
+            .iter()
+            .filter_map(|(&cause, &p)| {
+                let Cause::Pair(i, j) = cause else {
+                    return None;
+                };
+                let departed = |pr: PrNumber| landed.iter().any(|m| m.0 == pr);
+                let other = match (departed(i), departed(j)) {
+                    (true, false) => j,
+                    (false, true) => i,
+                    _ => return None,
+                };
+                let held = self.model.head(other)?;
+                (heads.get(&other) == Some(&held)).then_some((other, p))
+            })
+            .collect();
         self.model.sync(
             &observation.prs,
             &landed.iter().map(|m| m.0).collect(),
             position,
             foreign,
         );
+        for (pr, p) in carried {
+            self.model.suspected(pr, position, p);
+        }
+        self.notified
+            .retain(|pr, head| heads.get(pr) == Some(&&*head));
         self.age(observation);
 
         // A landing's chance of breaking trunk goes to the stretch current
@@ -353,11 +389,7 @@ impl Bayes {
         let tree: Vec<Member> = members.iter().chain(below).cloned().collect();
         let extra = self.model.would_blame(&tree);
         let runs = inference.with_failure(&self.model, &extra)?;
-        let singled = singled_out(
-            runs.into_iter(),
-            self.params.eject_above,
-            self.params.others_below,
-        );
+        let singled = singled_out(&runs, self.params.eject_above, self.params.others_below);
         // The hypothetical run is read last and has no batch, so a cause it
         // singles out maps to `None`.
         let trunk = Cause::Trunk(self.model.current());
@@ -546,13 +578,18 @@ impl Bayes {
         out
     }
 
-    /// The ejections every plan makes: each culprit a run singles out and
-    /// each conflict, never a member of a batch `fates` lands. A batch left
-    /// waiting that holds an ejected pull request can never land, and its
-    /// fate becomes `Retire`. Returns the ejected pull requests.
-    pub(super) fn eject(
-        &self,
+    /// The ejections every plan makes: each culprit a run singles out at
+    /// `eject_above` and each conflict, never a member of a batch `fates`
+    /// lands. A batch left waiting that holds an ejected pull request can
+    /// never land, and its fate becomes `Retire`. Then the notices: each
+    /// cause a run singles out at `notify_above`, in cause order, tells its
+    /// pull request — a `Bad` cause's, or each half of a pair — once per
+    /// head, and so once per plan, unless it is ejected or in a landing
+    /// batch. Returns the ejected pull requests.
+    pub(super) fn eject_and_notify(
+        &mut self,
         observation: &Observation,
+        heads: &BTreeMap<PrNumber, &Sha>,
         inference: &Inference,
         fates: &mut [Fate],
         plan: &mut Plan,
@@ -564,9 +601,10 @@ impl Bayes {
             }
         }
         let evidence = self.model.evidence();
-        let runs =
-            (0..evidence.len()).map(|r| (Some(evidence[r].batch), inference.run_posteriors(r)));
-        let singled = singled_out(runs, self.params.eject_above, self.params.others_below);
+        let runs: Vec<(Option<BatchId>, RunPosteriors)> = (0..evidence.len())
+            .map(|r| (Some(evidence[r].batch), inference.run_posteriors(r)))
+            .collect();
+        let singled = singled_out(&runs, self.params.eject_above, self.params.others_below);
         for (cause, batch) in singled {
             let batch = batch.expect("every existing run has a batch");
             if let Some(pr) = culprit(cause) {
@@ -584,6 +622,25 @@ impl Bayes {
         for (batch, fate) in observation.batches.iter().zip(fates.iter_mut()) {
             if matches!(fate, Fate::Wait) && batch.members.iter().any(|m| ejected.contains(&m.pr)) {
                 *fate = Fate::Retire;
+            }
+        }
+
+        let landing: BTreeSet<PrNumber> = landing_members(observation, fates).collect();
+        for (cause, batch) in singled_out(&runs, self.params.notify_above, self.params.others_below)
+        {
+            let batch = batch.expect("every existing run has a batch");
+            for (pr, reason) in notices(cause, batch) {
+                let Some(&head) = heads.get(&pr) else {
+                    continue;
+                };
+                if ejected.contains(&pr)
+                    || landing.contains(&pr)
+                    || self.notified.get(&pr) == Some(head)
+                {
+                    continue;
+                }
+                self.notified.insert(pr, head.clone());
+                plan.notify.push(Notice::new(pr, reason));
             }
         }
         ejected
@@ -630,20 +687,23 @@ impl Bayes {
     }
 
     /// The units with nothing `taken`, at their heads, by the chance one
-    /// fails given every failed run ([`Inference::p_none`] of its members'
-    /// `Bad`) over its members' mean value, least first.
+    /// fails on a node whose tree beyond trunk is `below`, given every
+    /// failed run — [`Inference::p_none`] of its members' `Bad`, the pairs
+    /// among them and each member's pair with each pull request below —
+    /// over its members' mean value, least first. A unit holding half of a
+    /// believed pair whose other half is below sorts last on that node.
     pub(super) fn units(
         &self,
         inference: &Inference,
         stacks: &Stacks,
         heads: &BTreeMap<PrNumber, &Sha>,
         taken: &BTreeSet<PrNumber>,
+        below: &[Member],
     ) -> Vec<Vec<Member>> {
         // TODO(bayes-atomic-unit-starvation): a large `Atomic` unit sorts
         // late and can be skipped step after step under a standing backlog.
         let risk = |unit: &[Member]| {
-            let causes: BTreeSet<Cause> = unit.iter().map(|&(pr, _)| Cause::Bad(pr)).collect();
-            let fails = 1.0 - inference.p_none(&self.model, &causes);
+            let fails = 1.0 - inference.p_none(&self.model, &exercised_by(unit, below));
             let value: f64 = unit.iter().map(|&(pr, _)| self.value(pr)).sum();
             fails / (value / unit.len() as f64)
         };
@@ -698,6 +758,11 @@ impl Scheduler for Bayes {
             let p = 1.0 - inference.p_none(&self.model, &exercised_by(&members, &below));
             self.landing_breaks.insert(id, p);
         }
+        self.pair_posteriors = self
+            .model
+            .pairs()
+            .map(|cause| (cause, inference.posterior(&self.model, cause)))
+            .collect();
         Ok(plan)
     }
 }
@@ -706,7 +771,7 @@ impl Scheduler for Bayes {
 mod tests {
     use super::super::model::FLOOR;
     use super::super::test_support::{
-        bad, failed_alone, informative, members, pair, params, prior,
+        bad, failed_alone, informative, members, pair, pair_failed, params, prior,
     };
     use super::*;
     use crate::BayesConfig;
@@ -873,7 +938,13 @@ mod tests {
             let inference = Inference::of(&bayes.model).unwrap();
             let heads: BTreeMap<PrNumber, &Sha> =
                 input.prs.iter().map(|p| (p.number, &p.head)).collect();
-            let units = bayes.units(&inference, &Stacks::new(input), &heads, &BTreeSet::new());
+            let units = bayes.units(
+                &inference,
+                &Stacks::new(input),
+                &heads,
+                &BTreeSet::new(),
+                &[],
+            );
             units.iter().map(|u| u[0].0.0).collect::<Vec<u64>>()
         };
         // Equal risk: the older pair, 3 and 4, first; without age, by number.
@@ -885,6 +956,26 @@ mod tests {
         // 3, worth 2, is more than twice as likely to fail as 1, worth 1.
         let (bayes, input) = aged(0.5, &[stale(ready(3), 100)], &[ready(1)]);
         assert_eq!(order(&bayes, &input), vec![1, 3]);
+
+        // 2 is believed to fail together with 1: on a node holding 1 it
+        // sorts last, whatever its own risk; on one without 1, by its own.
+        let mut bayes = Bayes::new(params());
+        let prs = ready_all(&[1, 2, 3, 4]);
+        pair_singled_out(&mut bayes, prs.clone());
+        let input = observation(prs, vec![]);
+        let inference = Inference::of(&bayes.model).unwrap();
+        let heads: BTreeMap<PrNumber, &Sha> =
+            input.prs.iter().map(|p| (p.number, &p.head)).collect();
+        let taken = BTreeSet::from([PrNumber(1)]);
+        let order = |below: &[Member]| {
+            bayes
+                .units(&inference, &Stacks::new(&input), &heads, &taken, below)
+                .iter()
+                .map(|u| u[0].0.0)
+                .collect::<Vec<u64>>()
+        };
+        assert_eq!(order(&members(&[1])), vec![3, 4, 2]);
+        assert_eq!(order(&[]), vec![2, 3, 4]);
     }
 
     #[test]
@@ -972,10 +1063,10 @@ mod tests {
         let shared = vec![(bad(1), 0.95), (bad(2), 0.1)];
         let lone = vec![(bad(1), 0.95), (bad(3), 0.09)];
         let runs = [(Some(BatchId(1)), shared.clone())];
-        assert!(singled_out(runs.into_iter(), 0.9, 0.1).is_empty());
+        assert!(singled_out(&runs, 0.9, 0.1).is_empty());
         let runs = [(Some(BatchId(1)), shared), (Some(BatchId(2)), lone)];
         assert_eq!(
-            singled_out(runs.into_iter(), 0.9, 0.1),
+            singled_out(&runs, 0.9, 0.1),
             BTreeMap::from([(bad(1), Some(BatchId(2)))])
         );
     }
@@ -1099,6 +1190,7 @@ mod tests {
         let mut bayes = bayes();
         let failed = testing(1, trunk(), &[1, 2], ci_failed());
         step(&mut bayes, &observation(ready_all(&[1, 2]), vec![failed]));
+        let carried = bayes.pair_posteriors[&pair(1, 2)];
         let batch = batch(2, trunk(), &[1], BatchState::Landed { tip: tip(2) });
         let mut input = observation(ready_after(&[2], 1), vec![batch]);
         input.trunk = tip(2);
@@ -1113,9 +1205,10 @@ mod tests {
             .collect();
         assert_eq!(exercised, vec![&BTreeSet::from([bad(2)])]);
         // The landing of 1 came after the run started: it adds its own
-        // chance of having broken 2 and leaves the run's share alone.
+        // chance of having broken 2, at the regrowth prior and at the pair's
+        // posterior, and leaves the run's share alone.
         let p = posterior(&bayes, bad(2));
-        let since = bayes.model.regrown(1);
+        let since = 1.0 - (1.0 - bayes.model.regrown(1)) * (1.0 - carried);
         assert!(
             (p - (1.0 - (1.0 - lone(prior())) * (1.0 - since))).abs() < 1e-9,
             "{p}"
@@ -1291,28 +1384,6 @@ mod tests {
     }
 
     #[test]
-    fn an_ejected_pair_member_takes_every_run_that_held_it() {
-        let mut bayes = bayes();
-        // {1, 2} failed three times and each passed alone on trunk three
-        // times, a pass between every two failures; {2, 3} failed once,
-        // which keeps Bad(2) above the floor of a singled-out pair's others
-        // until its third pass.
-        let model = &mut bayes.model;
-        model.sync(&ready_all(&[1, 2, 3]), &BTreeSet::new(), 0, 0);
-        for k in 0..3 {
-            model.failed(BatchId(3 * k + 1), &members(&[1, 2]), 0);
-            model.passed(BatchId(3 * k + 2), &members(&[1]), 0, true);
-            model.passed(BatchId(3 * k + 3), &members(&[2]), 0, true);
-        }
-        model.failed(BatchId(10), &members(&[2, 3]), 0);
-        let plan = step(&mut bayes, &observation(ready_all(&[1, 2, 3]), vec![]));
-        assert_eq!(plan.eject, vec![ejection(2, interacts_with(1, 7))]);
-        assert_eq!(bayes.model.evidence().len(), 4);
-        step(&mut bayes, &observation(ready_all(&[1, 3]), vec![]));
-        assert!(bayes.model.evidence().is_empty(), "{:?}", bayes.model);
-    }
-
-    #[test]
     fn an_unconfirmed_suspect_is_not_ejected() {
         let mut bayes = bayes();
         with_finder(&mut bayes);
@@ -1330,31 +1401,343 @@ mod tests {
                 ],
             ),
         );
+        // 1 and 2 are symmetric in the one failed run: neither is singled
+        // out at any threshold.
+        assert!(plan.notify.is_empty(), "{plan:?}");
         assert_eq!(plan, Plan::default());
     }
 
+    /// `bayes` holding `prs` after {1, 2} failed three times, each passing
+    /// alone on trunk twice between the failures: the pair is singled out
+    /// by run 7. Returns the plan of the step that reads it.
+    fn pair_singled_out(bayes: &mut Bayes, prs: Vec<PrSnapshot>) -> Plan {
+        bayes.model.sync(&prs, &BTreeSet::new(), 0, 0);
+        pair_failed(&mut bayes.model, &members(&[1]), &members(&[2]), 1);
+        step(bayes, &observation(prs, vec![]))
+    }
+
+    fn interacts(pr: u64, with: u64, batch: u64) -> Notice {
+        Notice::new(
+            PrNumber(pr),
+            NoticeReason::InteractsWith {
+                pr: PrNumber(with),
+                batch: BatchId(batch),
+            },
+        )
+    }
+
+    fn broken(pr: u64, batch: u64) -> Notice {
+        Notice::new(
+            PrNumber(pr),
+            NoticeReason::Broken {
+                batch: BatchId(batch),
+            },
+        )
+    }
+
     #[test]
-    fn a_singled_out_pair_ejects_the_newer_member() {
+    fn a_singled_out_pair_notifies_both_members_and_ejects_nobody() {
         let mut bayes = bayes();
-        // {1, 2} failed three times; each passed alone on trunk twice, the
-        // passes between the failures: one pass each would leave each `Bad`
-        // near the pair, and failures in one stretch would leave the pair
-        // near its trunk.
-        let model = &mut bayes.model;
-        model.sync(&ready_all(&[1, 2]), &BTreeSet::new(), 0, 0);
-        model.failed(BatchId(1), &members(&[1, 2]), 0);
-        for k in 0..2 {
-            model.passed(BatchId(3 * k + 2), &members(&[1]), 0, true);
-            model.passed(BatchId(3 * k + 3), &members(&[2]), 0, true);
-            model.failed(BatchId(3 * k + 4), &members(&[1, 2]), 0);
-        }
-        let plan = step(&mut bayes, &observation(ready_all(&[1, 2]), vec![]));
-        let p = Inference::of(&bayes.model)
-            .unwrap()
-            .posterior(&bayes.model, pair(1, 2));
+        let plan = pair_singled_out(&mut bayes, ready_all(&[1, 2]));
+        let p = posterior(&bayes, pair(1, 2));
         assert!(p > 0.95, "{p}");
-        assert_eq!(plan.eject, vec![ejection(2, interacts_with(1, 7))]);
-        assert_eq!(plan.start, vec![start(1, trunk(), &[1])]);
+        assert!(plan.eject.is_empty(), "{plan:?}");
+        assert_eq!(plan.notify, vec![interacts(1, 2, 7), interacts(2, 1, 7)]);
+        assert!(plan.start.contains(&start(1, trunk(), &[1])), "{plan:?}");
+        assert!(
+            plan.start
+                .iter()
+                .all(|s| !(s.prs.contains(&PrNumber(1)) && s.prs.contains(&PrNumber(2)))),
+            "{plan:?}"
+        );
+        // The same evidence at the same heads tells nobody again.
+        let plan = step(&mut bayes, &observation(ready_all(&[1, 2]), vec![]));
+        assert!(plan.notify.is_empty(), "{plan:?}");
+        // A new head that earns it is told again; 1, at the head it was
+        // told at, is not.
+        let prs = vec![ready(1), repushed(2)];
+        step(&mut bayes, &observation(prs.clone(), vec![]));
+        let two = vec![(PrNumber(2), sha(502))];
+        pair_failed(&mut bayes.model, &members(&[1]), &two, 11);
+        let plan = step(&mut bayes, &observation(prs, vec![]));
+        assert!(plan.eject.is_empty(), "{plan:?}");
+        assert_eq!(plan.notify, vec![interacts(2, 1, 17)]);
+    }
+
+    /// The observation after [`pair_singled_out`] in which `pr` departed
+    /// `how`, trunk moving one position to `tip(9)`, with `prs` queued and
+    /// `batches`.
+    fn departed(
+        pr: u64,
+        how: Departed,
+        prs: Vec<PrSnapshot>,
+        batches: Vec<BatchStatus>,
+    ) -> Observation {
+        let mut input = observation(prs, batches);
+        input.trunk = tip(9);
+        input.trunk_position = 1;
+        input.departed = vec![Departure::new(PrNumber(pr), sha(pr), how)];
+        input
+    }
+
+    #[test]
+    fn the_older_halfs_landing_carries_the_pairs_belief_onto_the_newer() {
+        for how in [Departed::Landed { batch: BatchId(8) }, Departed::Merged] {
+            let mut bayes = bayes();
+            pair_singled_out(&mut bayes, ready_all(&[1, 2]));
+            let p = bayes.pair_posteriors[&pair(1, 2)];
+            assert!(p > 0.95, "{how:?}: {p}");
+            let plan = step(
+                &mut bayes,
+                &departed(1, how.clone(), ready_after(&[2], 1), vec![]),
+            );
+            assert!(plan.eject.is_empty(), "{how:?}: {plan:?}");
+            assert!(bayes.pair_posteriors.is_empty(), "{how:?}");
+            let windows = bayes.model.windows(PrNumber(2), []).unwrap();
+            let &(from, to, landed) = windows.last().unwrap();
+            assert_eq!((from, to), (0, 1), "{how:?}");
+            assert!(landed > 0.95, "{how:?}: {landed}");
+            // 2 fails alone on the new trunk: the run singles it out.
+            let lone = testing(20, tip(9), &[2], ci_failed());
+            let plan = step(
+                &mut bayes,
+                &departed(1, how.clone(), ready_after(&[2], 1), vec![lone]),
+            );
+            assert_eq!(plan.eject, vec![ejection(2, failed_by(20))], "{how:?}");
+            assert!(plan.notify.is_empty(), "{how:?}: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn the_newer_halfs_landing_carries_the_pairs_belief_onto_the_older() {
+        let mut bayes = bayes();
+        pair_singled_out(&mut bayes, ready_all(&[1, 2]));
+        let how = Departed::Landed { batch: BatchId(8) };
+        let plan = step(
+            &mut bayes,
+            &departed(2, how.clone(), ready_after(&[1], 1), vec![]),
+        );
+        assert!(plan.eject.is_empty(), "{plan:?}");
+        assert!(bayes.pair_posteriors.is_empty());
+        let windows = bayes.model.windows(PrNumber(1), []).unwrap();
+        let &(from, to, landed) = windows.last().unwrap();
+        assert_eq!((from, to), (0, 1));
+        assert!(landed > 0.95, "{landed}");
+        // 1 fails alone on the new trunk: the run singles it out.
+        let lone = testing(20, tip(9), &[1], ci_failed());
+        let plan = step(
+            &mut bayes,
+            &departed(2, how, ready_after(&[1], 1), vec![lone]),
+        );
+        assert_eq!(plan.eject, vec![ejection(1, failed_by(20))]);
+        assert!(plan.notify.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn a_pair_half_in_a_landing_batch_is_not_told_and_the_other_is() {
+        let mut bayes = bayes();
+        let prs = ready_all(&[1, 2]);
+        bayes.model.sync(&prs, &BTreeSet::new(), 0, 0);
+        pair_failed(&mut bayes.model, &members(&[1]), &members(&[2]), 1);
+        bayes.read.insert(BatchId(30));
+        let passed = testing(30, trunk(), &[1], CiStatus::Passed);
+        let plan = step(&mut bayes, &observation(prs, vec![passed]));
+        assert_eq!(plan.land, ids(&[30]));
+        assert!(plan.eject.is_empty(), "{plan:?}");
+        assert_eq!(plan.notify, vec![interacts(2, 1, 7)]);
+    }
+
+    #[test]
+    fn a_newer_half_repushed_as_the_older_lands_carries_nothing() {
+        let mut bayes = bayes();
+        pair_singled_out(&mut bayes, ready_all(&[1, 2]));
+        let two = stale(repushed(2), 0);
+        let how = Departed::Landed { batch: BatchId(8) };
+        step(
+            &mut bayes,
+            &departed(1, how.clone(), vec![two.clone()], vec![]),
+        );
+        let windows = bayes.model.windows(PrNumber(2), [0]).unwrap();
+        assert!(windows.iter().all(|w| w.2 < 1e-3), "{windows:?}");
+        let mut lone = testing(20, tip(9), &[], ci_failed());
+        lone.members = vec![dorfq_core::BatchMember::new(PrNumber(2), sha(502))];
+        let plan = step(&mut bayes, &departed(1, how, vec![two], vec![lone]));
+        assert!(plan.eject.is_empty(), "{plan:?}");
+        assert!(plan.notify.is_empty(), "{plan:?}");
+        let p = posterior(&bayes, bad(2));
+        assert!(p < params().others_below, "{p}");
+    }
+
+    #[test]
+    fn a_pair_whose_older_half_is_ejected_leaves_the_newer_free() {
+        let mut bayes = bayes();
+        pair_singled_out(&mut bayes, ready_all(&[1, 2]));
+        let mut input = observation(ready_all(&[2]), vec![]);
+        input.departed = vec![Departure::new(PrNumber(1), sha(1), Departed::Ejected)];
+        step(&mut bayes, &input);
+        assert!(bayes.model.evidence().is_empty(), "{:?}", bayes.model);
+        assert!(bayes.pair_posteriors.is_empty());
+        let windows = bayes.model.windows(PrNumber(2), []).unwrap();
+        assert!(windows.iter().all(|w| w.2 < 1e-3), "{windows:?}");
+        let lone = testing(20, trunk(), &[2], ci_failed());
+        let plan = step(&mut bayes, &observation(ready_all(&[2]), vec![lone]));
+        assert!(plan.eject.is_empty(), "{plan:?}");
+        assert!(plan.notify.is_empty(), "{plan:?}");
+        let p = posterior(&bayes, bad(2));
+        assert!(p < params().others_below, "{p}");
+    }
+
+    #[test]
+    fn the_chain_under_a_believed_pair_extends_without_the_newer_half() {
+        let mut bayes = bayes();
+        pair_singled_out(&mut bayes, vec![ready(1), ready(2), fresh(3)]);
+        let root = || testing(20, trunk(), &[1], CiStatus::Pending);
+        let plan = step(
+            &mut bayes,
+            &observation(vec![ready(1), ready(2), fresh(3)], vec![root()]),
+        );
+        let on_root: Vec<&BatchStart> = plan.start.iter().filter(|s| s.base == tip(20)).collect();
+        assert_eq!(on_root.len(), 1, "{plan:?}");
+        assert_eq!(on_root[0].prs, numbers(&[3]));
+        assert!(plan.retire.is_empty(), "{plan:?}");
+        // With 2 alone beside the root, nothing extends the chain.
+        let mut bayes = Bayes::new(params());
+        pair_singled_out(&mut bayes, ready_all(&[1, 2]));
+        let plan = step(&mut bayes, &observation(ready_all(&[1, 2]), vec![root()]));
+        assert!(plan.start.iter().all(|s| s.base != tip(20)), "{plan:?}");
+        assert!(plan.retire.is_empty(), "{plan:?}");
+    }
+
+    /// `config`'s scheduler after fresh pull request 1 failed alone twice
+    /// and a probe passed: the observation of its next failure, run 4,
+    /// with 1 reported as `one` and `more` beside it, and that step's plan.
+    fn failed_after_a_probe(
+        config: BayesConfig,
+        one: PrSnapshot,
+        more: Vec<BatchStatus>,
+    ) -> (Bayes, Plan) {
+        let mut bayes = after_two_failures_and_a_probe(config);
+        let mut batches = vec![testing(4, trunk(), &[1], ci_failed())];
+        batches.extend(more);
+        let plan = step(&mut bayes, &observation(vec![one], batches));
+        (bayes, plan)
+    }
+
+    #[test]
+    fn a_bad_cause_singled_out_between_the_thresholds_is_told_and_not_ejected() {
+        let (bayes, plan) = failed_after_a_probe(params(), fresh(1), vec![]);
+        let p = bad_posterior(&bayes, 1);
+        assert!(
+            (params().notify_above..params().eject_above).contains(&p),
+            "{p}"
+        );
+        assert_eq!(plan.notify, vec![broken(1, 4)]);
+        assert!(plan.eject.is_empty(), "{plan:?}");
+        // 1 stays batchable: the plan runs it again.
+        assert!(
+            plan.start.iter().any(|s| s.prs.contains(&PrNumber(1))),
+            "{plan:?}"
+        );
+
+        // In a batch the plan lands, it is not told.
+        let mut landing = after_two_failures_and_a_probe(params());
+        landing.read.insert(BatchId(30));
+        let passed = testing(30, trunk(), &[1], CiStatus::Passed);
+        let input = observation(
+            vec![fresh(1)],
+            vec![testing(4, trunk(), &[1], ci_failed()), passed],
+        );
+        let plan = step(&mut landing, &input);
+        assert_eq!(plan.land, ids(&[30]));
+        assert!(plan.notify.is_empty(), "{plan:?}");
+
+        // Conflicting, it is ejected for the conflict and not told.
+        let (_, plan) = failed_after_a_probe(params(), stale(conflicting(1), 0), vec![]);
+        assert_eq!(plan.eject, vec![ejection(1, conflicts_with_trunk())]);
+        assert!(plan.notify.is_empty(), "{plan:?}");
+
+        // With `notify_above` at `eject_above`, nothing is told.
+        let silent = BayesConfig {
+            notify_above: params().eject_above,
+            ..params()
+        };
+        let (_, plan) = failed_after_a_probe(silent, fresh(1), vec![]);
+        assert!(plan.notify.is_empty(), "{plan:?}");
+        assert!(plan.eject.is_empty(), "{plan:?}");
+    }
+
+    /// `config`'s scheduler after fresh pull request 1 failed alone twice
+    /// and a probe passed, before the observation of run 4.
+    fn after_two_failures_and_a_probe(config: BayesConfig) -> Bayes {
+        let mut bayes = Bayes::new(config);
+        for batches in [
+            vec![],
+            vec![testing(1, trunk(), &[1], ci_failed())],
+            vec![testing(2, trunk(), &[1], ci_failed())],
+            vec![testing(3, trunk(), &[], CiStatus::Passed)],
+        ] {
+            step(&mut bayes, &observation(vec![fresh(1)], batches));
+        }
+        bayes
+    }
+
+    #[test]
+    fn a_bad_cause_singled_out_at_eject_above_is_ejected_and_not_told() {
+        let (bayes, plan) = failed_after_a_probe(params(), fresh(1), vec![]);
+        assert!(plan.eject.is_empty());
+        let mut bayes = bayes;
+        let plan = step(
+            &mut bayes,
+            &observation(vec![fresh(1)], vec![testing(5, trunk(), &[1], ci_failed())]),
+        );
+        assert_eq!(plan.eject, vec![ejection(1, failed_by(5))]);
+        assert!(plan.notify.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn a_pair_is_told_whatever_the_notice_threshold() {
+        let mut bayes = Bayes::new(BayesConfig {
+            notify_above: params().eject_above,
+            ..params()
+        });
+        let plan = pair_singled_out(&mut bayes, ready_all(&[1, 2]));
+        assert!(plan.eject.is_empty(), "{plan:?}");
+        assert_eq!(plan.notify, vec![interacts(1, 2, 7), interacts(2, 1, 7)]);
+    }
+
+    #[test]
+    fn a_pull_request_singled_out_as_bad_and_as_half_a_pair_is_told_it_is_broken() {
+        let mut bayes = bayes();
+        let prs = ready_after(&[1, 2], 50);
+        bayes
+            .model
+            .sync(&ready_all(&[1, 2]), &BTreeSet::new(), 0, 0);
+        pair_failed(&mut bayes.model, &members(&[1]), &members(&[2]), 1);
+        // Fifty landings later, 2 fails alone in a stretch of its own.
+        bayes.model.sync(&prs, &BTreeSet::new(), 50, 0);
+        bayes.model.passed(BatchId(100), &[], 50, true);
+        bayes.model.failed(BatchId(101), &members(&[2]), 50);
+        let mut input = observation(prs, vec![]);
+        input.trunk_position = 50;
+        let plan = step(&mut bayes, &input);
+        let inference = Inference::of(&bayes.model).unwrap();
+        let singled = singled_out(
+            &(0..bayes.model.evidence().len())
+                .map(|r| {
+                    (
+                        Some(bayes.model.evidence()[r].batch),
+                        inference.run_posteriors(r),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            params().notify_above,
+            params().others_below,
+        );
+        assert!(singled.contains_key(&bad(2)), "{singled:?}");
+        assert!(singled.contains_key(&pair(1, 2)), "{singled:?}");
+        assert!(plan.eject.is_empty(), "{plan:?}");
+        // 2 is told it is broken; 1 is told the pair.
+        assert_eq!(plan.notify, vec![broken(2, 101), interacts(1, 2, 7)]);
     }
 
     #[test]
@@ -1395,6 +1778,25 @@ mod tests {
                 .resolution(&inference, &members(&[1]), &[], &none)
                 .unwrap(),
             3.0
+        );
+
+        // A failure that would single a pair out resolves nobody: the pair
+        // ejects neither half.
+        let mut bayes = Bayes::new(params());
+        bayes
+            .model
+            .sync(&ready_all(&[1, 2]), &BTreeSet::new(), 0, 0);
+        pair_failed(&mut bayes.model, &members(&[1]), &members(&[2]), 1);
+        bayes.age(&observation(ready_all(&[1, 2]), vec![]));
+        let inference = Inference::of(&bayes.model).unwrap();
+        let both = members(&[1, 2]);
+        let extra = bayes.model.would_blame(&both);
+        let runs = inference.with_failure(&bayes.model, &extra).unwrap();
+        let singled = singled_out(&runs, 0.9, 0.1);
+        assert_eq!(singled.get(&pair(1, 2)), Some(&None), "{singled:?}");
+        assert_eq!(
+            bayes.resolution(&inference, &both, &[], &none).unwrap(),
+            0.0
         );
     }
 
@@ -1752,6 +2154,7 @@ mod tests {
         let mut bayes = bayes();
         with_finder(&mut bayes);
         both_running(&mut bayes);
+        let carried = bayes.pair_posteriors[&pair(1, 2)];
         // The chain's root landed while the finder ran on the old trunk.
         let root = batch(2, trunk(), &[1], BatchState::Landed { tip: tip(2) });
         let finder = testing(3, trunk(), &[2], CiStatus::Pending);
@@ -1769,8 +2172,11 @@ mod tests {
         // Its own CI's alibi at the trunk it reports, and the finder's at
         // the old trunk, not at 1's landing.
         assert_eq!(bayes.model.alibis(PrNumber(2)), Some(&[-24, 0][..]));
+        // 1's landing broke 2 at the regrowth prior or by their pair, at
+        // the posterior it had earned.
         let windows = bayes.model.windows(PrNumber(2), []).unwrap();
-        assert_eq!(windows.last(), Some(&(0, 1, bayes.model.regrown(1))));
+        let landed = 1.0 - (1.0 - bayes.model.regrown(1)) * (1.0 - carried);
+        assert_eq!(windows.last(), Some(&(0, 1, landed)));
     }
 
     #[test]
@@ -1966,6 +2372,29 @@ mod tests {
             for input in &inputs {
                 assert_eq!(a.step(input).unwrap(), b.step(input).unwrap());
             }
+            assert_eq!(a, b);
+            // A plan with a notice: fresh 1 failing alone across a probe.
+            let (mut a, mut b) = (make(), make());
+            let mut told = false;
+            for batches in [
+                vec![],
+                vec![testing(1, trunk(), &[1], ci_failed())],
+                vec![testing(2, trunk(), &[1], ci_failed())],
+                vec![testing(3, trunk(), &[], CiStatus::Passed)],
+                vec![testing(4, trunk(), &[1], ci_failed())],
+            ] {
+                let input = observation(vec![fresh(1)], batches);
+                let plan = a.step(&input).unwrap();
+                told |= !plan.notify.is_empty();
+                assert_eq!(plan, b.step(&input).unwrap());
+            }
+            assert!(told, "{speculation:?}");
+            assert_eq!(a, b);
+            // A plan with both notices of a singled-out pair.
+            let (mut a, mut b) = (make(), make());
+            let plan = pair_singled_out(&mut a, ready_all(&[1, 2]));
+            assert_eq!(plan.notify.len(), 2, "{speculation:?}: {plan:?}");
+            assert_eq!(plan, pair_singled_out(&mut b, ready_all(&[1, 2])));
             assert_eq!(a, b);
         }
     }
@@ -2231,7 +2660,13 @@ mod tests {
         assert!(joint > three && three > 0.7, "{joint} {three}");
         let heads: BTreeMap<PrNumber, &Sha> =
             input.prs.iter().map(|p| (p.number, &p.head)).collect();
-        let units = bayes.units(&inference, &Stacks::new(&input), &heads, &BTreeSet::new());
+        let units = bayes.units(
+            &inference,
+            &Stacks::new(&input),
+            &heads,
+            &BTreeSet::new(),
+            &[],
+        );
         assert_eq!(units, vec![members(&[3]), members(&[1, 2])]);
     }
 
@@ -2497,9 +2932,11 @@ mod tests {
         assert_eq!(then[0].0, bad(1));
         assert!(then[0].1 < 0.1, "{then:?}");
         assert!(inference.posterior(&bayes.model, bad(1)) > 0.9);
-        let runs = (0..2).map(|r| (Some(BatchId(r as u64 + 1)), inference.run_posteriors(r)));
+        let runs: Vec<_> = (0..2)
+            .map(|r| (Some(BatchId(r as u64 + 1)), inference.run_posteriors(r)))
+            .collect();
         assert_eq!(
-            singled_out(runs, 0.9, 0.1),
+            singled_out(&runs, 0.9, 0.1),
             BTreeMap::from([(bad(1), Some(BatchId(2)))])
         );
     }
@@ -2893,6 +3330,7 @@ mod tests {
             w_reject: 1.0,
             w_age: 0.0,
             eject_above: 0.9,
+            notify_above: 0.5,
             others_below: 0.1,
             speculate_above: 0.0,
             speculation,
@@ -3055,17 +3493,32 @@ mod tests {
         }
     }
 
+    /// What [`lone_until_ejected`] saw: each plan's start, each notice
+    /// with the number of starts before it, and the plan that ejects.
+    struct Lone {
+        bayes: Bayes,
+        starts: Vec<BatchStart>,
+        notices: Vec<(usize, Notice)>,
+        plan: Plan,
+    }
+
     /// Runs pull request 1 alone under `config`, failing every run that
-    /// holds it and passing every probe, until a plan ejects it: each plan's
-    /// start, and the plan that ejects.
-    fn lone_until_ejected(config: BayesConfig, pr: PrSnapshot) -> (Bayes, Vec<BatchStart>, Plan) {
+    /// holds it and passing every probe, until a plan ejects it.
+    fn lone_until_ejected(config: BayesConfig, pr: PrSnapshot) -> Lone {
         let mut bayes = Bayes::new(config);
         let mut starts = Vec::new();
+        let mut notices = Vec::new();
         let mut batches = Vec::new();
         loop {
             let plan = step(&mut bayes, &observation(vec![pr.clone()], batches));
+            notices.extend(plan.notify.iter().map(|n| (starts.len(), n.clone())));
             if !plan.eject.is_empty() {
-                return (bayes, starts, plan);
+                return Lone {
+                    bayes,
+                    starts,
+                    notices,
+                    plan,
+                };
             }
             assert_eq!(plan.start.len(), 1, "{plan:?}");
             let start = plan.start[0].clone();
@@ -3082,7 +3535,12 @@ mod tests {
 
     #[test]
     fn a_lone_pull_request_failing_alone_is_found_across_a_probe() {
-        let (_, starts, plan) = lone_until_ejected(params(), fresh(1));
+        let Lone {
+            starts,
+            notices,
+            plan,
+            ..
+        } = lone_until_ejected(params(), fresh(1));
         assert_eq!(
             starts,
             vec![
@@ -3094,6 +3552,8 @@ mod tests {
             ]
         );
         assert_eq!(plan.eject, vec![ejection(1, failed_by(5))]);
+        // Told once, by the step that read the failure after the probe.
+        assert_eq!(notices, vec![(4, broken(1, 4))]);
 
         // The posteriors along the way: after the second failure trunk is
         // the likelier cause and the probe beats the re-run; after the
@@ -3125,7 +3585,12 @@ mod tests {
     fn a_stale_pull_request_failing_alone_is_found_across_a_probe_at_shipped_priors() {
         for speculation in [Speculation::Chain, Speculation::Tree] {
             let config = shipped(speculation);
-            let (bayes, starts, plan) = lone_until_ejected(config, stale(ready(1), 3));
+            let Lone {
+                bayes,
+                starts,
+                notices,
+                plan,
+            } = lone_until_ejected(config, stale(ready(1), 3));
             assert_eq!(
                 starts,
                 vec![
@@ -3142,6 +3607,7 @@ mod tests {
                 vec![ejection(1, failed_by(5))],
                 "{speculation:?}"
             );
+            assert_eq!(notices, vec![], "{speculation:?}");
             // Against 1, trunk broken in the first stretch and a flake in
             // the second: about `0.001 · 0.03` to 1's `0.003`.
             let ejected = bad_posterior(&bayes, 1);

@@ -17,6 +17,7 @@ arrivals_per_hour = 5.0    # mean rate of new pull requests
 ci_minutes = { min = 45, max = 120 }   # uniform duration of a batch's CI run
 pr_ci_minutes = { min = 45, max = 120 }   # uniform duration of a pull request's own CI run
 rebase_minutes = { min = 15, max = 120 }   # uniform delay from a rebase becoming necessary to the author's push of it
+p_heed = 0.75                              # chance an author acts on the queue's notice that their pull request is probably broken: a rebase onto trunk and a push
 pr_ci_on_base_landed = true   # the repository re-runs a pull request's own CI when its base lands
 p_interact = 0.001         # a pair conflicts: a run with both fails; whichever lands first breaks the other
 p_flake = 0.03             # a run fails for no reason in the tree

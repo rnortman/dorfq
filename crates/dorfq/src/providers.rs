@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use dorfq_core::{
-    BatchId, BatchStart, EjectReason, Forge, ForgeError, Observation, PrNumber, Scheduler,
+    BatchId, BatchStart, EjectReason, Forge, ForgeError, NoticeReason, Observation, PrNumber,
+    Scheduler,
 };
 use dorfq_forge_github::api::{ApiError, Auth, RestClient};
 use dorfq_forge_github::app::AppKey;
@@ -114,6 +115,10 @@ impl Forge for SharedMock {
 
     fn eject(&mut self, pr: PrNumber, reason: &EjectReason) -> Result<(), ForgeError> {
         self.0.borrow_mut().eject(pr, reason)
+    }
+
+    fn notify(&mut self, pr: PrNumber, reason: &NoticeReason) -> Result<(), ForgeError> {
+        self.0.borrow_mut().notify(pr, reason)
     }
 }
 

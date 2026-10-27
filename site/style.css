@@ -196,6 +196,7 @@ canvas { width: 100%; height: var(--stage-height, 700px); display: block; backgr
 .log li .t { color: #5d6678; margin-right: 0.5rem; }
 .log li.k-land { color: var(--good); }
 .log li.k-eject { color: var(--bad); }
+.log li.k-notice { color: var(--warn); }
 .log li.k-blocked, .log li.k-withdraw { color: var(--warn); }
 .log li.k-arrive, .log li.k-admit { color: var(--text); }
 .log li.k-rebase, .log li.k-recheck, .log li.k-wait { color: var(--flake); }

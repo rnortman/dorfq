@@ -15,6 +15,7 @@ arrivals_per_hour = 5.0    # mean rate of new pull requests; stacks arrive as a 
 ci_minutes = { min = 45, max = 120 }   # uniform duration of a batch's CI run
 pr_ci_minutes = { min = 45, max = 120 }   # uniform duration of a pull request's own CI run, as long as the batch run; it starts when requested and needs no lane; a pull request is batchable only once it has passed on its current head
 rebase_minutes = { min = 15, max = 120 }   # uniform delay from a rebase becoming necessary (a conflict with trunk, or under github admission a landed base) to the author's push of it
+p_heed = 0.75                              # chance an author acts on the queue's notice that their pull request is probably broken: a rebase onto trunk and a push
 pr_ci_on_base_landed = true   # the repository re-runs a pull request's own CI when the pull request it was based on lands; the queue is billed for the direct children's runs
 p_interact = 0.001         # a pair conflicts: a run with both fails; whichever lands first breaks the other
 p_flake = 0.03             # a run fails for no reason in the tree
@@ -66,6 +67,7 @@ run_cost = 0.5             # one run, in value units, where a fresh pull request
 w_reject = 1.0             # resolving a bad pull request, as a multiple of its value
 w_age = 0.02             # each hour waited adds this to a pull request's value, for landing and for resolving
 eject_above = 0.9          # posterior at which a singled-out cause is ejected
+notify_above = 0.5         # posterior at which a singled-out cause's author is told, without an ejection
 others_below = 0.1         # a run singles a cause out when every other cause in it is below this
 speculate_above = 0.0      # a candidate starts when its score exceeds this
 speculation = "chain"      # one chain of batches built to land, culprit finders on trunk; "tree" scores every node's branches
@@ -86,6 +88,7 @@ run_cost = 0.5             # one run, in value units, where a fresh pull request
 w_reject = 1.0             # resolving a bad pull request, as a multiple of its value
 w_age = 0.02             # each hour waited adds this to a pull request's value, for landing and for resolving
 eject_above = 0.9          # posterior at which a singled-out cause is ejected
+notify_above = 0.5         # posterior at which a singled-out cause's author is told, without an ejection
 others_below = 0.1         # a run singles a cause out when every other cause in it is below this
 speculate_above = 0.0      # a candidate starts when its net score exceeds this
 speculation = "tree"       # for every batch in flight, what to run if it passes and if it fails, weighted by each future's chance; "chain" builds one chain

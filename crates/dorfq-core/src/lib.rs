@@ -13,7 +13,7 @@
 //! since has removed it: [`Forge::eject`] removes the pull request,
 //! [`Forge::retire`] removes the batch, and a successful [`Forge::land`]
 //! removes every member of the batch it landed. A refused landing removes
-//! nothing.
+//! nothing, and so does [`Forge::notify`].
 //!
 //! # Rules
 //!
@@ -52,6 +52,10 @@
 //!    that is still in the next observation if the item did not run.
 //!    *Enforced by* review: [`Scheduler::step`] sees only the observation,
 //!    so the only way to break this is to remember a plan as if it ran.
+//!    A notice has no echo: no observation reports that an author was told.
+//!    The scheduler remembers the (pull request, head) it has notified and
+//!    does not repeat it, so a plan cut short before `notify` (rule 7) loses
+//!    that head's notice. *Enforced by* review.
 //! 4. **The scheduler is deterministic.** [`Scheduler::step`] reads no
 //!    clock, no randomness and no I/O; its output is a function of its own
 //!    state and the observations it has been given, in order. Time is
@@ -76,30 +80,40 @@
 //!    `retire` do not name the same batch (a landed batch is reported
 //!    `Landed` before it is retired, which [`Observation::departed`] relies
 //!    on), and no member of a batch that `land` names is named by `start` or
-//!    `eject`, whether or not the landing is refused. A violation is
+//!    `eject`, whether or not the landing is refused. `notify` names each
+//!    pull request at most once, each known by the latest observation; no
+//!    pull request is named by both `notify` and `eject`, and none is a
+//!    member of a batch `land` names. A violation is
 //!    [`ForgeError::Permanent`]: a scheduler bug, and the process stops
 //!    (rule 7). *Enforced by* the ledger's `check_start`, `check_land`,
-//!    `check_retire` and `check_eject`.
+//!    `check_retire`, `check_notify` and `check_eject`.
 //! 6. **Effects on unknown things are bugs.** `land` or `retire` on a batch
 //!    that is not known; `land` on a batch the latest observation did not
 //!    report as `Testing { ci: Passed }`, or on a probe; `eject` on a pull
-//!    request that is not known — all [`ForgeError::Permanent`]. "Known" is
+//!    request that is not known; `notify` on a pull request that is not
+//!    known — all [`ForgeError::Permanent`]. "Known" is
 //!    judged against the latest observation and the forge's own effects
 //!    since it, not against whatever the world has done meanwhile: a pull
 //!    request whose owner cleared the intent after the observation is still
 //!    known, and `eject` on it succeeds. *Enforced by* the same ledger
 //!    checks.
 //! 7. **The driver executes a plan in a fixed order and stops at the first
-//!    error.** Order: `land`, `start`, `eject`, `retire`. Landings come first
-//!    so that a refused landing is visible before anything is built on its
-//!    tip; `retire` comes last, so a plan cut short leaves the batch, and the
-//!    facts that drove the plan, in the next observation. On
+//!    error.** Order: `land`, `notify`, `start`, `eject`, `retire`. Landings
+//!    come first so that a refused landing is visible before anything is
+//!    built on its tip, and so that a notice is never sent to a member of a
+//!    batch that landed; notices come next because they are the one item
+//!    nothing re-drives (rule 3) and the forge can deliver them without a
+//!    write to anything but the author's thread; `retire` comes last, so a
+//!    plan cut short leaves the batch, and the facts that drove the plan, in
+//!    the next observation. On
 //!    [`ForgeError::Transient`] the driver abandons the rest of the plan and
 //!    ticks again; on [`ForgeError::Permanent`] or a [`SchedulerError`] it
 //!    stops the process. `retire` on a `Testing { ci: Pending }` batch is its
 //!    cancellation: the forge drops the batch and, where the platform
 //!    allows, its run. *Enforced by* the driver's tests and the simulator
-//!    loop's tests.
+//!    loop's tests; the ledger enforces the order's consequence for `notify`
+//!    and `eject`: `check_notify` sees the landings, `check_eject` sees the
+//!    notices.
 //! 8. **Observations are well-formed and canonical.** [`Observation::prs`]
 //!    is sorted by number and [`Observation::batches`] by id, each without
 //!    duplicates, so two forges reporting the same facts produce equal
@@ -122,9 +136,9 @@
 //! 9. **Nothing about messages crosses the boundary.** The forge tells
 //!    authors about every transition the queue causes or observes; which
 //!    events, in what words, is each forge's own documentation. The
-//!    scheduler contributes an [`EjectReason`], worded through its
-//!    `Display`, and nothing else. *Enforced by* the types: no message type
-//!    exists here.
+//!    scheduler contributes an [`EjectReason`] and a [`NoticeReason`], each
+//!    worded through its `Display`, and nothing else. *Enforced by* the
+//!    types: no message type exists here.
 //!
 //! Forges enforce rules 2, 5, 6 and 8 through [`ledger::Ledger`], which
 //! holds the latest observation and the effects performed since it, so
@@ -139,7 +153,8 @@
 //! identifier newtypes ([`PrNumber`], [`BatchId`], [`Timestamp`],
 //! [`CheckName`]) are built directly, and [`Sha`] through [`Sha::parse`].
 //! An enum a consumer must act on ([`PrStatus`], [`BatchState`],
-//! [`CiStatus`], [`Departed`], [`PrBase`], [`StackPolicy`]) is exhaustive;
+//! [`CiStatus`], [`Departed`], [`PrBase`], [`StackPolicy`],
+//! [`NoticeReason`]) is exhaustive;
 //! one a consumer may ignore, because the forge renders it through
 //! `Display` and nobody's behaviour depends on its variant ([`Hold`],
 //! [`ConflictWith`], [`LandRefusal`], [`EjectReason`], [`Withdrawal`]), is
@@ -172,8 +187,9 @@
 //! also holds an exhaustive `match` over the same enum, so a new variant
 //! still fails to compile there.
 //!
-//! The contract change lands on `main` first, as one pull request of the
-//! kind above, and each line of work rebases onto it.
+//! A contract change and every consumer's edit land as one change. Where
+//! several lines of work are in flight, the one carrying the contract change
+//! lands first and the others rebase onto it.
 
 pub mod ledger;
 
@@ -649,13 +665,14 @@ impl fmt::Display for Withdrawal {
 }
 
 /// What the scheduler asks the forge to do in one tick, executed in the
-/// order `land`, `start`, `eject`, `retire` (rule 7).
+/// order `land`, `notify`, `start`, `eject`, `retire` (rule 7).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
     pub start: Vec<BatchStart>,
     pub land: Vec<BatchId>,
     pub retire: Vec<BatchId>,
     pub eject: Vec<Ejection>,
+    pub notify: Vec<Notice>,
 }
 
 impl Plan {
@@ -665,6 +682,7 @@ impl Plan {
             && self.land.is_empty()
             && self.retire.is_empty()
             && self.eject.is_empty()
+            && self.notify.is_empty()
     }
 }
 
@@ -710,8 +728,6 @@ pub enum EjectReason {
     Conflicts { with: ConflictWith },
     /// It is held responsible for `batch`'s failure.
     BatchFailed { batch: BatchId },
-    /// It fails only together with `pr`; `batch` singled the pair out.
-    InteractsWith { pr: PrNumber, batch: BatchId },
 }
 
 impl fmt::Display for EjectReason {
@@ -719,9 +735,50 @@ impl fmt::Display for EjectReason {
         match self {
             EjectReason::Conflicts { with } => write!(f, "conflicts with {with}"),
             EjectReason::BatchFailed { batch } => write!(f, "batch {} failed", batch.0),
-            EjectReason::InteractsWith { pr, batch } => {
-                write!(f, "fails together with #{} (batch {})", pr.0, batch.0)
+        }
+    }
+}
+
+/// A request to tell a pull request's author what the scheduler believes
+/// about it, without acting on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Notice {
+    pub pr: PrNumber,
+    pub reason: NoticeReason,
+}
+
+impl Notice {
+    /// A `Notice` with the given fields.
+    pub fn new(pr: PrNumber, reason: NoticeReason) -> Notice {
+        Notice { pr, reason }
+    }
+}
+
+/// What the scheduler believes about a pull request it is not ejecting.
+/// Exhaustive: the simulator judges each reason against its world's truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoticeReason {
+    /// It is probably broken against trunk: `batch` failed and nothing
+    /// else in that run explains the failure.
+    Broken { batch: BatchId },
+    /// It probably fails only together with `pr`, which is also queued;
+    /// `batch` is the run that singled the pair out. Each half of the pair
+    /// is told, naming the other.
+    InteractsWith { pr: PrNumber, batch: BatchId },
+}
+
+impl fmt::Display for NoticeReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NoticeReason::Broken { batch } => {
+                write!(f, "probably broken against trunk (batch {})", batch.0)
             }
+            NoticeReason::InteractsWith { pr, batch } => write!(
+                f,
+                "probably fails together with #{} (batch {})",
+                pr.0, batch.0
+            ),
         }
     }
 }
@@ -770,6 +827,9 @@ pub trait Forge {
     fn retire(&mut self, batch: BatchId) -> Result<(), ForgeError>;
     /// Clears a pull request's intent and tells its author why.
     fn eject(&mut self, pr: PrNumber, reason: &EjectReason) -> Result<(), ForgeError>;
+    /// Tells a pull request's author what the scheduler believes, and
+    /// changes nothing (rules 5, 9).
+    fn notify(&mut self, pr: PrNumber, reason: &NoticeReason) -> Result<(), ForgeError>;
 }
 
 /// A failed forge call.
@@ -910,10 +970,6 @@ mod tests {
                 with: ConflictWith::Pr(PrNumber(12)),
             },
             EjectReason::BatchFailed { batch: BatchId(7) },
-            EjectReason::InteractsWith {
-                pr: PrNumber(12),
-                batch: BatchId(7),
-            },
         ];
         let words: Vec<String> = reasons.iter().map(ToString::to_string).collect();
         assert_eq!(
@@ -922,7 +978,21 @@ mod tests {
                 "conflicts with trunk",
                 "conflicts with #12",
                 "batch 7 failed",
-                "fails together with #12 (batch 7)",
+            ]
+        );
+        let notices = [
+            NoticeReason::Broken { batch: BatchId(7) },
+            NoticeReason::InteractsWith {
+                pr: PrNumber(12),
+                batch: BatchId(7),
+            },
+        ];
+        let words: Vec<String> = notices.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            words,
+            [
+                "probably broken against trunk (batch 7)",
+                "probably fails together with #12 (batch 7)",
             ]
         );
         let departures = [
@@ -978,6 +1048,9 @@ mod tests {
         let reason = EjectReason::BatchFailed { batch: BatchId(4) };
         let ejection = Ejection::new(PrNumber(2), reason.clone());
         assert_eq!((ejection.pr, &ejection.reason), (PrNumber(2), &reason));
+        let reason = NoticeReason::Broken { batch: BatchId(4) };
+        let notice = Notice::new(PrNumber(2), reason.clone());
+        assert_eq!((notice.pr, &notice.reason), (PrNumber(2), &reason));
         let departure = Departure::new(PrNumber(5), sha.clone(), Departed::Merged);
         assert_eq!(
             (departure.pr, &departure.head, &departure.how),
@@ -1016,6 +1089,14 @@ mod tests {
         assert!(Plan::default().is_empty());
         let plan = Plan {
             land: vec![BatchId(1)],
+            ..Plan::default()
+        };
+        assert!(!plan.is_empty());
+        let plan = Plan {
+            notify: vec![Notice::new(
+                PrNumber(1),
+                NoticeReason::Broken { batch: BatchId(1) },
+            )],
             ..Plan::default()
         };
         assert!(!plan.is_empty());

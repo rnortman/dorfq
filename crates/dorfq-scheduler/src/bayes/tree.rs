@@ -163,7 +163,7 @@ impl Bayes {
             fates.push(fate);
         }
 
-        let ejected = self.eject(observation, inference, &mut fates, &mut plan);
+        let ejected = self.eject_and_notify(observation, heads, inference, &mut fates, &mut plan);
 
         // The nodes, from the fates the ejections leave: a waiting batch
         // whose base is no node, because the batch beneath it was just
@@ -316,13 +316,13 @@ impl Bayes {
         if pool.is_empty() {
             return Ok(Vec::new());
         }
-        let units = self.units(inference, stacks, heads, taken);
         let mut out: Vec<Candidate> = Vec::new();
         for (base, node) in nodes {
             let weight = node.weight();
             if weight == 0.0 {
                 continue;
             }
+            let units = self.units(inference, stacks, heads, taken, &node.tree);
             let beneath: BTreeSet<PrNumber> = node
                 .tree
                 .iter()
@@ -372,7 +372,7 @@ impl Bayes {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{failed_alone, informative, members, params};
+    use super::super::test_support::{failed_alone, informative, members, pair_failed, params};
     use super::*;
     use crate::test_support::*;
     use crate::{BayesConfig, Speculation};
@@ -716,5 +716,60 @@ mod tests {
         }
         let plan = bayes.step(&input).unwrap();
         assert!(!plan.start.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn a_believed_pairs_newer_half_runs_beside_the_older_never_on_its_tip() {
+        let mut bayes = tree(|p| p.lanes = 3);
+        let prs = ready_all(&[1, 2, 3]);
+        bayes.model.sync(&prs, &BTreeSet::new(), 0, 0);
+        pair_failed(&mut bayes.model, &members(&[1]), &members(&[2]), 1);
+        step(&mut bayes, &observation(prs.clone(), vec![]));
+        let input = observation(prs, vec![testing(20, trunk(), &[1], CiStatus::Pending)]);
+        let plan = step(&mut bayes.clone(), &input);
+        assert_eq!(plan.start, vec![start(21, tip(20), &[3])]);
+
+        // The best candidate on 1's tip leaves 2 out; on trunk, where 1 is
+        // not beneath, it holds 2.
+        let inference = Inference::of(&bayes.model).unwrap();
+        let stacks = Stacks::new(&input);
+        let heads: BTreeMap<PrNumber, &Sha> =
+            input.prs.iter().map(|p| (p.number, &p.head)).collect();
+        let none = BTreeSet::new();
+        let one = members(&[1]);
+        let lands = bayes.p_pass(&inference, &one, &[]);
+        let mut root = Node::root();
+        root.siblings.push(lands);
+        let nodes = BTreeMap::from([
+            (trunk(), root),
+            (
+                tip(20),
+                Node {
+                    p: lands,
+                    tree: one,
+                    siblings: Vec::new(),
+                },
+            ),
+        ]);
+        let ground = Ground {
+            inference: &inference,
+            stacks: &stacks,
+            heads: &heads,
+            landed: &none,
+            ejected: &none,
+            components: &[BTreeSet::from([PrNumber(1), PrNumber(2)])],
+            after: &trunk(),
+        };
+        let taken = BTreeSet::from([PrNumber(1)]);
+        let candidates = bayes.candidates(&ground, &nodes, &taken, false).unwrap();
+        let on = |base: Sha| best(candidates.iter().filter(|c| c.base == base)).unwrap();
+        assert!(
+            !on(tip(20)).members.iter().any(|m| m.0 == PrNumber(2)),
+            "{candidates:?}"
+        );
+        assert!(
+            on(trunk()).members.iter().any(|m| m.0 == PrNumber(2)),
+            "{candidates:?}"
+        );
     }
 }

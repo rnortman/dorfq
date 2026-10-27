@@ -77,6 +77,21 @@ pub struct PrRecord {
     /// It was bad against trunk at some point: broken itself, or stacked on
     /// a bad base.
     pub ever_bad: bool,
+    /// The first notice the queue ever sent it; `None` while it has had
+    /// none. Later notices, at this head or another, do not replace it.
+    pub notice: Option<FirstNotice>,
+}
+
+/// The first notice a pull request received, judged against the world's
+/// truth when it was sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirstNotice {
+    pub t: u64,
+    pub justified: bool,
+    /// For a justified `Broken` notice, the seconds from the later of its
+    /// arrival and `bad_since` to the notice: how long the author waited
+    /// to hear. `None` for an `InteractsWith` notice or an unjustified one.
+    pub waited: Option<u64>,
 }
 
 /// One batch run.
@@ -184,6 +199,15 @@ pub struct Metrics {
     /// justified ejection, direct or with an ejected base.
     pub detect_p50_hours: Option<f64>,
     pub detect_p95_hours: Option<f64>,
+    /// Hours from becoming bad, or from arriving when it arrived bad, to
+    /// the queue's first notice that it is probably broken, over pull
+    /// requests whose first notice said so truly.
+    pub notice_p50_hours: Option<f64>,
+    pub notice_p95_hours: Option<f64>,
+    /// Pull requests whose first notice was wrong: told it is probably
+    /// broken while not bad, or that it fails together with a pull request
+    /// it does not.
+    pub notices_good: usize,
     /// When the replication ended: its world last emptied, or it was cut
     /// off.
     pub ended_hours: f64,
@@ -307,6 +331,16 @@ impl Metrics {
                 Exit::Blocked { .. } => unreachable!("a root exit is not a block"),
             }
         }
+        let mut notice_hours: Vec<f64> = prs
+            .iter()
+            .filter_map(|p| p.notice?.waited)
+            .map(|s| s as f64 / HOUR)
+            .collect();
+        notice_hours.sort_by(f64::total_cmp);
+        let notices_good = prs
+            .iter()
+            .filter(|p| p.notice.is_some_and(|n| !n.justified))
+            .count();
         land_hours.sort_by(f64::total_cmp);
         reject_hours.sort_by(f64::total_cmp);
         detect_hours.sort_by(f64::total_cmp);
@@ -343,6 +377,9 @@ impl Metrics {
             reject_p95_hours: percentile(&reject_hours, 0.95),
             detect_p50_hours: percentile(&detect_hours, 0.5),
             detect_p95_hours: percentile(&detect_hours, 0.95),
+            notice_p50_hours: percentile(&notice_hours, 0.5),
+            notice_p95_hours: percentile(&notice_hours, 0.95),
+            notices_good,
             ended_hours: end.at as f64 / HOUR,
             cut_off: end.cut_off,
             stalled: end.stalled,
@@ -361,6 +398,7 @@ mod tests {
             left,
             rebases: 0,
             ever_bad: false,
+            notice: None,
         }
     }
 
@@ -512,6 +550,49 @@ mod tests {
         );
     }
 
+    fn told(justified: bool, waited: Option<u64>) -> Option<FirstNotice> {
+        Some(FirstNotice {
+            t: 0,
+            justified,
+            waited,
+        })
+    }
+
+    #[test]
+    fn notices_summarise_the_first_notice_of_each_pull_request() {
+        let mut prs = [
+            // Justified `Broken`: waited 1, 2 and 4 hours.
+            pr(1, 0, Some((7200, ejected(Some(0))))),
+            pr(2, 0, Some((7200, Exit::Landed { bad: false }))),
+            pr(3, 0, None),
+            // A justified `InteractsWith`: in neither measure.
+            pr(4, 0, None),
+            // Wrong, of either reason.
+            pr(5, 0, Some((60, Exit::Landed { bad: false }))),
+            pr(6, 0, None),
+            // Never told.
+            pr(7, 0, None),
+        ];
+        prs[0].notice = told(true, Some(3600));
+        prs[1].notice = told(true, Some(7200));
+        prs[2].notice = told(true, Some(14400));
+        prs[3].notice = told(true, None);
+        prs[4].notice = told(false, None);
+        prs[5].notice = told(false, None);
+        let m = Metrics::summarise(
+            &prs,
+            &[],
+            &[],
+            &[],
+            RunningSeconds::default(),
+            End::drained(0),
+        );
+        assert_eq!(
+            (m.notice_p50_hours, m.notice_p95_hours, m.notices_good),
+            (Some(2.0), Some(4.0), 2)
+        );
+    }
+
     #[test]
     fn empty_sets_summarise_to_none() {
         let m = Metrics::summarise(
@@ -531,6 +612,7 @@ mod tests {
         assert_eq!(m.land_p50_hours, None);
         assert_eq!(m.reject_p95_hours, None);
         assert_eq!(m.detect_p50_hours, None);
+        assert_eq!((m.notice_p50_hours, m.notices_good), (None, 0));
     }
 
     #[test]

@@ -68,10 +68,14 @@ pub struct BayesConfig {
     /// value: a pull request queued `h` hours is worth `1 + w_age·h` to
     /// land, and `w_reject` times that to resolve.
     pub w_age: f64,
-    /// The posterior at which a singled-out cause is ejected.
-    // TODO(soft-eject): a second, lower threshold at which the author is told
-    // the pull request is probably broken, without an ejection.
+    /// The posterior at which a singled-out `Bad` cause is ejected.
     pub eject_above: f64,
+    /// The posterior at which a singled-out cause's author is told, without
+    /// an ejection: the pull request is probably broken against trunk, or
+    /// probably fails only together with another. Equal to `eject_above`,
+    /// a pull request that is probably broken is ejected and never told;
+    /// a pair is never ejected, so its notice is sent at any value.
+    pub notify_above: f64,
     /// A run singles a cause out when every other cause in it is below this.
     pub others_below: f64,
     /// A candidate starts when its score exceeds this.
@@ -207,14 +211,21 @@ impl BayesConfig {
         finite("w_reject", self.w_reject)?;
         non_negative("w_age", self.w_age)?;
         finite("eject_above", self.eject_above)?;
+        finite("notify_above", self.notify_above)?;
         finite("others_below", self.others_below)?;
         finite("speculate_above", self.speculate_above)?;
-        if self.eject_above > self.others_below {
+        if self.eject_above <= self.others_below {
+            return Err(ConfigError {
+                field: "eject_above",
+                requirement: "must be greater than others_below",
+            });
+        }
+        if self.others_below < self.notify_above && self.notify_above <= self.eject_above {
             Ok(())
         } else {
             Err(ConfigError {
-                field: "eject_above",
-                requirement: "must be greater than others_below",
+                field: "notify_above",
+                requirement: "must be greater than others_below and at most eject_above",
             })
         }
     }
@@ -254,6 +265,7 @@ run_cost = 0.5
 w_reject = 1.0
 w_age = 0.02
 eject_above = 0.9
+notify_above = 0.5
 others_below = 0.1
 speculate_above = 0.0
 speculation = \"chain\"
@@ -299,6 +311,7 @@ speculation = \"chain\"
                 w_reject: 1.0,
                 w_age: 0.02,
                 eject_above: 0.9,
+                notify_above: 0.5,
                 others_below: 0.1,
                 speculate_above: 0.0,
                 speculation: Speculation::Chain,
@@ -384,6 +397,9 @@ speculation = \"chain\"
         let without = BAYES.replace("p_trunk = 0.001\n", "");
         let message = parse(&without).unwrap_err();
         assert!(message.contains("p_trunk"), "{message}");
+        let without = BAYES.replace("notify_above = 0.5\n", "");
+        let message = parse(&without).unwrap_err();
+        assert!(message.contains("notify_above"), "{message}");
         let message = parse("lanes = 2\n").unwrap_err();
         assert!(message.contains("kind"), "{message}");
     }
@@ -462,7 +478,25 @@ speculation = \"chain\"
             error.to_string(),
             "eject_above must be greater than others_below"
         );
-        assert_eq!(bayes_with(set!(eject_above = 0.1 + 1e-9)), Ok(()));
+        assert_eq!(
+            bayes_with(|c| {
+                c.eject_above = 0.1 + 1e-9;
+                c.notify_above = 0.1 + 1e-9;
+            }),
+            Ok(())
+        );
+        // `notify_above` lies in `(others_below, eject_above]`.
+        for p in [0.1, 0.9 + 1e-9] {
+            let error = bayes_with(|c| set!(notify_above = p)(c)).unwrap_err();
+            assert_eq!(error.field, "notify_above");
+            assert_eq!(
+                error.to_string(),
+                "notify_above must be greater than others_below and at most eject_above"
+            );
+        }
+        assert_eq!(bayes_with(set!(notify_above = 0.1 + 1e-9)), Ok(()));
+        assert_eq!(bayes_with(set!(notify_above = 0.9)), Ok(()));
+        assert_eq!(field(set!(notify_above = f64::NAN)), "notify_above");
         // TOML allows `inf` and `nan`; neither is a parameter.
         assert_eq!(field(set!(run_cost = f64::INFINITY)), "run_cost");
         assert_eq!(field(set!(w_reject = f64::NAN)), "w_reject");

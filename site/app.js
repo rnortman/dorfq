@@ -38,6 +38,9 @@ const ROWS = [
   ["reject_p95_hours", 2, null],
   ["detect_p50_hours", 2, "median hours from a pull request becoming broken, or arriving broken, to its justified ejection"],
   ["detect_p95_hours", 2, "95th-percentile hours from a pull request becoming broken, or arriving broken, to its justified ejection"],
+  ["notice_p50_hours", 2, "median hours from a pull request becoming broken, or arriving broken, to the queue's first notice that it is probably broken, over pull requests whose first notice said so truly"],
+  ["notice_p95_hours", 2, "95th-percentile hours from a pull request becoming broken, or arriving broken, to the queue's first notice that it is probably broken, over pull requests whose first notice said so truly"],
+  ["notices_good", 1, "pull requests whose first notice was wrong: told it is probably broken while not, or that it fails together with a pull request it does not"],
   ["ended_hours", 1, null],
   ["cut_off", 2, "share of replications that ended before the queue emptied"],
   ["stalled", 2, "share of replications ended by the stall detector: no landing or ejection for stall_hours"],
@@ -348,6 +351,7 @@ function eventText(e) {
     case "refused": return `refused ${e.batch}: ${e.reason}`;
     case "eject":
       return `eject ${e.pr} ${e.justified ? "justified" : "unjustified"}: ${e.reason}${e.final ? "" : ", rebasing"}`;
+    case "notice": return `notice ${e.pr} ${e.justified ? "justified" : "unjustified"}: ${e.reason}`;
     case "retire": return `retire ${e.batch}${e.cancelled ? " cancelled" : ""}`;
     case "pr_ci": return `pr-ci ${e.pr}${e.billed ? " billed" : ""}`;
     case "pr_ci_end": return `pr-ci ${e.pr} ${e.cancelled ? "cancelled" : e.failed ? "failed" : "passed"}`;
@@ -359,6 +363,7 @@ function eventText(e) {
     case "step": {
       let s = `queued=${e.queued} in_flight=${e.in_flight}`;
       if (e.land.length) s += ` | land ${list(e.land)}`;
+      if (e.notify.length) s += ` | notify ${e.notify.map((x) => `${x.pr} (${x.reason})`).join(" ")}`;
       if (e.start.length) s += ` | start ${e.start.map((x) => `${x.batch}${list(x.members)}`).join(" ")}`;
       if (e.eject.length) s += ` | eject ${e.eject.map((x) => `${x.pr} (${x.reason})`).join(" ")}`;
       if (e.retire.length) s += ` | retire ${list(e.retire)}`;
@@ -1248,7 +1253,7 @@ const replay = {
     const shown = [];
     for (let i = world.index - 1; i >= 0 && shown.length < 200; i -= 1) {
       const e = world.events[i];
-      if (e.kind === "step" && e.land.length + e.start.length + e.eject.length + e.retire.length === 0) continue;
+      if (e.kind === "step" && e.land.length + e.notify.length + e.start.length + e.eject.length + e.retire.length === 0) continue;
       shown.push(e);
     }
     shown.reverse();

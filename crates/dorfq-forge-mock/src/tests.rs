@@ -618,6 +618,35 @@ fn eject_removes_and_tells_the_reason() {
 }
 
 #[test]
+fn notify_tells_the_reason_and_removes_nothing() {
+    let (mut forge, buffer) = forge(THREE);
+    forge.observe().unwrap();
+    let reason = NoticeReason::InteractsWith {
+        pr: PrNumber(1),
+        batch: BatchId(4),
+    };
+    forge.notify(PrNumber(2), &reason).unwrap();
+    assert_eq!(
+        forge.messages().last(),
+        Some(&Message {
+            pr: PrNumber(2),
+            event: Event::Notice {
+                reason: reason.clone()
+            }
+        })
+    );
+    let text = buffer.text();
+    assert!(
+        text.contains("message to pr 2: notice: probably fails together with #1 (batch 4)\n"),
+        "{text}"
+    );
+    let observation = forge.observe().unwrap();
+    assert_eq!(numbers(&observation), [1, 2, 3]);
+    assert_eq!(observation.prs[1].status, PrStatus::Ready);
+    assert!(observation.departed.is_empty());
+}
+
+#[test]
 fn messages_follow_a_pull_request_through_the_queue() {
     let (mut forge, buffer) = forge("ci_ticks = 1\n[[pr]]\nnumber = 1\narrives_at = 1\n");
     let trunk = forge.observe().unwrap().trunk;
@@ -741,7 +770,10 @@ fn rule_6_violations_are_permanent() {
     );
     assert_eq!(
         violation_of(forge.eject(PrNumber(9), &CONFLICTS_WITH_TRUNK)),
-        Violation::UnknownPr { pr: PrNumber(9) }
+        Violation::UnknownPr {
+            effect: "eject",
+            pr: PrNumber(9)
+        }
     );
     forge
         .start_batch(&start(1, &observation.trunk, &[1]))
@@ -963,14 +995,44 @@ fn ejecting_the_same_pull_request_twice_after_one_observation_is_permanent() {
     forge.eject(PrNumber(2), &CONFLICTS_WITH_TRUNK).unwrap();
     assert_eq!(
         violation_of(forge.eject(PrNumber(2), &CONFLICTS_WITH_TRUNK)),
-        Violation::UnknownPr { pr: PrNumber(2) }
+        Violation::UnknownPr {
+            effect: "eject",
+            pr: PrNumber(2)
+        }
     );
 }
 
 #[test]
+fn notifying_an_unknown_pull_request_is_permanent() {
+    let (mut forge, _) = forge(THREE);
+    forge.observe().unwrap();
+    let reason = NoticeReason::Broken { batch: BatchId(1) };
+    assert_eq!(
+        violation_of(forge.notify(PrNumber(9), &reason)),
+        Violation::UnknownPr {
+            effect: "notify",
+            pr: PrNumber(9)
+        }
+    );
+    forge.notify(PrNumber(2), &reason).unwrap();
+    assert_eq!(
+        violation_of(forge.notify(PrNumber(2), &reason)),
+        Violation::NotifiedTwice { pr: PrNumber(2) }
+    );
+    assert_eq!(
+        violation_of(forge.eject(PrNumber(2), &CONFLICTS_WITH_TRUNK)),
+        Violation::NotifiedInPlan { pr: PrNumber(2) }
+    );
+    assert_eq!(forge.messages().len(), 4);
+}
+
+#[test]
 fn violations_say_what_was_wrong() {
-    let message =
-        ForgeError::Permanent(Box::new(Violation::UnknownPr { pr: PrNumber(9) })).to_string();
+    let message = ForgeError::Permanent(Box::new(Violation::UnknownPr {
+        effect: "eject",
+        pr: PrNumber(9),
+    }))
+    .to_string();
     assert!(message.contains("eject: pr 9 is not known"), "{message}");
     let landed = Violation::LandedInPlan {
         effect: "start_batch",
