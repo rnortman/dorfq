@@ -7,8 +7,13 @@ members' landing value, as though its pass lands: `chain_plan` in
 the landing term. Under load a passed finder does not land: `chain_plan`
 retires it whenever a chain batch holds trunk, so `p·V` prices a landing
 that will not happen, and the score has no term for what the pass actually
-does — clear its suspects for the chain and strip them from the failed runs
-they share with the culprit. On one 12/hr sweep point traced whole, finders
+does — discount its suspects by `p_miss` in the failed runs they share with
+the culprit, and cover them against a second proposal at that trunk
+position. A finder that is a strict prefix of an `Atomic`
+unit never lands under `chain` at any load — `split_atomic` retires its pass
+— and is priced the same; a quiet queue in the simulator's `sim.toml` re-ran
+one such finder, scored on a landing it could not make, for 280 hours before
+`suspects` was bounded to one proposal of a set per trunk position. On one 12/hr sweep point traced whole, finders
 that passed and were not landed took 44% of the chain's run-hours, up from
 31% before the walk that proposes more of them (their count nearly doubled);
 they win lanes and members over chain extensions, so the median wait rises

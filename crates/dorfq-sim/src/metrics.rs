@@ -159,6 +159,7 @@ pub struct Metrics {
     pub runs: usize,
     /// Batch runs stopped by their batch's retirement.
     pub cancelled_runs: usize,
+    /// Members per batch run, a probe counting as a run of none.
     pub mean_batch_size: Option<f64>,
     /// Billed PR CI runs, cancelled included.
     pub billed_pr_ci_runs: usize,

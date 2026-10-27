@@ -53,43 +53,6 @@ reserved start after some number of skips) sized in that world against the
 whole wait, selection in `step` included. Deferred because the rule changes
 which batch the extension emits, which is design work.
 
-### bayes-false-green
-
-The `bayes` model treats a passing run as proof, not evidence. `passed` in
-`crates/dorfq-scheduler/src/bayes/model.rs` moves each covered pull
-request's cleared position to the run's trunk and sets each covered pair to
-`FLOOR`; `blames` then excludes that pull request from every failed run
-started at or before that position, and `prune` discards a failure with
-nothing left to blame as a flake. A pull request's own CI, read through
-`PrSnapshot::behind`, is taken as proof the same way, although own CI is
-often weaker than the queue's: the mock forge's `bad = true` at its default
-`behind = 0` (`crates/dorfq-forge-mock`) is the fixture form of that, and
-under `bayes` the shipped `crates/dorfq/examples/scenario.toml` never ejects
-pull request 5 — every failed run holding it has nothing else to blame and
-is pruned. CI misses a real break at some small rate, so a pass should lower
-the belief that a pull request or pair is broken, as any other observation
-does, not zero it; own CI is the same mechanism at its own rate, and
-`prune`'s rule that a run with nothing left to blame was a flake changes
-with it. The simulator's world now produces false greens: a run over a
-broken tree passes at `p_miss`, own CI and batch runs alike, a bad pull
-request that lands breaks trunk until the world repairs it after
-`trunk_fix_minutes`, and the report counts `landed_bad` and
-`trunk_broken_hours`; `crates/dorfq-sim/examples/busy.toml` runs at
-`p_miss = 0.02`, where `bayes` made one bad landing in four replications, a
-stack of five pull requests, trunk was broken for 2.2 hours, and the queue ejected
-three innocents in that replication, against none in any replication at
-`p_miss = 0`. What a false green costs the scheduler is therefore
-measurable, and what modelling one buys is the design: no passing run, queue
-or own CI, clears a cause outright, and `prune`'s rule that a run with
-nothing left to blame was a flake changes with it. It keeps more causes
-alive, so it bears on `bayes-posterior-precision`. Done means: no passing
-run clears a cause outright in the model; the mock's `bad` pull request at
-`behind = 0` is either ejected under `bayes` in a driver test or documented
-in `crates/dorfq-forge-mock` as a fixture `bayes` reads as a flake, by the
-design's choice; and the speculation sweep at `p_miss = 0.02` shows the
-change against the world. The `TODO(bayes-false-green)` comment is on
-`passed`.
-
 ### bayes-pair-eject-timing
 
 When `bayes` singles out a pair of pull requests while both are still
@@ -102,13 +65,12 @@ keeps the runs, so a run that held the pair would blame `Bad(newer)` alone,
 and `eject` re-reads every run's posteriors each step and would single it
 out with `BatchFailed`; `EjectReason::InteractsWith` would then be unused.
 Two things that candidate leaves open. A run's `Bad(newer)` is read at the
-run's own position, and `blames` excuses a pull request cleared at or after
-it, so an alibi the newer earned between that run and the older's landing (a
-hedge on trunk that passed) leaves the run with nothing to blame, `prune`
-drops it as a flake, and the newer is batched again and fails once more
-before it is ejected: the conversion of `Pair(older, newer)` into
-`Bad(newer)` would have to be blamable from the older's landing position.
-And whether the two are kept apart until the older lands: a batch holding
+run's own position, so an alibi the newer earned between that run and the
+older's landing (a hedge on trunk that passed) discounts it by `p_miss` in
+that run; the run keeps `Bad(newer)` and its stretch's trunk cause and is
+not pruned, but whether the discounted `Bad(newer)` is still singled out, or
+the newer is batched again and fails once more before it is ejected, has not
+been traced. And whether the two are kept apart until the older lands: a batch holding
 both has `p_pass` near zero once the pair is materialised and `grow` stops
 at the first unit that does not raise the score, but `units` sorts by `Bad`
 risk, not pair belief, and that case has not been traced. The other route
@@ -134,60 +96,6 @@ that passed alone costs on the order of `n · m` runs. Cross-subset suspects
 strategy is design work: which subsets to run, how their verdicts update the
 pair beliefs, and how a suspect batch of several pull requests is scored
 against the extensions.
-
-### bayes-posterior-precision
-
-The Bayesian scheduler's exact inference sums an alternating series over the
-subsets of a component's failed runs. When a component is explained only by
-causes at low belief — pairs at the interaction prior, members whose alibi
-set them to the floor and whose belief later landings lifted back near that
-prior — the probability of all its failures falls toward the rounding error
-of the terms that cancel to give it, and the posteriors become noise. That
-is the shape a CI outage or a long flaky spell produces, with the same pull
-requests retried on culprit finders. Today the guard where the
-`TODO(bayes-posterior-precision)` comment sits in
-`crates/dorfq-scheduler/src/bayes/infer.rs` estimates the error and, once
-the estimate reaches 1%, has `step` return a `SchedulerError`, which stops
-the process, rather than eject a pull request on noise; the estimate runs
-well above the true error, so the stop comes a run or two before the
-posteriors are noise. It is reached two ways. Inferring over the evidence
-reaches it at a chain of about nine or more such linked runs at the shipped
-priors. Scoring a candidate batch by the posteriors its failure would give
-reaches it sooner: the hypothetical run is summed with every component that
-a cause the batch would blame belongs to, so one cluster reaches it a run
-before the evidence does, and a batch whose members come from separate
-clusters is scored over their union, whose runs count as if they were one
-cluster: two clusters of four, each resolved comfortably on its own, stop
-the process. The chain extension grows from the ready pull requests in
-ascending order of belief, which puts members lifted off their alibi by a
-landing first, so such a batch is an ordinary candidate. That scoring stop
-remains under `speculation = "chain"`, the control, and is gone under
-`"tree"`, where a hypothetical failure that cannot be resolved scores with
-no resolution credit: the tree scores several times more hypotheticals a
-step, over deeper trees, and would stop far more often. The stop on the
-evidence remains under both. On a real forge a long flaky spell or a CI
-outage stops the queue; the self-hosting queue is far too small to have
-reached the regime. `crates/dorfq-sim/examples/outage.toml` — the busy world
-with CI down from hour 24 to hour 36 — puts an outage in the world but does
-not reach the regime: the stop fired under neither speculation in any of
-four replications. Every run that touches the window fails, own CI included,
-so no pull request arriving in it becomes ready before it ends; `bayes` ran
-6 to 13 batch runs to a failed end in the window in each of three
-replications traced, and ejected 0 to 17 innocents a replication against 0
-to 3 in `busy.toml`. The world that reaches the regime — a longer outage, a
-long flaky spell — is still to be found, and comes before the choice of
-recovery. Two recoveries are candidates: drop the component's oldest runs
-until the sum is significant, or fall back to exact enumeration over the
-component's causes when there are few of them. Deferred because either
-changes what the posteriors are in a regime no simulated world has reached,
-so choosing and sizing one is model design with a world that exercises it.
-Scoring has a third, exact remedy for the union: components share no cause,
-so the hypothetical run's failure can be scored against each component
-separately and the results combined, which leaves the posteriors unchanged
-and moves the scoring stop back to where a single cluster puts it. It
-resolves neither the single-cluster case nor inference over the evidence,
-and it changes when the queue stops, so it is chosen together with the
-recovery above.
 
 ### chain-collapse-under-runner-queue
 
@@ -361,8 +269,22 @@ comment sits above the label check in `enqueued_bases`.
 ### soft-eject
 
 A second, lower belief threshold at which the scheduler tells an author that
-their pull request is probably broken against trunk, without ejecting it. It
-needs a contract item beside `Plan.eject` (rule 9 lets the scheduler send
+their pull request is probably broken against trunk, without ejecting it.
+The threshold is where the tree sets a pull request aside rather than
+running it as a suspect: under `speculation = "tree"` a suspect batch seldom
+beats a fresh extension's score while fresh work is ready, so a bad pull
+request waits for a quiet period, and the chain ejects faster; that is
+accepted, and the author's notice is what closes the gap — a told author
+rebases and re-runs their own CI. In a quiet queue the slowest case is a
+pull request bad at its own origin, alone, and it is slow under the shipped
+`speculation = "chain"` too, where nothing is set aside: the chain re-runs
+it, its failures within one stretch are explained by that stretch's trunk
+cause, its posterior plateaus near 0.8 once a probe has passed, and at the
+shipped priors and inference read limit it takes about a dozen failed runs
+and two probes to eject: the priors set the plateau's height, and the read
+limit sets how long it lasts. That plateau is the confidence the soft
+threshold is for, in either mode — an author told at it rebases and re-runs
+their own CI long before the hard ejection. It needs a contract item beside `Plan.eject` (rule 9 lets the scheduler send
 authors nothing else), emitted once per (pull request, head), and a `Forge`
 method that the GitHub forge relays as a comment and the mock records. In
 the simulator, a told author starts a fix (as a failed own-CI run already
@@ -396,68 +318,3 @@ each policy's replications. It needs a JavaScript runtime pinned in
 once the page grows past its first version or becomes a production replay
 tool.
 The `TODO(test-site-app-js-untested-against-report-schema)` comment sits in `site/BUILD.bazel`, above the report rules.
-
-### tree-starves-resolution
-
-Under `speculation = "tree"` a suspect batch almost never starts while fresh
-pull requests are ready, so bad pull requests sit queued until their authors
-withdraw them. Every candidate on every node competes on one score and a
-lane takes the maximum; a suspect singleton's value is
-`p + (1 − p)·w_reject = 1` at `w_reject = 1`, which nets at most
-`1 − run_cost` on an empty node and about `0.08` on trunk beside a pending
-batch of sixteen, while an extension of fresh pull requests on the same node
-nets several. The risk-sorted unit order and `grow`'s stop at the first unit
-that does not raise the score keep a high-`Bad` suspect out of every
-extension too. The chain only runs its finders because the
-one-extension-per-step rule reserves the remaining lanes for them. In the
-speculation sweep (`crates/dorfq-sim/sweeps/speculation.toml`, four
-replications) the tree ejected about 80% fewer bad pull requests than the
-chain at every point and left about three times as many pull requests
-unfinished at nearly every point, landing more only under overload; those
-ratios were measured before the simulator modelled breakage against trunk,
-when `ejected_bad` also counted a pull request whose conflicting partner was
-merely queued, and the replications were cut off at a fixed drain. A pull
-request left queued costs the objective nothing. Two things to price, each
-as a flag measured by that sweep: `w_age`, a value per hour waited, shipped;
-the sweep has it as an axis and at `[0.02, 0.1]` the criterion was not met;
-and `w_reject`, which prices a resolution at one landing against a fresh
-batch's several. Along `w_reject` too the criterion was not met: in the
-speculation sweep at `p_miss = 0.02`, run in thirds pinned on `w_age` at
-eight replications, the summary had the tree better than the chain on
-`ejected_bad` at no more than 31 of 192 points in any third (at
-`w_age = 0.1`, where it was better on `ended_hours` at 99 of 192), and,
-counted point by point on both metrics at once from the sweep's JSON, at no
-more than 12 of 96 points in any `w_age`/`w_reject` cell; at `p_miss = 0`
-fewer on both counts. The structural options are therefore next: a lane
-reservation for resolution, which is what the chain's one-extension-per-step rule gives it, or a
-detection-latency term in the objective, which has none. Done means a flag
-under which the tree is better than the chain on `ejected_bad` and on
-`ended_hours` at more than half of the compared points, as that sweep's
-summary prints them: a replication now runs until its queue empties, so the
-time it takes to empty is what `unfinished` used to measure. The
-`TODO(tree-starves-resolution)` comment is on `candidates` in
-`crates/dorfq-scheduler/src/bayes/tree.rs`.
-
-### trunk-broken-probe
-
-`Bayes` does not notice that trunk itself is broken. A pass that missed a
-real break lands a bad pull request; after it, every batch built on trunk
-fails and `Bayes` singles out each suspect batch's suspect in turn, so
-innocent pull requests are ejected one after another, under both
-speculations, since every suspect batch runs on trunk or above it. `Bisect`
-has the same limit — it ejects each singleton in turn — and keeps it: it is
-the comparison baseline, and that is what bisecting queues do. A probe on
-trunk (a `BatchStart` with no members, which the contract allows) would
-tell. The candidate: a `Trunk` cause that every run exercises, so "trunk is
-broken" is a hypothesis with a posterior like any other, and the probe a
-candidate scored like any other — run when its resolution value beats the
-alternatives, nothing held specially since every candidate's chance of
-passing already carries the trunk posterior, resumed when a probe passes;
-under the chain a probe is a finder on trunk, under the tree a candidate on
-the trunk node. How the operator is told is open. The simulator produces a
-broken trunk: a bad pull request lands on a false green at `p_miss`, every
-run on trunk fails until the repair after `trunk_fix_minutes`, a probe on
-trunk fails with them, and `trunk_broken_hours` and `ejected_good` in
-`crates/dorfq-sim/examples/busy.toml` measure what the probe would buy. The
-`TODO(trunk-broken-probe)` comment sits at `Bayes`'s suspect generation in
-`crates/dorfq-scheduler/src/bayes/policy.rs`.

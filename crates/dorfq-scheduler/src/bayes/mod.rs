@@ -1,48 +1,77 @@
 //! The model behind the Bayesian scheduler.
 //!
-//! Two kinds of cause can make a run fail. `Bad(i)`: pull request `i` fails
-//! against trunk on its own. The model holds one cleared position per queued
-//! pull request at its head — the trunk it is known good against: at first
-//! sight the trunk its own CI ran on, as the forge's `behind` reports it,
-//! moved forward by every alibi and never back, and reset when the head
-//! changes. The belief that it is bad at any position is what the landings
-//! since its cleared position regrow. `Pair(i, j)`: the two fail only
-//! together; materialised at the prior `p_interact` once a failed run
-//! exercised both, dropped when either leaves. Beyond those, any run fails
-//! for no reason with probability `p_flake`. A pull request and one of its
+//! Three kinds of cause can make a run fail. `Bad(i)`: pull request `i` fails
+//! against trunk on its own. The model holds, per queued pull request at its
+//! head, an origin — the trunk its own CI ran on at first sight, as the
+//! forge's `behind` reports it, reset when the head changes — and the
+//! alibis read since. Its belief is over windows of trunk: the origin window,
+//! its own content, which its own CI missed at `p_miss` if broken, at the
+//! prior `p_interact`; and the landings since the origin, each of which may
+//! have broken it with probability `p_interact`. `Pair(i, j)`: the two fail
+//! only together; materialised at the prior `p_interact` once a failed run
+//! exercised both, dropped when either leaves. `Trunk(o)`: trunk, or CI,
+//! broke after passing run `o` started, failing every run started after it
+//! and before the next pass; below. Beyond those, any run fails for no
+//! reason with probability `p_flake`. A pull request and one of its
 //! enqueued ancestors are never a pair: the forge reports a stacked pull
 //! request ready only when its own CI covered its ancestors.
 //!
 //! Trunk positions are the forge's count of the pull requests that reached
 //! trunk, landed by the queue or by any other hand. A run exercises `Bad` of
 //! every member of its tree (its own members and every ancestor batch's) and
-//! every pair of them. A passing run is an alibi: it clears every `Bad` it
-//! exercised at the trunk it started on, credited with its own tree's landings
-//! since, and sets every pair it exercised to a floor that inference treats as
-//! false. A pull request's own CI passing on its head is an alibi for its `Bad`
-//! alone, against the trunk that run started on. Each landing since a cleared
-//! position may have broken the pull request, with probability `p_interact` per
-//! pull request that reached trunk.
+//! every pair of them. CI misses a real break at `p_miss`, so a passing run
+//! is evidence, not proof: an alibi at the trunk it started on, credited
+//! with its own tree's landings since, that lowers the odds of every window
+//! it covers by `p_miss`; and each materialised pair it exercised is lowered
+//! the same way, no cause once below a floor. A pull request's own CI passing
+//! on its head on a later trunk is one more alibi, for its `Bad` alone.
 //!
 //! A failing run is evidence. A failed run is read at the trunk it started
-//! on: it blames a pull request only if its cleared position is behind that
-//! trunk, and only for the landings between the two, so a landing after the
-//! run's start never explains its failure and an alibi later than the run
-//! clears the pull request of it. A run leaves the evidence when nothing it
-//! could blame is left: every member's cleared position is past the run's,
-//! and its pairs are at the floor; or when a member of its tree leaves other
-//! than by landing. A member that lands takes only its own causes out of the
-//! runs it was in.
+//! on: it blames a pull request whose origin is at or behind that trunk, for
+//! its own content and the landings between the two, so a landing after the
+//! run's start never explains its failure. A run leaves the evidence when
+//! nothing it could blame is left: every member has landed and its pairs
+//! are below the floor; or when a member of its tree leaves other than by
+//! landing. A member that lands takes only its own causes out of the runs it
+//! was in.
 //!
-//! Posteriors are exact under this model: a pull request's chance of being
-//! bad is split into independent stretches of trunk at the positions of the
-//! failed runs that blame it, the evidence splits into components of runs
-//! linked by a shared cause, and each component is solved by
-//! inclusion–exclusion over its subsets of runs. A batch's chance of passing
-//! is the posterior probability that none of the causes its run exercises
-//! holds, given every failed run, from the same sums. That sum cannot be
-//! resolved when a component is explained only by many low-belief causes and
-//! flakes, and inference then stops the process rather than return noise.
+//! A break of trunk is transient: someone repairs it, and the queue sees
+//! only runs passing again. So trunk is a cause per stretch: every passing
+//! run whose tree stood on trunk opens one, and a failed run blames the
+//! stretch it started in, the latest such pass that started before it.
+//! A stretch starts at the floor `p_trunk`, the chance trunk or CI breaks
+//! for a reason the queue did not test, and is raised by each landing read
+//! while it is current, at the chance the landed batch was bad given every
+//! verdict read when it was landed, and by each change to trunk by another
+//! hand, at `p_trunk` once more. Failures between two passes share their
+//! stretch's cause, so they fall to trunk rather than to whoever was in
+//! them; a later pass leaves the explanation of the earlier failures alone.
+//! A run that blames nothing but a stretch a later pass closed leaves the
+//! evidence, and of those that blame nothing but the current stretch only
+//! as many are kept as inference reads.
+//!
+//! Once trunk is believed broken, a probe — a batch with no members, on
+//! trunk — is the candidate that tests it: its chance of passing is the
+//! current stretch's alone, and a failure that would single that stretch out
+//! is worth every queued pull request's value, all of which a broken trunk
+//! holds up. One runs at a time, waited for and retired on its verdict,
+//! or cancelled once trunk moves past its base, never landed and never
+//! built on; a pass on trunk opens a fresh stretch
+//! and the queue resumes. A pull request whose failures are capped by its
+//! stretch's trunk, one too fresh to outweigh `p_trunk`, is found across a
+//! probe, where its failures on both sides are explained by its own cause
+//! once and by trunk only as two stretches together.
+//!
+//! Posteriors are exact under this model, over the runs inference reads: a
+//! pull request's chance of being bad is split into independent windows of
+//! trunk at its origin, its alibis and the positions of the failed runs that
+//! blame it, the evidence splits into components of runs linked by a shared
+//! cause, and each component is solved by inclusion–exclusion over its
+//! subsets of runs. A batch's chance of passing is the posterior probability
+//! that none of the causes its run exercises holds, given every failed run,
+//! from the same sums, the current stretch's trunk among them. A sum
+//! explained only by many low-belief causes and flakes cannot be resolved;
+//! it is read over fewer of the component's newest runs until it can.
 
 mod chain;
 mod infer;
@@ -76,8 +105,9 @@ pub(crate) struct Bayes {
     params: BayesConfig,
     ids: Ids,
     model: Model,
-    /// Culprit finders started and still tracked; every other tracked batch,
-    /// started here or not, is a chain batch. Empty under the tree.
+    /// Culprit finders and probes started and still tracked; every other
+    /// tracked batch with members, started here or not, is a chain batch.
+    /// Empty under the tree.
     finders: BTreeSet<BatchId>,
     /// Every batch in the latest observation: its tree and the trunk its
     /// run tested.
@@ -93,6 +123,10 @@ pub(crate) struct Bayes {
     /// Each queued pull request's value this step: `1 + w_age·h` for the
     /// `h` hours since it appeared.
     values: BTreeMap<PrNumber, f64>,
+    /// Each batch a plan landed, with the chance it was bad, given every
+    /// verdict read by then: credited to the current stretch once an
+    /// observation reports it landed.
+    landing_breaks: BTreeMap<BatchId, f64>,
 }
 
 /// A tracked batch: what its run exercises and the trunk it tested.
@@ -117,6 +151,7 @@ impl Bayes {
             read: BTreeSet::new(),
             since: BTreeMap::new(),
             values: BTreeMap::new(),
+            landing_breaks: BTreeMap::new(),
         }
     }
 }

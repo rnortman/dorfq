@@ -168,9 +168,9 @@ pub(crate) fn conflicts_with(pr: u64) -> EjectReason {
 
 /// Steps `scheduler` and checks the plan: a ledger handed `observation`
 /// accepts every item in rule 7's order, as a forge's would (rules 5 and
-/// 6); every new batch has members (these policies start no probes); and no
-/// pull request is in two new batches, or in a new batch and a tracked one
-/// this plan does not retire.
+/// 6); at most one new batch has no members, a probe, and it is based on
+/// trunk or an observed tip; and no pull request is in two new batches, or
+/// in a new batch and a tracked one this plan does not retire.
 pub(crate) fn step(scheduler: &mut impl Scheduler, observation: &Observation) -> Plan {
     let plan = scheduler
         .step(observation)
@@ -206,8 +206,19 @@ pub(crate) fn step(scheduler: &mut impl Scheduler, observation: &Observation) ->
             seen.extend(batch.members.iter().map(|m| m.pr));
         }
     }
+    let probes: Vec<&BatchStart> = plan.start.iter().filter(|s| s.prs.is_empty()).collect();
+    assert!(probes.len() <= 1, "more than one probe: {plan:?}");
+    for probe in probes {
+        assert!(
+            probe.base == observation.trunk
+                || observation
+                    .batches
+                    .iter()
+                    .any(|b| b.state.tip() == Some(&probe.base)),
+            "a probe on neither trunk nor a tip: {plan:?}"
+        );
+    }
     for start in &plan.start {
-        assert!(!start.prs.is_empty(), "{plan:?}");
         for pr in &start.prs {
             assert!(seen.insert(*pr), "{pr:?} started twice: {plan:?}");
         }

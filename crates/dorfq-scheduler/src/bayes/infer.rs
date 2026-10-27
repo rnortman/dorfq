@@ -1,11 +1,13 @@
 //! Exact posteriors over the evidence, by inclusion–exclusion.
 //!
-//! A failed run blames a pull request only for the landings between its
-//! cleared position and the trunk the run started on, so the inference's
-//! variables are, per pull request, the stretches of trunk between the
-//! positions of the runs that blame it, each broken independently; and the
-//! pairs. A run exercises every stretch of a pull request it blames up to
-//! its own position.
+//! A failed run blames a pull request for its own content and for the
+//! landings between its origin and the trunk the run started on, so the
+//! inference's variables are, per pull request, its origin window and the
+//! windows of trunk between its origin, its alibis and the positions of the
+//! runs that blame it, each broken independently and each discounted by the
+//! alibis that cover it; the pairs; and each stretch's trunk. A run
+//! exercises every window of a pull request it blames up to its own position,
+//! and the trunk of the stretch it started in.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -20,11 +22,13 @@ pub(crate) const MAX_COMPONENT_RUNS: usize = 12;
 
 /// The largest estimated rounding error a posterior may carry. A component
 /// whose failure is too improbable for the alternating sum to resolve
-/// exceeds it, and inference fails rather than return noise.
+/// exceeds it, and is read over fewer runs.
 const MAX_ERROR: f64 = 1e-2;
 
 /// A component whose posteriors the alternating sum cannot resolve to
-/// [`MAX_ERROR`].
+/// [`MAX_ERROR`] even over its newest run alone. No valid configuration
+/// reaches it: every run exercises its stretch's trunk at a belief above
+/// the floor, so one run's chance of failing is above the floor too.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Unresolved {
     runs: usize,
@@ -48,10 +52,10 @@ impl Error for Unresolved {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Var {
     /// Something reaching trunk in positions `(from, to]` broke the pull
-    /// request.
+    /// request; `(origin, origin]` is its own content.
     Seg(PrNumber, i64, i64),
-    /// The pair cause.
-    Pair(Cause),
+    /// A pair cause, or a stretch's trunk cause: one variable each.
+    One(Cause),
 }
 
 /// A cause's posterior in one failed run: the chance it held on the trunk
@@ -94,9 +98,7 @@ impl Inference {
             }
             let all: Vec<(i64, &BTreeSet<Cause>)> =
                 runs.iter().map(|&r| (at[r], &effective[r])).collect();
-            let component = Solved::new(model, &all, kept(runs).len());
-            component.sum.check()?;
-            solved.push(component);
+            solved.push(Solved::new(model, &all, kept(runs).len())?);
         }
         Ok(Inference {
             effective,
@@ -108,8 +110,8 @@ impl Inference {
     }
 
     /// The probability that no cause in `causes` holds now, given that every
-    /// run inference read failed. `Bad(x)` is every stretch of `x` since its
-    /// cleared position.
+    /// run inference read failed. `Bad(x)` is every window of `x` since its
+    /// origin.
     ///
     /// Components are independent given the evidence, and a cause in none
     /// is independent of everything, so the result is a product: `1 − p_c`
@@ -177,6 +179,11 @@ impl Inference {
         &self.effective[r]
     }
 
+    /// The trunk position run `r` started on.
+    pub(crate) fn run_at(&self, r: usize) -> i64 {
+        self.at[r]
+    }
+
     /// The posteriors were a further run, started now, to fail blaming
     /// `extra`: for each run inference would read in the component that run
     /// would join, oldest first and the hypothetical run last, its batch and
@@ -195,14 +202,14 @@ impl Inference {
             .flat_map(|c| self.components[c].iter().copied())
             .collect();
         runs.sort_unstable();
-        let kept = &runs[runs.len().saturating_sub(MAX_COMPONENT_RUNS - 1)..];
         let mut all: Vec<(i64, &BTreeSet<Cause>)> = runs
             .iter()
             .map(|&r| (self.at[r], &self.effective[r]))
             .collect();
         all.push((model.position(), extra));
-        let solved = Solved::new(model, &all, kept.len() + 1);
-        solved.sum.check()?;
+        let read = (runs.len() + 1).min(MAX_COMPONENT_RUNS);
+        let solved = Solved::new(model, &all, read)?;
+        let kept = &runs[runs.len() + 1 - solved.read..];
         let evidence = model.evidence();
         let of_run = |at: i64, causes: &BTreeSet<Cause>| -> RunPosteriors {
             causes
@@ -232,15 +239,23 @@ struct Solved {
     /// The variables each read run exercises, oldest first.
     sets: Vec<BTreeSet<Var>>,
     sum: Alternating<Var>,
+    /// How many of the component's newest runs the sums read.
+    read: usize,
 }
 
 impl Solved {
     /// The variables of a component whose runs are `all`, each run's
     /// position and effective causes, oldest first, of which inference reads
-    /// the newest `read`. A pull request's stretches are cut at its cleared
-    /// position, at the position of every run of `all` that blames it and at
-    /// the model's position.
-    fn new(model: &Model, all: &[(i64, &BTreeSet<Cause>)], read: usize) -> Solved {
+    /// the newest `read`, or as many fewer as it takes for the sums to
+    /// resolve to [`MAX_ERROR`]. A pull request's windows are cut at its
+    /// origin, its alibis, the position of every run of `all` that blames it
+    /// and the model's position. Fails only when the newest run alone
+    /// cannot be resolved.
+    fn new(
+        model: &Model,
+        all: &[(i64, &BTreeSet<Cause>)],
+        read: usize,
+    ) -> Result<Solved, Unresolved> {
         let mut bounds: BTreeMap<PrNumber, BTreeSet<i64>> = BTreeMap::new();
         let mut belief: BTreeMap<Var, f64> = BTreeMap::new();
         for &(at, causes) in all {
@@ -249,20 +264,18 @@ impl Solved {
                     Cause::Bad(x) => {
                         bounds.entry(x).or_default().insert(at);
                     }
-                    Cause::Pair(..) => {
-                        belief.insert(Var::Pair(cause), model.belief(cause));
+                    Cause::Pair(..) | Cause::Trunk(_) => {
+                        belief.insert(Var::One(cause), model.belief(cause));
                     }
                 }
             }
         }
-        for (&x, cuts) in &mut bounds {
-            let cleared = model.cleared(x).expect("a blamed pull request is held");
-            cuts.insert(cleared);
-            cuts.insert(model.position());
-            let cuts: Vec<i64> = cuts.iter().copied().collect();
-            for w in cuts.windows(2) {
-                let (a, b) = (w[0], w[1]);
-                belief.insert(Var::Seg(x, a, b), model.regrown(b - a));
+        for (&x, cuts) in &bounds {
+            let windows = model
+                .windows(x, cuts.iter().copied())
+                .expect("a blamed pull request is held");
+            for (a, b, p) in windows {
+                belief.insert(Var::Seg(x, a, b), p);
             }
         }
         let sets: Vec<BTreeSet<Var>> = all[all.len() - read..]
@@ -275,29 +288,45 @@ impl Solved {
                             .filter(|(var, _)| matches!(var, Var::Seg(_, _, to) if *to <= at))
                             .map(|(var, _)| var)
                             .collect(),
-                        Cause::Pair(..) => vec![Var::Pair(cause)],
+                        Cause::Pair(..) | Cause::Trunk(_) => vec![Var::One(cause)],
                     })
                     .collect()
             })
             .collect();
-        let refs: Vec<&BTreeSet<Var>> = sets.iter().collect();
-        let sum = Alternating::over(&refs, |var| belief[&var], model.priors.p_flake);
-        Solved { belief, sets, sum }
+        let mut error = None;
+        for skip in 0..sets.len() {
+            let refs: Vec<&BTreeSet<Var>> = sets[skip..].iter().collect();
+            let sum = Alternating::over(&refs, |var| belief[&var], model.priors.p_flake);
+            match sum.check() {
+                Ok(()) => {
+                    let sets = sets[skip..].to_vec();
+                    let read = sets.len();
+                    return Ok(Solved {
+                        belief,
+                        sets,
+                        sum,
+                        read,
+                    });
+                }
+                Err(unresolved) => error = Some(unresolved),
+            }
+        }
+        Err(error.expect("a component has a run"))
     }
 
-    /// The variables of `cause`: every stretch of a pull request, or the
-    /// pair.
+    /// The variables of `cause`: every window of a pull request, the pair,
+    /// or the stretch's trunk.
     fn vars(&self, cause: Cause) -> Vec<Var> {
         match cause {
             Cause::Bad(x) => segments(&self.belief, x).map(|(var, _)| var).collect(),
-            Cause::Pair(..) => vec![Var::Pair(cause)],
+            Cause::Pair(..) | Cause::Trunk(_) => vec![Var::One(cause)],
         }
     }
 
     /// The posterior of `cause` at position `at`: for a pull request, that
-    /// a stretch of it ending at or before `at` holds.
+    /// a window of it ending at or before `at` holds.
     ///
-    /// A pull request's stretches `s_1 … s_k`, oldest first, are exercised
+    /// A pull request's windows `s_1 … s_k`, oldest first, are exercised
     /// by nested sets of runs `M_1 ⊇ … ⊇ M_k`, so a run set `S` meets every
     /// `M_i` up to some `j` and none beyond; summing the alternating terms
     /// by that `j`, with `G_j = g[F ∖ M_j]`,
@@ -310,8 +339,8 @@ impl Solved {
                 .given(self.sum.masks.get(&var).copied().unwrap_or(0))
         };
         let segments: Vec<(f64, f64)> = match cause {
-            Cause::Pair(..) => {
-                let var = Var::Pair(cause);
+            Cause::Pair(..) | Cause::Trunk(_) => {
+                let var = Var::One(cause);
                 let p = self.belief.get(&var).copied().unwrap_or(0.0);
                 return (p * given(var) / fail).clamp(0.0, 1.0);
             }
@@ -348,7 +377,8 @@ impl Solved {
     }
 }
 
-/// Pull request `x`'s stretches in `belief`, oldest first.
+/// Pull request `x`'s windows in `belief`, origin window first, then oldest
+/// first.
 fn segments(belief: &BTreeMap<Var, f64>, x: PrNumber) -> impl Iterator<Item = (Var, f64)> + '_ {
     belief
         .range(Var::Seg(x, i64::MIN, i64::MIN)..=Var::Seg(x, i64::MAX, i64::MAX))
@@ -362,7 +392,7 @@ fn kept(runs: &[usize]) -> &[usize] {
 }
 
 /// Partitions runs into components linked by a shared cause. Two runs that
-/// blame one pull request share its oldest stretch, so these are the
+/// blame one pull request share its origin window, so these are the
 /// components of the variables too.
 fn components(effective: &[BTreeSet<Cause>]) -> Vec<Vec<usize>> {
     let mut parent: Vec<usize> = (0..effective.len()).collect();
@@ -467,9 +497,6 @@ impl<K: Ord + Copy> Alternating<K> {
         // against brute force this estimate runs well above the error, by a
         // factor that varies with the component.
         let error = f64::EPSILON * self.magnitude / fail;
-        // TODO(bayes-posterior-precision): a component explained only by
-        // low-belief causes cannot be resolved, so inference fails here rather
-        // than eject on noise; recovering instead is unbuilt.
         if fail > 0.0 && error < MAX_ERROR {
             Ok(())
         } else {
@@ -497,10 +524,13 @@ fn subset_sums(v: &mut [f64]) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::model::Priors;
-    use super::super::test_support::{bad, members, model, pair, prior, priors};
+    use super::super::model::{FLOOR, Priors};
+    use super::super::test_support::{
+        bad, failed_alone, members, model, pair, params, prior, priors,
+    };
     use super::*;
     use crate::test_support::{ready, stacked, stale};
+    use crate::{BayesConfig, SchedulerConfig};
     use dorfq_core::{BatchId, PrSnapshot};
 
     fn bads(ns: &[u64]) -> BTreeSet<Cause> {
@@ -604,13 +634,31 @@ mod tests {
     }
 
     /// `P(no variable of none holds | every run failed)` by summing over
-    /// every assignment.
+    /// every assignment. Variables in the same runs, and alike in or out
+    /// of `none`, act as one, so each such group is enumerated as one.
     fn brute_none<K: Ord + Copy>(
         runs: &[BTreeSet<K>],
         none: &BTreeSet<K>,
         belief: impl Fn(K) -> f64,
     ) -> f64 {
-        let (vars, weights) = weights(runs, none, belief);
+        let mut groups: BTreeMap<(Vec<usize>, bool), f64> = BTreeMap::new();
+        for &var in runs.iter().flatten().chain(none) {
+            groups.entry(group_of(runs, none, var)).or_insert(1.0);
+        }
+        let unique: BTreeSet<K> = runs.iter().flatten().chain(none).copied().collect();
+        for var in unique {
+            *groups.get_mut(&group_of(runs, none, var)).unwrap() *= 1.0 - belief(var);
+        }
+        let keys: Vec<&(Vec<usize>, bool)> = groups.keys().collect();
+        let merged: Vec<BTreeSet<usize>> = (0..runs.len())
+            .map(|r| {
+                (0..keys.len())
+                    .filter(|&g| keys[g].0.contains(&r))
+                    .collect()
+            })
+            .collect();
+        let none: BTreeSet<usize> = (0..keys.len()).filter(|&g| keys[g].1).collect();
+        let (vars, weights) = weights(&merged, &none, |g| 1.0 - groups[keys[g]]);
         let mask: usize = vars
             .iter()
             .enumerate()
@@ -618,6 +666,14 @@ mod tests {
             .map(|(i, _)| 1 << i)
             .sum();
         share(&weights, mask)
+    }
+
+    /// The runs `var` is in, and whether it is in `none`.
+    fn group_of<K: Ord>(runs: &[BTreeSet<K>], none: &BTreeSet<K>, var: K) -> (Vec<usize>, bool) {
+        let within = (0..runs.len())
+            .filter(|&r| runs[r].contains(&var))
+            .collect();
+        (within, none.contains(&var))
     }
 
     fn assert_close<K: Ord + Copy + fmt::Debug>(got: &BTreeMap<K, f64>, want: &BTreeMap<K, f64>) {
@@ -644,7 +700,7 @@ mod tests {
             .zip(&effective)
             .map(|(run, causes)| (run.at, causes))
             .collect();
-        Solved::new(model, &all, all.len())
+        Solved::new(model, &all, all.len()).unwrap()
     }
 
     /// `P(cause holds at position at | every run failed)` by brute force
@@ -693,51 +749,90 @@ mod tests {
     #[test]
     fn a_chain_whose_child_passed_is_read_through_its_alibi() {
         // Parent {1, 2} failed; child {3} on it failed; child {4} on the
-        // parent passed, clearing 1, 2 and their pair.
+        // parent passed, discounting 1, 2 and their pair.
         let mut model = model(&[1, 2, 3, 4]);
         model.failed(BatchId(1), &members(&[1, 2]), 0);
         model.failed(BatchId(2), &members(&[1, 2, 3]), 0);
-        model.passed(&members(&[1, 2, 4]), 0);
-        assert_eq!(model.evidence().len(), 1);
-        let run = &model.evidence()[0];
-        assert_eq!(
-            model.effective(run).collect::<Vec<_>>(),
-            vec![bad(3), pair(1, 3), pair(2, 3)]
-        );
+        model.passed_after(&members(&[1, 2, 4]), 0);
+        assert_eq!(model.evidence().len(), 2);
         assert_model_matches_brute_force(&model);
-        // A grandchild that passes clears the whole chain: a flake.
-        model.passed(&members(&[1, 2, 3]), 0);
-        assert!(model.evidence().is_empty());
-        assert_eq!(
-            Inference::of(&model).unwrap().posterior(&model, bad(3)),
-            0.0
-        );
+        let three = Inference::of(&model).unwrap().posterior(&model, bad(3));
+        // A grandchild that passes discounts the whole chain: both runs
+        // stay, and 3 is no longer the likely cause.
+        model.passed_after(&members(&[1, 2, 3]), 0);
+        assert_eq!(model.evidence().len(), 2);
+        assert_model_matches_brute_force(&model);
+        let after = Inference::of(&model).unwrap().posterior(&model, bad(3));
+        assert!(after < three / 5.0, "{after} against {three}");
+        assert!(after > 0.0, "{after}");
     }
 
     #[test]
     fn a_pair_only_explanation_matches_brute_force() {
         let mut model = model(&[1, 2]);
         model.failed(BatchId(1), &members(&[1, 2]), 0);
-        model.passed(&members(&[1]), 0);
-        model.passed(&members(&[2]), 0);
+        model.passed_after(&members(&[1]), 0);
+        model.passed_after(&members(&[2]), 0);
         assert_model_matches_brute_force(&model);
         let p = Inference::of(&model).unwrap().posterior(&model, pair(1, 2));
-        assert!(
-            (p - 0.002 / (0.002 + 0.998 * priors().p_flake)).abs() < 1e-12,
-            "{p}"
-        );
+        let each = 1.0 - model.belief(bad(1));
+        let fail = 1.0 - (1.0 - priors().p_flake) * each * each * 0.998 * 0.999;
+        assert!((p - 0.002 / fail).abs() < 1e-12, "{p}");
+        assert!(p > 0.05, "{p}");
     }
 
     #[test]
-    fn a_cleared_cause_leaves_the_component() {
+    fn a_discounted_cause_stays_in_the_component_below_the_others() {
         let mut model = model(&[1, 2, 3, 4]);
         model.failed(BatchId(1), &members(&[1, 2, 3]), 0);
         model.failed(BatchId(2), &members(&[3, 4]), 0);
-        model.passed(&members(&[2]), 0);
+        model.passed_after(&members(&[2]), 0);
         assert_model_matches_brute_force(&model);
         let inference = Inference::of(&model).unwrap();
-        assert!(!inference.effective[0].contains(&bad(2)));
-        assert_eq!(inference.posterior(&model, bad(2)), 0.0);
+        assert!(inference.effective[0].contains(&bad(2)));
+        let two = inference.posterior(&model, bad(2));
+        let one = inference.posterior(&model, bad(1));
+        assert!(two > 0.0 && two < one / 10.0, "{two} against {one}");
+    }
+
+    #[test]
+    fn an_alibi_cuts_a_window_and_discounts_what_it_covers() {
+        // 1 at origin −5: fails at 0 beside 2, passes alone covered at 4,
+        // fails at 7 beside 3.
+        let prs = |landings: u32| -> Vec<PrSnapshot> {
+            (1..=3).map(|n| stale(ready(n), 5 + landings)).collect()
+        };
+        let mut model = Model::new(priors());
+        model.sync(&prs(0), &BTreeSet::new(), 0, 0);
+        model.failed(BatchId(1), &members(&[1, 2]), 0);
+        model.sync(&prs(4), &BTreeSet::new(), 4, 0);
+        model.passed_after(&members(&[1]), 4);
+        model.sync(&prs(7), &BTreeSet::new(), 7, 0);
+        model.failed(BatchId(2), &members(&[1, 3]), 7);
+        let one = PrNumber(1);
+        let inference = Inference::of(&model).unwrap();
+        let solved = &inference.solved[0];
+        let windows: Vec<(Var, f64, usize)> = segments(&solved.belief, one)
+            .map(|(var, p)| (var, p, solved.sum.masks[&var]))
+            .collect();
+        assert_eq!(
+            windows,
+            vec![
+                (Var::Seg(one, -5, -5), model.discounted(0.002, 2), 0b11),
+                (
+                    Var::Seg(one, -5, 0),
+                    model.discounted(model.regrown(5), 1),
+                    0b11
+                ),
+                (
+                    Var::Seg(one, 0, 4),
+                    model.discounted(model.regrown(4), 1),
+                    0b10
+                ),
+                (Var::Seg(one, 4, 7), model.regrown(3), 0b10),
+            ]
+        );
+        assert_model_matches_brute_force(&model);
     }
 
     #[test]
@@ -794,14 +889,21 @@ mod tests {
 
     #[test]
     fn components_are_runs_linked_by_a_shared_cause() {
-        let mut model = model(&[1, 2, 3, 4, 5]);
+        let mut model = model(&[1, 2, 3, 4, 5, 6]);
         model.failed(BatchId(1), &members(&[1, 2]), 0);
-        model.failed(BatchId(2), &members(&[4]), 0);
-        model.failed(BatchId(3), &members(&[2, 3]), 0);
-        model.failed(BatchId(4), &members(&[5]), 0);
-        model.failed(BatchId(5), &members(&[4, 5]), 0);
+        model.passed(BatchId(2), &[], 0, true);
+        model.failed(BatchId(3), &members(&[4]), 0);
+        model.passed(BatchId(4), &[], 0, true);
+        model.failed(BatchId(5), &members(&[2, 3]), 0);
+        model.failed(BatchId(6), &members(&[6]), 0);
+        model.passed(BatchId(7), &[], 0, true);
+        model.failed(BatchId(8), &members(&[5]), 0);
+        model.failed(BatchId(9), &members(&[4, 5]), 0);
+        // Runs 1 and 5 share 2, and 5 and 6 their stretch; 3 shares 4 with
+        // 9, and 8 its stretch and 5.
         let inference = Inference::of(&model).unwrap();
-        assert_eq!(inference.components(), &[vec![0, 2], vec![1, 3, 4]]);
+        assert_eq!(inference.components(), &[vec![0, 2, 3], vec![1, 4, 5]]);
+        assert_model_matches_brute_force(&model);
     }
 
     #[test]
@@ -817,9 +919,11 @@ mod tests {
         // 1 appears only in the two runs left out, so it keeps its belief.
         assert!((inference.posterior(&model, bad(1)) - prior()).abs() < 1e-15);
         assert!((inference.posterior(&model, pair(1, 2)) - 0.002).abs() < 1e-15);
-        let lone = vec![bads(&[2]); MAX_COMPONENT_RUNS];
+        let trunk = Cause::Trunk(None);
+        let lone = vec![BTreeSet::from([bad(2), trunk]); MAX_COMPONENT_RUNS];
         let refs: Vec<&BTreeSet<Cause>> = lone.iter().collect();
-        let want = posteriors(&refs, |_| prior(), priors().p_flake).unwrap()[&bad(2)];
+        let belief = |c| if c == trunk { 0.001 } else { prior() };
+        let want = posteriors(&refs, belief, priors().p_flake).unwrap()[&bad(2)];
         assert!((inference.posterior(&model, bad(2)) - want).abs() < 1e-12);
     }
 
@@ -840,6 +944,173 @@ mod tests {
                 got[&cause]
             );
         }
+    }
+
+    #[test]
+    fn the_newest_run_alone_resolves_at_every_valid_prior() {
+        // Every run, hypothetical ones included, exercises its stretch's
+        // trunk at a belief above `FLOOR`, so its chance of failing is above
+        // `FLOOR`, and a single run's sum, of terms at most 2 in magnitude,
+        // resolves: `Unresolved` is out of reach of every configuration the
+        // validator accepts, at both ends of each prior's range.
+        let low = FLOOR * (1.0 + 1e-9);
+        let high = 1.0 - f64::EPSILON;
+        for p_flake in [f64::MIN_POSITIVE, high] {
+            for p_miss in [f64::MIN_POSITIVE, high] {
+                for p_interact in [low, high] {
+                    for p_trunk in [low, high] {
+                        let config = BayesConfig {
+                            p_interact,
+                            p_flake,
+                            p_miss,
+                            p_trunk,
+                            ..params()
+                        };
+                        assert_eq!(SchedulerConfig::Bayes(config).validate(), Ok(()));
+                        for behind in [0, u32::MAX] {
+                            let mut model = Model::new(config.priors());
+                            let prs: Vec<PrSnapshot> =
+                                (1..=3).map(|n| stale(ready(n), behind)).collect();
+                            model.sync(&prs, &BTreeSet::new(), 0, 0);
+                            model.passed(BatchId(1), &members(&[1]), 0, true);
+                            model.failed(BatchId(2), &members(&[1, 2]), 0);
+                            let inference = Inference::of(&model)
+                                .unwrap_or_else(|e| panic!("{config:?}, {behind}: {e}"));
+                            assert_eq!(inference.solved[0].read, 1);
+                            // A hypothetical run joins it through the
+                            // current stretch's trunk, and resolves too.
+                            let extra = model.would_blame(&members(&[3]));
+                            inference
+                                .with_failure(&model, &extra)
+                                .unwrap_or_else(|e| panic!("{config:?}, {behind}: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unresolvable_component_is_read_over_fewer_runs() {
+        // Eleven chained runs whose causes all sit near the floor, one
+        // landing above it: the sum over all eleven cannot be resolved.
+        let prs: Vec<u64> = (1..=12).collect();
+        let model = apart(0.002, 1, &prs, &chain_of(11));
+        let inference = Inference::of(&model).unwrap();
+        let read = inference.solved[0].read;
+        assert!(read < 11, "{read}");
+        let alone = apart(0.002, 1, &prs, &chain_of(11)[11 - read..]);
+        let alone_inference = Inference::of(&alone).unwrap();
+        assert_eq!(alone_inference.solved[0].read, read);
+        for n in 1..=12 {
+            let (got, want) = (
+                inference.posterior(&model, bad(n)),
+                alone_inference.posterior(&alone, bad(n)),
+            );
+            assert!((got - want).abs() < 1e-12, "{n}: {got} against {want}");
+        }
+    }
+
+    #[test]
+    fn a_stretch_s_trunk_cause_links_its_runs_and_resolves_their_sum() {
+        // Twelve pull requests one landing behind, each failing alone in
+        // one stretch: nothing links the runs but the stretch's trunk.
+        let prs: Vec<u64> = (1..=12).collect();
+        let runs: Vec<BTreeSet<Cause>> = prs.iter().map(|&n| bads(&[n])).collect();
+        let model = hand(0.002, 1, &prs, &runs);
+        let inference = Inference::of(&model).unwrap();
+        assert_eq!(inference.components(), &[(0..12).collect::<Vec<_>>()]);
+        assert_eq!(inference.solved[0].read, 12);
+        let trunk = inference.posterior(&model, Cause::Trunk(None));
+        assert!(trunk > 0.99, "{trunk}");
+        for &n in &prs {
+            let p = inference.posterior(&model, bad(n));
+            assert!(p < 0.1, "{n}: {p}");
+        }
+    }
+
+    /// Pull request 1's cluster: a failed run of 1 with a batch-mate of its
+    /// own, from 2 up; pull request 20's the same, mates from 21 up.
+    /// Fourteen runs, ids from 1: four of A then three of B, then, when
+    /// `pass` holds, a pass on trunk over the unrelated 40 (batch 8), then
+    /// three of A and four of B. `skip` leaves out the oldest runs.
+    fn two_clusters(pass: bool, skip: usize) -> Model {
+        let mut prs: Vec<u64> = (1..=8).chain(20..=27).collect();
+        prs.push(40);
+        let mut model = model(&prs);
+        let (mut a, mut b) = (2..=8, 21..=27);
+        let mut runs: Vec<Vec<u64>> = Vec::new();
+        for (n_a, n_b) in [(4, 3), (3, 4)] {
+            runs.extend((0..n_a).map(|_| vec![1, a.next().unwrap()]));
+            runs.extend((0..n_b).map(|_| vec![20, b.next().unwrap()]));
+        }
+        for (i, tree) in runs.iter().enumerate() {
+            let id = i as u64 + if i < 7 { 1 } else { 2 };
+            if pass && i == 7 {
+                model.passed(BatchId(8), &members(&[40]), 0, true);
+            }
+            if i >= skip {
+                model.failed(BatchId(id), &members(tree), 0);
+            }
+        }
+        model
+    }
+
+    #[test]
+    fn two_clusters_across_a_stretch_boundary_past_the_read_limit_are_each_singled_out() {
+        let model = two_clusters(true, 0);
+        let inference = Inference::of(&model).unwrap();
+        assert_eq!(inference.components(), &[(0..14).collect::<Vec<_>>()]);
+        assert_eq!(inference.solved[0].read, MAX_COMPONENT_RUNS);
+        // The newest A run is 9, the newest B run 13.
+        for (r, culprit) in [(9, bad(1)), (13, bad(20))] {
+            for (cause, p) in inference.run_posteriors(r) {
+                if cause == culprit {
+                    assert!(p > 0.999, "{r} {cause:?}: {p}");
+                } else {
+                    assert!(p < 0.1, "{r} {cause:?}: {p}");
+                }
+            }
+        }
+        for trunk in [Cause::Trunk(None), Cause::Trunk(Some(BatchId(8)))] {
+            let p = inference.posterior(&model, trunk);
+            assert!(p < 0.1, "{trunk:?}: {p}");
+        }
+        // The two A runs left unread change nothing.
+        let read = two_clusters(true, 2);
+        let read_inference = Inference::of(&read).unwrap();
+        assert_eq!(read_inference.solved[0].read, MAX_COMPONENT_RUNS);
+        let causes = inference.component_causes(&inference.components()[0]);
+        for cause in causes {
+            let (got, want) = (
+                inference.posterior(&model, cause),
+                read_inference.posterior(&read, cause),
+            );
+            assert!(
+                (got - want).abs() < 1e-12,
+                "{cause:?}: {got} against {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_clusters_in_one_stretch_compete_with_its_trunk_cause_and_neither_is_singled_out() {
+        let model = two_clusters(false, 0);
+        let inference = Inference::of(&model).unwrap();
+        assert_eq!(inference.components(), &[(0..14).collect::<Vec<_>>()]);
+        assert_eq!(inference.solved[0].read, MAX_COMPONENT_RUNS);
+        // Bad(1) ∧ Bad(20), about 2.4e-3, against Trunk(None) alone at 1e-3.
+        for (r, culprit) in [(9, bad(1)), (13, bad(20))] {
+            let p = inference
+                .run_posteriors(r)
+                .into_iter()
+                .find(|&(cause, _)| cause == culprit)
+                .unwrap()
+                .1;
+            assert!(0.6 < p && p < 0.8, "{r} {culprit:?}: {p}");
+        }
+        let trunk = inference.posterior(&model, Cause::Trunk(None));
+        assert!(0.2 < trunk && trunk < 0.4, "{trunk}");
     }
 
     #[test]
@@ -896,10 +1167,21 @@ mod tests {
                 stale(pr, behind)
             })
             .collect();
-        model.sync(&snapshots, &BTreeSet::new(), 0);
+        model.sync(&snapshots, &BTreeSet::new(), 0, 0);
         for (id, run) in runs.iter().enumerate() {
             let tree: Vec<u64> = run.iter().flat_map(Cause::prs).map(|pr| pr.0).collect();
             model.failed(BatchId(id as u64), &members(&tree), 0);
+        }
+        model
+    }
+
+    /// [`hand`], but with a pass on trunk before each run, so that no two
+    /// runs share a stretch.
+    fn apart(p_interact: f64, behind: u32, prs: &[u64], runs: &[BTreeSet<Cause>]) -> Model {
+        let mut model = hand(p_interact, behind, prs, &[]);
+        for (id, run) in runs.iter().enumerate() {
+            let tree: Vec<u64> = run.iter().flat_map(Cause::prs).map(|pr| pr.0).collect();
+            failed_alone(&mut model, id as u64, &members(&tree));
         }
         model
     }
@@ -932,12 +1214,13 @@ mod tests {
     }
 
     #[test]
-    fn p_none_of_a_whole_run_is_its_flake() {
+    fn p_none_of_a_whole_run_is_its_flake_or_its_trunk() {
         let model = hand(0.002, 25, &[1, 2, 3], &[bads(&[1, 2, 3])]);
         let got = none_matches_brute_force(&model, &bads(&[1, 2, 3]));
         let none = (1.0 - prior()).powi(3);
-        let fail = 1.0 - 0.98 * none;
-        assert!((got - 0.02 * none / fail).abs() < 1e-12, "{got}");
+        let fail = 1.0 - 0.98 * none * 0.999;
+        let other = 0.02 + 0.98 * 0.001;
+        assert!((got - other * none / fail).abs() < 1e-12, "{got}");
     }
 
     #[test]
@@ -945,7 +1228,7 @@ mod tests {
         let prs: Vec<u64> = (25..=31).collect();
         let unit = bads(&prs);
         let runs = [unit.clone(), unit.clone()];
-        let model = hand(0.001, 5, &prs, &runs);
+        let model = apart(0.001, 5, &prs, &runs);
         let joint = none_matches_brute_force(&model, &unit);
         let inference = Inference::of(&model).unwrap();
         let marginals: f64 = unit
@@ -953,9 +1236,9 @@ mod tests {
             .map(|&c| 1.0 - inference.posterior(&model, c))
             .product();
         assert!(joint < 0.02 && marginals > 0.3, "{joint} {marginals}");
-        let model = hand(0.001, 1, &prs, &runs);
+        let model = apart(0.001, 1, &prs, &runs);
         let joint = none_matches_brute_force(&model, &unit);
-        assert!((joint - 0.054).abs() < 1e-3, "{joint}");
+        assert!((joint - 0.058).abs() < 1e-3, "{joint}");
     }
 
     #[test]
@@ -968,30 +1251,34 @@ mod tests {
     #[test]
     fn p_none_multiplies_over_the_components_it_touches() {
         let runs = [bads(&[1, 2]), bads(&[3, 4])];
-        let model = hand(0.002, 25, &[1, 2, 3, 4, 9], &runs);
+        let model = apart(0.002, 25, &[1, 2, 3, 4, 9], &runs);
         none_matches_brute_force(&model, &bads(&[1, 3, 9]));
         // The component of 3 and 4 is untouched and contributes nothing.
         let one = none_matches_brute_force(&model, &bads(&[1, 2]));
-        let alone = hand(0.002, 25, &[1, 2], &runs[..1]);
+        let alone = apart(0.002, 25, &[1, 2], &runs[..1]);
         let alone = none_matches_brute_force(&alone, &bads(&[1, 2]));
         assert!((one - alone).abs() < 1e-15, "{one} {alone}");
     }
 
     #[test]
     fn p_none_resolves_a_stripped_sum_below_the_rounding_noise() {
-        // Twelve failures of {1, 2}: with both stripped only flakes are
-        // left, and the stripped sum is p_flake^12.
+        // Twelve failures of {1, 2}: with both and their stretch's trunk
+        // stripped only flakes are left, and the stripped sum is p_flake^12.
+        let trunk = Cause::Trunk(None);
         let runs = vec![bads(&[1, 2]); MAX_COMPONENT_RUNS];
         let model = hand(0.001, 1, &[1, 2], &runs);
-        let got = none_matches_brute_force(&model, &bads(&[1, 2]));
+        let mut strip = bads(&[1, 2]);
+        strip.insert(trunk);
+        let got = none_matches_brute_force(&model, &strip);
         assert!(got < 1e-9, "{got}");
-        // Runs {x, r, r + 1}: stripped of x, a chain of ten whose sum the
-        // relative check rejects, while the component's own sum resolves.
+        // Runs {x, r, r + 1}: stripped of x and trunk, a chain of ten whose
+        // sum the relative check rejects, while the component's own sum
+        // resolves.
         let x = 100;
         let chain: Vec<BTreeSet<Cause>> = (1..=10).map(|r| bads(&[x, r, r + 1])).collect();
         let prs: Vec<u64> = (1..=11).chain([x]).collect();
         let model = hand(0.001, 1, &prs, &chain);
-        let got = none_matches_brute_force(&model, &bads(&[x]));
+        let got = none_matches_brute_force(&model, &BTreeSet::from([bad(x), trunk]));
         assert!(got < 1e-9, "{got}");
         let stripped = chain_of(10);
         let refs: Vec<&BTreeSet<Cause>> = stripped.iter().collect();
@@ -1006,11 +1293,11 @@ mod tests {
             (1..=3).map(|n| stale(ready(n), 5 + landings)).collect()
         };
         let mut model = Model::new(priors());
-        model.sync(&prs(0), &BTreeSet::new(), 0);
+        model.sync(&prs(0), &BTreeSet::new(), 0, 0);
         model.failed(BatchId(1), &members(&[1, 2]), 0);
-        model.sync(&prs(4), &BTreeSet::new(), 4);
+        model.sync(&prs(4), &BTreeSet::new(), 4, 0);
         model.failed(BatchId(2), &members(&[1, 3]), 4);
-        model.sync(&prs(7), &BTreeSet::new(), 7);
+        model.sync(&prs(7), &BTreeSet::new(), 7, 0);
         model.failed(BatchId(3), &members(&[1]), 7);
         let one = PrNumber(1);
         let inference = Inference::of(&model).unwrap();
@@ -1021,6 +1308,7 @@ mod tests {
         assert_eq!(
             stretches,
             vec![
+                (Var::Seg(one, -5, -5), model.discounted(0.002, 1), 0b111),
                 (Var::Seg(one, -5, 0), model.regrown(5), 0b111),
                 (Var::Seg(one, 0, 4), model.regrown(4), 0b110),
                 (Var::Seg(one, 4, 7), model.regrown(3), 0b100),
@@ -1040,35 +1328,46 @@ mod tests {
         assert!(at[0] < at[1] && at[1] < at[2], "{at:?}");
         assert_eq!(inference.posterior(&model, bad(1)), at[2]);
 
-        // 3 passes covered at 4: the run started at 4 no longer blames it.
-        model.passed(&members(&[3]), 4);
+        // 3 passes covered at 4: the run started at 4 still blames it, its
+        // windows up to 4 discounted once.
+        model.passed_after(&members(&[3]), 4);
         let inference = Inference::of(&model).unwrap();
-        assert!(!inference.effective[1].contains(&bad(3)));
-        let vars = &inference.solved[0].belief;
-        assert!(segments(vars, PrNumber(3)).next().is_none());
+        assert!(inference.effective[1].contains(&bad(3)));
+        let three = PrNumber(3);
+        let vars: Vec<(Var, f64)> = segments(&inference.solved[0].belief, three).collect();
+        assert_eq!(
+            vars,
+            vec![
+                (Var::Seg(three, -5, -5), model.discounted(0.002, 2)),
+                (
+                    Var::Seg(three, -5, 4),
+                    model.discounted(model.regrown(9), 1)
+                ),
+                (Var::Seg(three, 4, 7), model.regrown(3)),
+            ]
+        );
         assert_model_matches_brute_force(&model);
     }
 
     #[test]
-    fn a_failure_cleared_of_one_member_is_not_reblamed_on_it_by_later_landings() {
+    fn a_failure_blames_each_member_up_to_its_own_trunk_and_landings_since_add_to_it() {
         let prs = |landings: u32| -> Vec<PrSnapshot> {
-            (41..=45).map(|n| stale(ready(n), 5 + landings)).collect()
+            (41..=44).map(|n| stale(ready(n), 5 + landings)).collect()
         };
         let mut model = Model::new(priors());
-        model.sync(&prs(0), &BTreeSet::new(), 0);
-        model.failed(BatchId(1), &members(&[41, 42, 43, 44, 45]), 0);
-        model.passed(&members(&[41]), 0);
-        model.sync(&prs(3), &BTreeSet::new(), 3);
+        model.sync(&prs(0), &BTreeSet::new(), 0, 0);
+        model.failed(BatchId(1), &members(&[41, 42, 43, 44]), 0);
+        model.passed_after(&members(&[41]), 0);
+        model.sync(&prs(3), &BTreeSet::new(), 3, 0);
         let inference = Inference::of(&model).unwrap();
-        assert_eq!(inference.posterior(&model, bad(41)), model.regrown(3));
-        // The run still blames 42–45 up to its own trunk, and the pairs
-        // among all five; each is bad now if bad then or broken since.
+        // The run blames all four up to its own trunk, 41 discounted, and
+        // the pairs among them; each is bad now if bad then or broken since.
         let vars = variables(&model);
-        assert_eq!(vars.sets[0].len(), 14);
-        for n in 42..=45 {
-            let then = Var::Seg(PrNumber(n), -5, 0);
-            let bad_then =
-                1.0 - brute_none(&vars.sets, &BTreeSet::from([then]), |var| vars.belief[&var]);
+        assert_eq!(vars.sets[0].len(), 15);
+        for n in 41..=44 {
+            let then =
+                BTreeSet::from([Var::Seg(PrNumber(n), -5, -5), Var::Seg(PrNumber(n), -5, 0)]);
+            let bad_then = 1.0 - brute_none(&vars.sets, &then, |var| vars.belief[&var]);
             let now = 1.0 - (1.0 - bad_then) * (1.0 - model.regrown(3));
             let got = inference.posterior(&model, bad(n));
             assert!((got - now).abs() < 1e-12, "{n}: {got} against {now}");

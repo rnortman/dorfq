@@ -136,7 +136,10 @@ Copy `crates/dorfq/examples/github.toml` and set `owner`, `repo` and
 `tick_millis` is the polling interval. The `[scheduler]` table sets the
 Bayesian scheduler's parameters, each commented in the example: set `lanes`
 and `max_batch` to what the repository's CI can take, and the `p_flake` and
-`p_interact` priors from its history.
+`p_interact` priors from its history, `p_miss` from the rate its CI has
+been seen to pass a change that was broken, and `p_trunk` from how often
+trunk or CI has broken between two passing runs for a reason no queued
+change explains.
 
 Run it wherever outbound HTTPS is available:
 
@@ -159,6 +162,14 @@ user unit expects it and restarts the unit if it is running.
 - A push to trunk by another hand also counts as trunk changes against every
   queued pull request, so one that the push broke is found by its next failed
   batch rather than batched again.
+- A run on a batch with no members, a commit named `dorfq probe <id>` on
+  trunk, is the queue testing trunk alone after several batches failed. One
+  that fails means trunk, or CI, is broken: the queue waits, probing, until
+  one passes. Failures while trunk is broken are explained by trunk rather
+  than by the pull requests in the runs, so an ejection then is rare, not
+  impossible: one made while probes are failing is worth a second look
+  before telling its author. A probe still running when trunk moves is
+  cancelled; its verdict would be about a trunk that is gone.
 - A queue that stops with "batch <id>'s tip is its base" is tracking a batch
   that an earlier build published at its own base, because every member was
   already in trunk. Stop the queue, delete `refs/dorfq/batches/<id>` and the

@@ -27,14 +27,17 @@ private_key_file = "dorfq-app.pem"    # relative to this file's directory
 # env = "DORFQ_GITHUB_TOKEN"          # the environment variable holding the token
 
 # Set lanes and max_batch to the concurrency and batch size the repository's
-# CI can take. p_flake and p_interact are priors: set them from the
-# repository's own history of flaky runs and pairwise conflicts.
+# CI can take. p_flake, p_interact, p_miss and p_trunk are priors: set them
+# from the repository's own history of flaky runs, pairwise conflicts, breaks
+# its CI passed and breaks of trunk or CI that no queued change explains.
 [scheduler]
 kind = "bayes"
 lanes = 2                  # most batches in flight at once
 max_batch = 8              # most pull requests one batch may hold
 p_interact = 0.001         # prior: a pair fails only together; also the regrowth per pull request landed, from which every belief starts
 p_flake = 0.03             # prior: a run fails for no reason
+p_miss = 0.02              # prior: CI misses a real break at this rate; a pass lowers a cause's odds by it, never to nothing
+p_trunk = 0.001            # prior: between two passes on trunk, trunk or CI breaks for a reason the queue did not test
 run_cost = 0.5             # one run, in value units, where a fresh pull request is worth 1
 w_reject = 1.0             # resolving a bad pull request, as a multiple of its value
 w_age = 0.02               # each hour waited adds this to a pull request's value, for landing and for resolving

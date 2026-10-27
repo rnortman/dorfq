@@ -341,7 +341,7 @@ function eventText(e) {
     case "repush": return `repush ${e.pr}`;
     case "withdraw": return `withdraw ${e.pr}`;
     case "blocked": return `blocked ${e.pr} ${e.final ? "on" : "with"} ${e.on}${e.bad ? " bad" : ""}`;
-    case "start": return `start ${e.batch} ${list(e.members)} on ${e.base === null ? "trunk" : e.base}`;
+    case "start": return `start ${e.batch} ${e.members.length === 0 ? "probe" : list(e.members)} on ${e.base === null ? "trunk" : e.base}`;
     case "run_end":
       return `ci ${e.batch} ${e.passed ? "passed" : "failed"}${e.broken ? " broken" : ""}${e.flake ? " flake" : ""}${e.outage ? " outage" : ""}`;
     case "land": return `land ${e.batch} ${list(e.members)}`;

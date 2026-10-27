@@ -47,11 +47,19 @@ pub struct BayesConfig {
     /// Own members of a fresh batch.
     pub max_batch: usize,
     /// Prior: a pair fails only together; also the regrowth per pull
-    /// request landed, from which every `Bad` starts and to which every
-    /// alibi returns.
+    /// request landed, from which every `Bad` starts at its origin.
     pub p_interact: f64,
     /// A run fails for no reason.
     pub p_flake: f64,
+    /// Prior: CI misses a real break at this rate, own CI and the queue's
+    /// alike, so a passing run lowers the belief in every cause it
+    /// exercised by this factor in odds and never to nothing.
+    pub p_miss: f64,
+    /// Prior: between one passing run on trunk and the next, trunk or CI
+    /// breaks for a reason the queue did not test — CI itself going down,
+    /// or a change to trunk by another hand, each change the forge reports
+    /// counting once more.
+    pub p_trunk: f64,
     /// One run, in value units, where a fresh pull request is worth 1.
     pub run_cost: f64,
     /// Resolving a bad pull request, as a multiple of its value.
@@ -74,9 +82,7 @@ pub struct BayesConfig {
 
 /// How the scheduler chooses batches beyond the first.
 ///
-/// `lanes` bounds the pending batches under both variants. Under `tree`, an
-/// unresolvable hypothetical failure scores no resolution credit, where
-/// under `chain` it stops the step.
+/// `lanes` bounds the pending batches under both variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Speculation {
@@ -129,8 +135,8 @@ fn probability(field: &'static str, value: f64) -> Result<(), ConfigError> {
     }
 }
 
-/// A prior belief: above the floor an alibi leaves, which inference treats
-/// as false, and below 1.
+/// A prior belief: above the floor below which a pair is no cause, and
+/// below 1.
 fn belief(field: &'static str, value: f64) -> Result<(), ConfigError> {
     if value > FLOOR && value < 1.0 {
         Ok(())
@@ -195,6 +201,8 @@ impl BayesConfig {
         at_least_one("max_batch", self.max_batch)?;
         belief("p_interact", self.p_interact)?;
         probability("p_flake", self.p_flake)?;
+        probability("p_miss", self.p_miss)?;
+        belief("p_trunk", self.p_trunk)?;
         finite("run_cost", self.run_cost)?;
         finite("w_reject", self.w_reject)?;
         non_negative("w_age", self.w_age)?;
@@ -216,6 +224,8 @@ impl BayesConfig {
         Priors {
             p_interact: self.p_interact,
             p_flake: self.p_flake,
+            p_miss: self.p_miss,
+            p_trunk: self.p_trunk,
         }
     }
 }
@@ -238,6 +248,8 @@ lanes = 2
 max_batch = 24
 p_interact = 0.002
 p_flake = 0.02
+p_miss = 0.02
+p_trunk = 0.001
 run_cost = 0.5
 w_reject = 1.0
 w_age = 0.02
@@ -281,6 +293,8 @@ speculation = \"chain\"
                 max_batch: 24,
                 p_interact: 0.002,
                 p_flake: 0.02,
+                p_miss: 0.02,
+                p_trunk: 0.001,
                 run_cost: 0.5,
                 w_reject: 1.0,
                 w_age: 0.02,
@@ -364,6 +378,12 @@ speculation = \"chain\"
         let without = BAYES.replace("w_age = 0.02\n", "");
         let message = parse(&without).unwrap_err();
         assert!(message.contains("w_age"), "{message}");
+        let without = BAYES.replace("p_miss = 0.02\n", "");
+        let message = parse(&without).unwrap_err();
+        assert!(message.contains("p_miss"), "{message}");
+        let without = BAYES.replace("p_trunk = 0.001\n", "");
+        let message = parse(&without).unwrap_err();
+        assert!(message.contains("p_trunk"), "{message}");
         let message = parse("lanes = 2\n").unwrap_err();
         assert!(message.contains("kind"), "{message}");
     }
@@ -410,6 +430,10 @@ speculation = \"chain\"
                 "p_flake must be strictly between 0 and 1"
             );
         }
+        for p in [0.0, 1.0] {
+            let error = bayes_with(|c| set!(p_miss = p)(c)).unwrap_err();
+            assert_eq!(error.to_string(), "p_miss must be strictly between 0 and 1");
+        }
         // `p_interact` at the floor would start every belief at what
         // inference reads as false, and at 1 would make every landing
         // certain breakage.
@@ -419,7 +443,13 @@ speculation = \"chain\"
                 error.to_string(),
                 format!("p_interact must be above the belief floor {FLOOR:e} and below 1")
             );
+            let error = bayes_with(|c| set!(p_trunk = p)(c)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("p_trunk must be above the belief floor {FLOOR:e} and below 1")
+            );
         }
+        assert_eq!(bayes_with(|c| set!(p_trunk = FLOOR * 1.01)(c)), Ok(()));
         // Just inside each open interval is accepted.
         assert_eq!(bayes_with(|c| set!(p_interact = FLOOR * 1.01)(c)), Ok(()));
         assert_eq!(bayes_with(|c| set!(p_interact = 1.0 - 1e-9)(c)), Ok(()));

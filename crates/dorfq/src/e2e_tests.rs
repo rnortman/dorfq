@@ -1,12 +1,14 @@
-//! The driver running `AllAtOnce` against `MockForge`, scenario to its end.
+//! The driver running a scheduler against `MockForge`, scenario to its end.
 
 use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
 
-use dorfq_core::{BatchId, BatchState, ConflictWith, EjectReason, LandRefusal, PrNumber, Sha};
+use dorfq_core::{
+    BatchId, BatchState, CiStatus, ConflictWith, EjectReason, LandRefusal, PrNumber, Scheduler, Sha,
+};
 use dorfq_forge_mock::{Event, Message, MockForge, Scenario};
-use dorfq_scheduler::AllAtOnce;
+use dorfq_scheduler::{AllAtOnce, SchedulerConfig};
 
 use crate::driver::{Driver, TickReport};
 use crate::providers::SharedMock;
@@ -75,16 +77,20 @@ impl Run {
     }
 }
 
-/// Ticks until a tick is idle and every scenario pull request has arrived;
-/// any forge error fails the test.
+/// [`run_with`] under `AllAtOnce`.
 fn run(scenario: &str) -> Run {
+    run_with(scenario, &mut AllAtOnce::new())
+}
+
+/// Ticks `scheduler` until a tick is idle and every scenario pull request
+/// has arrived; any forge error fails the test.
+fn run_with(scenario: &str, scheduler: &mut dyn Scheduler) -> Run {
     let scenario = Scenario::from_toml(scenario).unwrap();
     let mock = Rc::new(RefCell::new(MockForge::new(scenario, Box::new(io::sink()))));
     let mut forge = SharedMock(Rc::clone(&mock));
-    let mut scheduler = AllAtOnce::new();
     let mut reports = Vec::new();
     {
-        let mut driver = Driver::new(&mut forge, &mut scheduler);
+        let mut driver = Driver::new(&mut forge, scheduler);
         loop {
             let report = driver.tick().unwrap();
             let idle = report.idle;
@@ -315,6 +321,61 @@ fn shipped_example_runs_to_idle() {
     assert_eq!(run.trunk(), &sha(6));
     assert!(run.reports.last().unwrap().idle);
     assert_eq!(run.reports.len(), 8);
+}
+
+#[test]
+fn shipped_scenario_runs_to_idle_under_bayes() {
+    let shipped: toml::Table = toml::from_str(include_str!("../examples/github.toml")).unwrap();
+    let config: SchedulerConfig = shipped["scheduler"].clone().try_into().unwrap();
+    config.validate().unwrap();
+    let mut scheduler = config.build();
+    let run = run_with(
+        include_str!("../examples/scenario.toml"),
+        scheduler.as_mut(),
+    );
+    assert_eq!(run.starts()[0], (0, 1, vec![1, 2, 3]));
+    assert_eq!(run.landed(), [1, 2, 3]);
+    // 5 fails alone until probes, batches with no members, have passed on
+    // trunk and its failures on both sides of a stretch boundary single it
+    // out. How many failures and probes that takes depends on the priors and
+    // on `MAX_COMPONENT_RUNS`, so it is not asserted.
+    let last = run.starts().last().unwrap().clone();
+    assert_eq!(last.2, [5]);
+    assert_eq!(
+        run.ejected(),
+        [
+            (
+                4,
+                EjectReason::Conflicts {
+                    with: ConflictWith::Trunk,
+                }
+            ),
+            (5, failed(last.1))
+        ]
+    );
+    let probes: Vec<u64> = run
+        .starts()
+        .iter()
+        .filter(|s| s.2.is_empty())
+        .map(|s| s.1)
+        .collect();
+    assert!(!probes.is_empty());
+    let passed = |id: u64| {
+        run.reports.iter().any(|r| {
+            r.observation.batches.iter().any(|b| {
+                b.id == BatchId(id)
+                    && matches!(
+                        b.state,
+                        BatchState::Testing {
+                            ci: CiStatus::Passed,
+                            ..
+                        }
+                    )
+            })
+        })
+    };
+    assert!(probes.iter().all(|&id| passed(id)));
+    assert!(run.reports.last().unwrap().idle);
 }
 
 #[test]
