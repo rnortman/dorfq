@@ -32,6 +32,8 @@ Either credential needs these repository permissions:
 - Checks: read
 - Metadata: read
 - Workflows: read/write
+- Administration: read/write — only with `lock_heads = true`
+- Actions: read/write — only with `ci = "actions"`
 
 Workflows is needed because GitHub refuses a merge or a ref update that adds
 or changes a file under `.github/workflows/` to a credential without it, and
@@ -39,6 +41,28 @@ the queue makes both for every queued pull request that touches CI; without
 it the first such batch stops the queue. Checks is what GitHub's permission
 reference names for listing a commit's check runs, which the queue does on
 every observation.
+
+With `lock_heads = true` the queue owns a repository ruleset,
+`dorfq/locked-heads`, that locks the head branch of every pull request in a
+batch until the batch ends, and needs Administration to write it. A
+credential without it stops the queue at the first batch it starts, naming
+the permission. Do not edit the ruleset by
+hand while the queue runs; the queue creates it with the first locked
+branch, rewrites it as batches start and end, and deletes it with the last.
+The ruleset outlives the process: while the queue is stopped, whether it
+stopped on an error or was shut down, the branches it locked stay locked.
+To release them, delete `dorfq/locked-heads`; the queue makes it again from
+its batch records at its next successful observation. Delete it too when
+turning `lock_heads` off or retiring the queue for good.
+
+With `ci = "actions"` the queue cancels the workflow runs still going on a
+batch's branch when it retires the batch without landing it: a batch the
+scheduler gave up on, one that failed fast while its other checks were still
+running, a probe trunk moved under. A retired batch then does not keep a
+runner busy to the end. The cancel comes once the batch's record and branch
+are gone, so a cancelled run is never read as the batch's verdict. A credential without Actions: read/write stops the
+queue at the first such retire, naming the permission. A repository whose CI
+is not Actions leaves the setting absent.
 
 ### As a GitHub App
 
@@ -82,12 +106,20 @@ env = "DORFQ_GITHUB_TOKEN"
 
 ## The label
 
-The label is what authorises a merge. Anyone who can apply it lands the pull
-request, and on GitHub the Triage role is enough. The pull request lands at
-whatever head it has when its batch is built, which may include commits
-pushed after it was labelled. Branch protection's review rules do not apply,
-because landing is a push by the queue's own identity, the token's account or
-the app. Batch CI runs the pull request's own workflow files as a push to
+The label puts a pull request in the pool; anyone who can apply it does, and
+on GitHub the Triage role is enough. A head lands only when GitHub reports
+its base branch's protection satisfied and the configured checks pass, so
+review requirements, code owners and stale-review dismissal apply exactly as
+the repository configures them. A pull request GitHub blocks, or a draft, is
+held, not withdrawn; the queue posts nothing about it — GitHub shows why on
+the pull request. A new head is held until it passes again. A pull request
+held by the repository at the latest observation is not landed, even if its
+batch passed. With `lock_heads` on, while a pull request is in a batch its
+head branch is locked, so nobody can push to it; removing the label
+withdraws it and, while the queue is running, unlocks the branch at its next
+observation. A head in a fork cannot be locked. With `lock_heads` off, or for
+a head in a fork, a push to a batched branch makes its batch refuse to land.
+Batch CI runs the pull request's own workflow files as a push to
 this repository, with this repository's secrets, and that holds for pull
 requests from forks too. So read a pull request's current head, workflows
 included, before you label it.
@@ -100,10 +132,14 @@ included, before you label it.
   and to the bypass list of any rule requiring a pull request.
 - Trunk's required status checks should be the names in `checks`.
 - CI must run on `dorfq/batch/**` pushes and report under the names in
-  `checks`. GitHub reads a push workflow from the pushed commit, and a batch
+  `batch_checks`, which defaults to `checks`. GitHub reads a push workflow from the pushed commit, and a batch
   branch carries trunk's workflows, so the trigger has to be on trunk before
   batch branches get checks; until then batches stay pending. dorfq's own
   `.github/workflows/ci.yml` has the trigger.
+- With `lock_heads` on, the branch lock is a repository ruleset. On a
+  private repository, rulesets need a plan that offers them.
+- With `ci = "actions"`, only runs whose head branch is the batch branch are
+  cancelled; a run of the same commit on trunk is left alone.
 
 ## The live lane
 
@@ -124,6 +160,15 @@ exactly one of the two. Under an app this is the one check that GitHub
 accepts its tokens and lets it comment, label, set statuses and push trunk.
 `DORFQ_LIVE_API_BASE` points it at GitHub Enterprise.
 
+With `DORFQ_LIVE_LOCK_HEADS=1` the lane also locks a batched branch with the
+queue's ruleset, which needs Administration: read/write on the credential and
+a public scratch repository, or a plan that offers rulesets on private ones.
+The lane never touches `main`'s protection.
+
+With `DORFQ_LIVE_CI=actions` the lane also dispatches a workflow on a batch
+branch and retires the batch, which needs Actions: read/write on the
+credential.
+
 The live lane refuses any repository whose name contains neither `scratch`
 nor `playground`, and treats the one it accepts as disposable: it closes
 every open labelled pull request, deletes every queue ref, and lands commits
@@ -133,7 +178,18 @@ on `main`.
 
 Copy `crates/dorfq/examples/github.toml` and set `owner`, `repo` and
 `[forge.auth]`. `api_base` is `https://<host>/api/v3` on GitHub Enterprise;
-`tick_millis` is the polling interval. The `[scheduler]` table sets the
+`tick_millis` is the polling interval. `checks` names the checks that must
+pass on a pull request's head; `batch_checks`, the checks that must pass on a
+batch tip, for a repository whose merge CI reports under other names than
+its pull-request CI; absent, it is `checks`. Either may name an Actions job
+or a commit status context such as Buildkite's `buildkite/<pipeline>`.
+`lock_heads = true` locks each batched pull request's head branch with a
+repository ruleset until its batch ends, so a push cannot waste the batch's
+run; it needs Administration: read/write, and is off when absent.
+`ci = "actions"` cancels the workflow runs still going on a batch's branch
+when the batch is retired unlanded; it needs Actions: read/write, and
+absent, nothing is cancelled. The
+`[scheduler]` table sets the
 Bayesian scheduler's parameters, each commented in the example: set `lanes`
 and `max_batch` to what the repository's CI can take, and the `p_flake` and
 `p_interact` priors from its history, `p_miss` from the rate its CI has
@@ -175,9 +231,9 @@ user unit expects it and restarts the unit if it is running.
   before telling its author. A probe still running when trunk moves is
   cancelled; its verdict would be about a trunk that is gone.
 - A comment beginning `<!-- dorfq: notice -->` is the queue telling an
-  author what it believes without acting on it: that the pull request is
-  probably broken against trunk, or probably fails together with another
-  queued pull request. The pull request stays queued. Rebasing and letting
+  author what it believes without acting on it: that the pull request is the
+  likely cause of a failed batch, or that it and another queued pull request
+  probably fail only together. The pull request stays queued. Rebasing and letting
   its own checks run again is the fastest way to settle it either way.
 - A queue that stops with "batch <id>'s tip is its base" is tracking a batch
   that an earlier build published at its own base, because every member was
@@ -206,4 +262,19 @@ every pull request in it.
   retarget by hand.
 - A stacked pull request landed in the same batch as its base is moved onto
   trunk just before trunk moves, so GitHub marks it merged.
+- If that batch then does not land — trunk moved first, a call failed, or
+  the queue stopped between the move and the fast-forward — the queue puts
+  the stacked pull request back on its base, at once or at its next
+  observation, after a restart included.
 - Every scheduler batches a stack bases before children.
+- GitHub judges a stacked pull request by the protection rules of the branch
+  it targets, as it would when merging it there. To require review for
+  stacked pull requests, the repository's rules must target their base
+  branches too; a ruleset on every branch does.
+- With `lock_heads` on, while its base is in a batch, the queue's own lock on
+  the base's branch blocks the stacked pull request too, and GitHub's answer
+  does not say which rule blocks it. A stacked pull request outside a batch is
+  then held as blocked by branch protection until its base leaves the batch;
+  it is not batched on top of its base meanwhile. One already in a batch was
+  ready when it was batched and is not held by the block, so a review
+  dismissed on it while its base is batched does not stop it landing.

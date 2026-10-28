@@ -7,11 +7,18 @@
 //! in `DORFQ_GITHUB_APP_KEY_FILE`; exactly one form must be set. Under the
 //! app it is the one place installation-token minting meets GitHub. Also
 //! reads `DORFQ_LIVE_REPO` (`owner/name`) and optionally
-//! `DORFQ_LIVE_API_BASE` (default `https://api.github.com`).
+//! `DORFQ_LIVE_API_BASE` (default `https://api.github.com`), and
+//! `DORFQ_LIVE_LOCK_HEADS`: `1` runs the forge with `lock_heads` on and adds
+//! the step that checks the branch lock, which needs Administration:
+//! read/write; unset or empty leaves both out. `DORFQ_LIVE_CI`: `actions`
+//! runs the forge with `ci = "actions"` and adds the step that checks a
+//! retired batch's workflow run is cancelled, which needs Actions:
+//! read/write; unset or empty leaves both out.
 //! Refuses, before any request, a repository whose name contains neither
 //! `scratch` nor `playground`. The repository it accepts is treated as disposable: every open
 //! labelled pull request is closed and every queue ref deleted, and trunk
-//! (`main`) keeps the commits the run lands on it.
+//! (`main`) keeps the commits the run lands on it. The lane never touches
+//! trunk's protection.
 
 use std::env;
 use std::fmt::Display;
@@ -27,7 +34,7 @@ use dorfq_core::{
 use dorfq_forge_github::api::{Auth, GitHubApi, RefUpdate, RestClient};
 use dorfq_forge_github::app::AppKey;
 use dorfq_forge_github::messages::{Marker, last_marker};
-use dorfq_forge_github::{GitHubForge, Settings, system_clock};
+use dorfq_forge_github::{Ci, GitHubForge, LOCK_RULESET, Settings, system_clock};
 use serde_json::{Value, json};
 
 const TRUNK: &str = "main";
@@ -57,11 +64,43 @@ struct Target {
     owner: String,
     repo: String,
     auth: Auth,
+    lock_heads: bool,
+    ci: Option<Ci>,
 }
 
 const TOKEN_VAR: &str = "DORFQ_GITHUB_TOKEN";
 const APP_CLIENT_ID_VAR: &str = "DORFQ_GITHUB_APP_CLIENT_ID";
 const APP_KEY_FILE_VAR: &str = "DORFQ_GITHUB_APP_KEY_FILE";
+const LOCK_HEADS_VAR: &str = "DORFQ_LIVE_LOCK_HEADS";
+const CI_VAR: &str = "DORFQ_LIVE_CI";
+
+/// Whether the run locks batched heads, from `DORFQ_LIVE_LOCK_HEADS`'s
+/// value: unset or empty is off, exactly `1` is on, anything else refused.
+fn lock_heads_from_env(value: Result<String, env::VarError>) -> Result<bool, String> {
+    match value {
+        Err(env::VarError::NotPresent) => Ok(false),
+        Ok(value) if value.is_empty() => Ok(false),
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) => Err(format!(
+            "{LOCK_HEADS_VAR} is {value:?}; set it to `1` or leave it unset"
+        )),
+        Err(error) => Err(format!("{LOCK_HEADS_VAR}: {error}")),
+    }
+}
+
+/// The CI system the run cancels on, from `DORFQ_LIVE_CI`'s value: unset or
+/// empty is none, exactly `actions` is Actions, anything else refused.
+fn ci_from_env(value: Result<String, env::VarError>) -> Result<Option<Ci>, String> {
+    match value {
+        Err(env::VarError::NotPresent) => Ok(None),
+        Ok(value) if value.is_empty() => Ok(None),
+        Ok(value) if value == "actions" => Ok(Some(Ci::Actions)),
+        Ok(value) => Err(format!(
+            "{CI_VAR} is {value:?}; set it to `actions` or leave it unset"
+        )),
+        Err(error) => Err(format!("{CI_VAR}: {error}")),
+    }
+}
 
 /// Reads the one credential form the environment sets, and parses an app's
 /// key so a bad file fails before any request. `set` says whether a variable
@@ -97,6 +136,8 @@ impl Target {
             _ => Err(format!("{var} is unset, empty or not UTF-8")),
         };
         let auth = auth_from_env(|var| env::var_os(var).is_some(), required)?;
+        let lock_heads = lock_heads_from_env(env::var(LOCK_HEADS_VAR))?;
+        let ci = ci_from_env(env::var(CI_VAR))?;
         let full = required("DORFQ_LIVE_REPO")?;
         let (owner, repo) = match full.split_once('/') {
             Some((owner, repo)) if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') => {
@@ -120,6 +161,8 @@ impl Target {
             owner,
             repo,
             auth,
+            lock_heads,
+            ci,
         })
     }
 
@@ -138,6 +181,9 @@ impl Target {
             trunk: TRUNK.to_owned(),
             label: LABEL.to_owned(),
             checks: vec![CHECK.to_owned()],
+            batch_checks: vec![CHECK.to_owned()],
+            lock_heads: self.lock_heads,
+            ci: self.ci,
         };
         GitHubForge::new(
             Box::new(self.client()),
@@ -467,7 +513,8 @@ fn run() -> Result<(), String> {
 
     // 2. Fixtures: A and C change a.txt incompatibly; B adds a workflow file,
     // new on every run, so building and landing it need the Workflows
-    // permission.
+    // permission. Its job outlasts every poll, so only step 10 dispatches it
+    // and only a cancel completes it.
     let trunk = repo.trunk()?;
     let a = repo.fixture(
         &trunk,
@@ -485,7 +532,7 @@ fn run() -> Result<(), String> {
         &format!(".github/workflows/{prefix}.yml"),
         &format!(
             "name: {prefix}\non: workflow_dispatch\njobs:\n  noop:\n    runs-on: ubuntu-latest\n    \
-             steps:\n      - run: \"true\"\n"
+             steps:\n      - run: sleep 600\n"
         ),
     )?;
     let c = repo.fixture(
@@ -807,7 +854,142 @@ fn run() -> Result<(), String> {
     )?;
     forge.retire(BatchId(5)).map_err(at("retiring batch 5"))?;
 
-    // 9. Clean up the run's fixtures; trunk keeps what landed on it.
+    // 9. With the lock on, a batched member's branch is locked: the
+    // ruleset names it, a push to it is refused, and removing the label
+    // unlocks it.
+    if target.lock_heads {
+        let trunk = repo.trunk()?;
+        let h_branch = format!("{prefix}-h");
+        let h = repo.fixture(
+            &trunk,
+            TRUNK,
+            &h_branch,
+            &format!("{prefix} H"),
+            &format!("{prefix}-h.txt"),
+            &format!("{prefix} H\n"),
+        )?;
+        fixtures.push(h.number);
+        let observation = observe_until(&mut forge, "H ready", |o| {
+            ready_on(o, &[(&h, PrBase::Trunk)])
+        })?;
+        forge
+            .start_batch(&BatchStart::new(
+                BatchId(6),
+                observation.trunk.clone(),
+                vec![h.number],
+            ))
+            .map_err(at("starting batch 6"))?;
+        let locked = repo
+            .client
+            .find_ruleset(LOCK_RULESET)
+            .map_err(at("reading the lock"))?;
+        check(
+            locked
+                .as_ref()
+                .is_some_and(|(_, branches)| branches.contains(&h_branch)),
+            || format!("{LOCK_RULESET} is {locked:?}, expected it to lock {h_branch}"),
+        )?;
+        let blocked = repo.commit_file(
+            &h.head,
+            &format!("{prefix}-h.txt"),
+            &format!("{prefix} H, pushed while batched\n"),
+            &format!("{prefix}: a push to a batched branch"),
+        )?;
+        let push = repo
+            .client
+            .update_ref(&format!("refs/heads/{h_branch}"), &blocked, false);
+        check(push.is_err(), || {
+            format!("a push to the locked branch {h_branch} was {push:?}")
+        })?;
+        repo.client
+            .remove_label(h.number, LABEL)
+            .map_err(at("unlabelling H"))?;
+        observe_until(&mut forge, "H departed", |o| {
+            snapshot(o, h.number).is_none()
+        })?;
+        let locked = repo
+            .client
+            .find_ruleset(LOCK_RULESET)
+            .map_err(at("reading the lock"))?;
+        check(locked.is_none(), || {
+            format!("{LOCK_RULESET} is {locked:?} after the only batched member left")
+        })?;
+        forge.retire(BatchId(6)).map_err(at("retiring batch 6"))?;
+    }
+
+    // 10. With `ci = "actions"`, retiring a testing batch cancels the
+    // workflow run going on its branch.
+    if target.ci == Some(Ci::Actions) {
+        let trunk = repo.trunk()?;
+        let i = repo.fixture(
+            &trunk,
+            TRUNK,
+            &format!("{prefix}-i"),
+            &format!("{prefix} I"),
+            &format!("{prefix}-i.txt"),
+            &format!("{prefix} I\n"),
+        )?;
+        fixtures.push(i.number);
+        let observation = observe_until(&mut forge, "I ready", |o| {
+            ready_on(o, &[(&i, PrBase::Trunk)])
+        })?;
+        forge
+            .start_batch(&BatchStart::new(
+                BatchId(7),
+                observation.trunk.clone(),
+                vec![i.number],
+            ))
+            .map_err(at("starting batch 7"))?;
+        let observation = observe_until(&mut forge, "batch 7 testing, pending", |o| {
+            matches!(
+                batch(o, 7),
+                Some(BatchState::Testing {
+                    ci: CiStatus::Pending,
+                    ..
+                })
+            )
+        })?;
+        let Some(BatchState::Testing { tip, .. }) = batch(&observation, 7).cloned() else {
+            unreachable!("observe_until accepted batch 7 as testing");
+        };
+        let batch_branch = "dorfq/batch/7";
+        repo.client
+            .post(
+                &format!("/actions/workflows/{prefix}.yml/dispatches"),
+                &json!({ "ref": batch_branch }),
+            )
+            .map_err(at("dispatching B's workflow on batch 7"))?;
+        poll("a run going on batch 7", || {
+            let runs = repo
+                .client
+                .list_runs(&tip)
+                .map_err(at("listing batch 7's runs"))?;
+            Ok(
+                if runs
+                    .iter()
+                    .any(|r| r.head_branch.as_deref() == Some(batch_branch) && !r.completed)
+                {
+                    Ok(())
+                } else {
+                    Err(format!("runs on {tip}: {runs:?}"))
+                },
+            )
+        })?;
+        forge.retire(BatchId(7)).map_err(at("retiring batch 7"))?;
+        poll("every run on batch 7 completed", || {
+            let runs = repo
+                .client
+                .list_runs(&tip)
+                .map_err(at("listing batch 7's runs"))?;
+            Ok(if runs.iter().all(|r| r.completed) {
+                Ok(())
+            } else {
+                Err(format!("runs on {tip}: {runs:?}"))
+            })
+        })?;
+    }
+
+    // 11. Clean up the run's fixtures; trunk keeps what landed on it.
     for number in fixtures {
         let open = repo
             .client
@@ -852,6 +1034,39 @@ mod tests {
     /// its own copy.
     fn app_key_file(name: &str) -> String {
         key_file(name, include_str!("../../testdata/app-key.pkcs1.pem"))
+    }
+
+    #[test]
+    fn the_lock_runs_only_when_asked_for_with_1() {
+        let lock = |value: &str| lock_heads_from_env(Ok(value.to_owned()));
+        assert_eq!(
+            lock_heads_from_env(Err(env::VarError::NotPresent)),
+            Ok(false)
+        );
+        assert_eq!(lock(""), Ok(false));
+        assert_eq!(lock("1"), Ok(true));
+        for value in ["0", "false", "true", "yes"] {
+            let error = lock(value).unwrap_err();
+            assert_eq!(
+                error,
+                format!("DORFQ_LIVE_LOCK_HEADS is {value:?}; set it to `1` or leave it unset")
+            );
+        }
+    }
+
+    #[test]
+    fn the_cancel_runs_only_when_asked_for_with_actions() {
+        let ci = |value: &str| ci_from_env(Ok(value.to_owned()));
+        assert_eq!(ci_from_env(Err(env::VarError::NotPresent)), Ok(None));
+        assert_eq!(ci(""), Ok(None));
+        assert_eq!(ci("actions"), Ok(Some(Ci::Actions)));
+        for value in ["1", "Actions", "buildkite"] {
+            let error = ci(value).unwrap_err();
+            assert_eq!(
+                error,
+                format!("DORFQ_LIVE_CI is {value:?}; set it to `actions` or leave it unset")
+            );
+        }
     }
 
     #[test]

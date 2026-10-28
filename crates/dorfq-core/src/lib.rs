@@ -41,7 +41,12 @@
 //!    `Ok(())`. The forge re-checks neither CI nor admission at `land`:
 //!    admission is judged at the latest observation (`Ready`) and again at
 //!    `start` (rule 5), and the window from the latest observation to `land`
-//!    is one tick. Only the exact tree that passed CI on top of the current
+//!    is one tick. One exception: a forge that reports the repository's own
+//!    verdict on a head (a draft, protection unsatisfied) refuses to land a
+//!    member the latest observation reported held by that verdict,
+//!    [`LandRefusal::MemberHeld`], because landing it would bypass the rule
+//!    the repository configured; a forge that reports no such verdict never
+//!    refuses on it. Only the exact tree that passed CI on top of the current
 //!    trunk ever lands. *Enforced by* [`ledger::Ledger::check_land`] and each
 //!    forge's refusal tests.
 //! 3. **Plan items are requests.** The scheduler learns facts only from
@@ -134,8 +139,8 @@
 //!    included. A forge whose observation breaks this reports
 //!    [`ForgeError::Permanent`]. *Enforced by* [`ledger::Ledger::observed`].
 //! 9. **Nothing about messages crosses the boundary.** The forge tells
-//!    authors about every transition the queue causes or observes; which
-//!    events, in what words, is each forge's own documentation. The
+//!    authors about the transitions its own documentation names, in its own
+//!    words; which transitions, and whether any, is each forge's choice. The
 //!    scheduler contributes an [`EjectReason`] and a [`NoticeReason`], each
 //!    worded through its `Display`, and nothing else. *Enforced by* the
 //!    types: no message type exists here.
@@ -439,8 +444,10 @@ pub enum Hold {
     OwnCiFailed,
     /// The forge has not yet computed whether it merges into its base.
     MergeabilityUnknown,
-    /// The platform's review requirement is not met.
-    Review,
+    /// The base branch's protection rules are not satisfied: a review, a
+    /// code owner, an unresolved conversation, or a required check the
+    /// queue does not list.
+    Protection,
     /// It is a draft.
     Draft,
     /// Its own CI did not cover ancestor `pr`'s current head.
@@ -453,7 +460,7 @@ impl fmt::Display for Hold {
             Hold::OwnCiPending => f.write_str("own CI pending"),
             Hold::OwnCiFailed => f.write_str("own CI failed"),
             Hold::MergeabilityUnknown => f.write_str("mergeability unknown"),
-            Hold::Review => f.write_str("review required"),
+            Hold::Protection => f.write_str("blocked by branch protection"),
             Hold::Draft => f.write_str("draft"),
             Hold::AncestorMoved { pr } => write!(f, "ancestor #{} moved", pr.0),
         }
@@ -582,6 +589,9 @@ pub enum LandRefusal {
     TrunkMoved { trunk: Sha },
     /// A member is no longer enqueued at the head the batch was built with.
     MemberGone { pr: PrNumber },
+    /// The latest observation reported a member held by the repository's
+    /// own verdict on its head.
+    MemberHeld { pr: PrNumber },
 }
 
 impl fmt::Display for LandRefusal {
@@ -589,6 +599,9 @@ impl fmt::Display for LandRefusal {
         match self {
             LandRefusal::TrunkMoved { trunk } => write!(f, "trunk moved to {trunk}"),
             LandRefusal::MemberGone { pr } => write!(f, "#{} is gone", pr.0),
+            LandRefusal::MemberHeld { pr } => {
+                write!(f, "#{} is held by the repository's rules", pr.0)
+            }
         }
     }
 }
@@ -942,11 +955,15 @@ mod tests {
             LandRefusal::MemberGone { pr: PrNumber(3) }.to_string(),
             "#3 is gone"
         );
+        assert_eq!(
+            LandRefusal::MemberHeld { pr: PrNumber(3) }.to_string(),
+            "#3 is held by the repository's rules"
+        );
         let holds = [
             Hold::OwnCiPending,
             Hold::OwnCiFailed,
             Hold::MergeabilityUnknown,
-            Hold::Review,
+            Hold::Protection,
             Hold::Draft,
             Hold::AncestorMoved { pr: PrNumber(3) },
         ];
@@ -957,7 +974,7 @@ mod tests {
                 "own CI pending",
                 "own CI failed",
                 "mergeability unknown",
-                "review required",
+                "blocked by branch protection",
                 "draft",
                 "ancestor #3 moved",
             ]

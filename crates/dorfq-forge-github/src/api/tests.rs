@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::time::UNIX_EPOCH;
 
@@ -115,7 +115,7 @@ fn is_transient(e: &ApiError) -> bool {
     matches!(e, ApiError::Transient(_))
 }
 
-fn pr_json(number: u64, head: &str, labels: &[&str], mergeable: Value) -> Value {
+fn pr_json(number: u64, head: &str, labels: &[&str], merge_state: &str) -> Value {
     json!({
         "number": number,
         "title": format!("change {number}"),
@@ -123,18 +123,17 @@ fn pr_json(number: u64, head: &str, labels: &[&str], mergeable: Value) -> Value 
         "head": { "sha": head, "ref": "topic", "repo": { "full_name": "acme/widgets" } },
         "base": { "sha": A, "ref": "main" },
         "labels": labels.iter().map(|l| json!({ "name": l })).collect::<Vec<_>>(),
-        "mergeable": mergeable,
+        "mergeable_state": merge_state,
+        "draft": false,
         "merged": false,
     })
 }
 
 #[test]
-fn get_pr_decodes_null_mergeable_as_unknown() {
-    let (mut api, _) = client(vec![route(
-        "GET",
-        "/pulls/12",
-        ok(pr_json(12, B, &["queue", "bug"], Value::Null)),
-    )]);
+fn get_pr_decodes_every_field() {
+    let mut draft = pr_json(12, B, &["queue", "bug"], "unknown");
+    draft["draft"] = json!(true);
+    let (mut api, _) = client(vec![route("GET", "/pulls/12", ok(draft))]);
     let pr = api.get_pr(PrNumber(12)).unwrap();
     assert_eq!(
         pr,
@@ -143,18 +142,65 @@ fn get_pr_decodes_null_mergeable_as_unknown() {
             base: "main".to_owned(),
             head: sha(B),
             labels: vec!["queue".to_owned(), "bug".to_owned()],
-            mergeable: None,
+            merge_state: MergeState::Unknown,
+            draft: true,
             merged: false,
         }
     );
 }
 
 #[test]
+fn get_pr_decodes_every_mergeable_state() {
+    let words = [
+        ("clean", MergeState::Clean),
+        ("unstable", MergeState::Unstable),
+        ("has_hooks", MergeState::HasHooks),
+        ("behind", MergeState::Behind),
+        ("blocked", MergeState::Blocked),
+        ("dirty", MergeState::Dirty),
+        ("draft", MergeState::Draft),
+        ("unknown", MergeState::Unknown),
+    ];
+    for (word, state) in words {
+        let (mut api, _) = client(vec![route("GET", "/pulls/2", ok(pr_json(2, B, &[], word)))]);
+        assert_eq!(
+            api.get_pr(PrNumber(2)).unwrap().merge_state,
+            state,
+            "{word}"
+        );
+    }
+}
+
+#[test]
+fn get_pr_requires_a_known_mergeable_state_and_draft() {
+    let mut odd = pr_json(2, B, &[], "sideways");
+    let mut no_state = pr_json(3, B, &[], "clean");
+    no_state.as_object_mut().unwrap().remove("mergeable_state");
+    let mut no_draft = pr_json(4, B, &[], "clean");
+    no_draft.as_object_mut().unwrap().remove("draft");
+    odd["draft"] = json!(false);
+    let (mut api, _) = client(vec![
+        route("GET", "/pulls/2", ok(odd)),
+        route("GET", "/pulls/3", ok(no_state)),
+        route("GET", "/pulls/4", ok(no_draft)),
+    ]);
+    for (n, needle) in [
+        (2, "unknown mergeable_state \"sideways\""),
+        (3, "no mergeable_state field"),
+        (4, "no draft field"),
+    ] {
+        let error = api.get_pr(PrNumber(n)).unwrap_err();
+        assert!(!is_transient(&error), "{error}");
+        assert!(error.to_string().contains(needle), "{error}");
+    }
+}
+
+#[test]
 fn get_pr_decodes_merged_and_requires_it() {
-    let mut merged = pr_json(5, B, &[], json!(false));
+    let mut merged = pr_json(5, B, &[], "dirty");
     merged["state"] = json!("closed");
     merged["merged"] = json!(true);
-    let mut silent = pr_json(6, B, &[], json!(true));
+    let mut silent = pr_json(6, B, &[], "clean");
     silent.as_object_mut().unwrap().remove("merged");
     let (mut api, _) = client(vec![
         route("GET", "/pulls/5", ok(merged)),
@@ -168,17 +214,17 @@ fn get_pr_decodes_merged_and_requires_it() {
 }
 
 #[test]
-fn get_pr_decodes_mergeable_and_closed() {
-    let mut closed = pr_json(3, C, &[], json!(false));
+fn get_pr_decodes_merge_state_and_closed() {
+    let mut closed = pr_json(3, C, &[], "dirty");
     closed["state"] = json!("closed");
     let (mut api, _) = client(vec![
-        route("GET", "/pulls/2", ok(pr_json(2, B, &[], json!(true)))),
+        route("GET", "/pulls/2", ok(pr_json(2, B, &[], "clean"))),
         route("GET", "/pulls/3", ok(closed)),
     ]);
     let two = api.get_pr(PrNumber(2)).unwrap();
-    assert_eq!((two.open, two.mergeable), (true, Some(true)));
+    assert_eq!((two.open, two.merge_state), (true, MergeState::Clean));
     let three = api.get_pr(PrNumber(3)).unwrap();
-    assert_eq!((three.open, three.mergeable), (false, Some(false)));
+    assert_eq!((three.open, three.merge_state), (false, MergeState::Dirty));
 }
 
 #[test]
@@ -370,7 +416,7 @@ fn unexpected_check_and_pr_states_are_permanent() {
         "{error}"
     );
 
-    let mut merged = pr_json(4, B, &[], Value::Null);
+    let mut merged = pr_json(4, B, &[], "unknown");
     merged["state"] = json!("merged");
     let (mut api, _) = client(vec![route("GET", "/pulls/4", ok(merged))]);
     let error = api.get_pr(PrNumber(4)).unwrap_err();
@@ -469,12 +515,12 @@ fn compare_not_found_is_permanent() {
 #[test]
 fn list_follows_link_next() {
     let page2 = format!("{REPO}/pulls?state=open&per_page=100&page=2");
-    let mut first = ok(json!([pr_json(1, A, &["queue"], Value::Null)]));
+    let mut first = ok(json!([pr_json(1, A, &["queue"], "unknown")]));
     first.headers.push((
         "link",
         format!("<{page2}>; rel=\"next\", <{page2}>; rel=\"last\""),
     ));
-    let mut second = ok(json!([pr_json(2, B, &[], Value::Null)]));
+    let mut second = ok(json!([pr_json(2, B, &[], "unknown")]));
     second.headers.push((
         "link",
         format!("<{REPO}/pulls?page=1>; rel=\"prev\", <{REPO}/pulls?page=1>; rel=\"first\""),
@@ -511,7 +557,7 @@ fn list_follows_link_next() {
 #[test]
 fn a_failed_later_page_fails_the_list() {
     let page2 = format!("{REPO}/pulls?state=open&per_page=100&page=2");
-    let mut first = ok(json!([pr_json(1, A, &["queue"], Value::Null)]));
+    let mut first = ok(json!([pr_json(1, A, &["queue"], "unknown")]));
     first
         .headers
         .push(("link", format!("<{page2}>; rel=\"next\"")));
@@ -529,14 +575,14 @@ fn a_failed_later_page_fails_the_list() {
 
 #[test]
 fn list_reads_each_base_and_head_branch_but_not_a_forks() {
-    let mut stacked = pr_json(1, A, &["queue"], Value::Null);
+    let mut stacked = pr_json(1, A, &["queue"], "unknown");
     stacked["base"]["ref"] = json!("feature/one");
     stacked["head"]["ref"] = json!("feature/two");
-    let mut shouting = pr_json(2, B, &[], Value::Null);
+    let mut shouting = pr_json(2, B, &[], "unknown");
     shouting["head"]["repo"]["full_name"] = json!("ACME/Widgets");
-    let mut fork = pr_json(3, C, &[], Value::Null);
+    let mut fork = pr_json(3, C, &[], "unknown");
     fork["head"]["repo"]["full_name"] = json!("someone/widgets");
-    let mut deleted_fork = pr_json(4, C, &[], Value::Null);
+    let mut deleted_fork = pr_json(4, C, &[], "unknown");
     deleted_fork["head"]["repo"] = Value::Null;
     let (mut api, _) = client(vec![route(
         "GET",
@@ -564,7 +610,7 @@ fn set_base_patches_the_pull_request() {
     let (mut api, seen) = client(vec![route(
         "PATCH",
         "/pulls/7",
-        ok(pr_json(7, A, &[], Value::Null)),
+        ok(pr_json(7, A, &[], "unknown")),
     )]);
     api.set_base(PrNumber(7), "main").unwrap();
     let seen = seen.borrow();
@@ -634,13 +680,13 @@ fn set_base_maps_a_refusal() {
 
 #[test]
 fn merged_pr_heads_asks_for_trunk_merges_of_the_branch_and_keeps_merged_ones() {
-    let mut merged = pr_json(5, A, &[], Value::Null);
+    let mut merged = pr_json(5, A, &[], "unknown");
     merged["state"] = json!("closed");
     merged["merged_at"] = json!("2026-10-01T00:00:00Z");
-    let mut abandoned = pr_json(6, B, &[], Value::Null);
+    let mut abandoned = pr_json(6, B, &[], "unknown");
     abandoned["state"] = json!("closed");
     abandoned["merged_at"] = Value::Null;
-    let mut also_merged = pr_json(8, C, &[], Value::Null);
+    let mut also_merged = pr_json(8, C, &[], "unknown");
     also_merged["state"] = json!("closed");
     also_merged["merged_at"] = json!("2026-10-02T00:00:00Z");
     // The route matches the whole query, so it is what checks `base=main`.
@@ -1315,4 +1361,247 @@ fn a_rejected_installation_token_is_permanent_and_not_reminted() {
     let seen = seen.borrow();
     assert_eq!(seen.len(), 4, "no mint follows a rejection");
     assert_eq!(seen[3].3, "Bearer installation-token-1");
+}
+
+const RULESETS: &str = "/rulesets?includes_parents=false&per_page=100";
+
+fn branch_set(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|&n| n.to_owned()).collect()
+}
+
+#[test]
+fn find_ruleset_reads_the_named_one_and_its_branches() {
+    let (mut api, _) = client(vec![
+        route(
+            "GET",
+            RULESETS,
+            ok(json!([
+                { "id": 4, "name": "protect main" },
+                { "id": 7, "name": "dorfq/locked-heads" },
+            ])),
+        ),
+        route(
+            "GET",
+            "/rulesets/7",
+            ok(json!({
+                "id": 7,
+                "name": "dorfq/locked-heads",
+                "conditions": { "ref_name": {
+                    "include": ["refs/heads/a", "refs/heads/b/c"], "exclude": [] } },
+            })),
+        ),
+    ]);
+    assert_eq!(
+        api.find_ruleset("dorfq/locked-heads").unwrap(),
+        Some((RulesetId(7), branch_set(&["a", "b/c"])))
+    );
+}
+
+#[test]
+fn find_ruleset_answers_none_and_refuses_two() {
+    let (mut api, _) = client(vec![route(
+        "GET",
+        RULESETS,
+        ok(json!([{ "id": 4, "name": "other" }])),
+    )]);
+    assert_eq!(api.find_ruleset("dorfq/locked-heads").unwrap(), None);
+    let (mut api, _) = client(vec![route(
+        "GET",
+        RULESETS,
+        ok(json!([
+            { "id": 4, "name": "dorfq/locked-heads" },
+            { "id": 5, "name": "dorfq/locked-heads" },
+        ])),
+    )]);
+    let error = api.find_ruleset("dorfq/locked-heads").unwrap_err();
+    assert!(!is_transient(&error), "{error}");
+    assert!(error.to_string().contains("2 rulesets"), "{error}");
+}
+
+#[test]
+fn ruleset_writes_send_the_lock_and_read_their_statuses() {
+    let (mut api, seen) = client(vec![
+        route(
+            "POST",
+            "/rulesets",
+            status(201, json!({ "id": 9, "name": "n" })),
+        ),
+        route("PUT", "/rulesets/9", ok(json!({ "id": 9 }))),
+        route(
+            "PUT",
+            "/rulesets/9",
+            status(404, json!({ "message": "Not Found" })),
+        ),
+        route("DELETE", "/rulesets/9", status(204, Value::Null)),
+        route(
+            "DELETE",
+            "/rulesets/8",
+            status(404, json!({ "message": "Not Found" })),
+        ),
+    ]);
+    let locked = branch_set(&["pr-1"]);
+    assert_eq!(api.create_ruleset("n", &locked).unwrap(), RulesetId(9));
+    assert!(api.update_ruleset(RulesetId(9), &locked).unwrap());
+    assert!(!api.update_ruleset(RulesetId(9), &locked).unwrap());
+    api.delete_ruleset(RulesetId(9)).unwrap();
+    api.delete_ruleset(RulesetId(8)).unwrap();
+    let seen = seen.borrow();
+    assert_eq!(
+        seen[0].2,
+        Some(json!({
+            "name": "n",
+            "target": "branch",
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": { "ref_name": { "include": ["refs/heads/pr-1"], "exclude": [] } },
+            "rules": [{ "type": "update" }],
+        }))
+    );
+    assert!(seen[1].2.as_ref().unwrap().get("name").is_none());
+}
+
+#[test]
+fn a_refused_ruleset_call_names_the_permission_unless_rate_limited() {
+    let refused = status(
+        403,
+        json!({ "message": "Resource not accessible by integration" }),
+    );
+    let mut limited = status(403, json!({ "message": "secondary rate limit" }));
+    limited.headers.push(("retry-after", "60".to_owned()));
+    let (mut api, _) = client(vec![
+        route("POST", "/rulesets", refused.clone()),
+        route("POST", "/rulesets", limited),
+        route("GET", RULESETS, refused),
+    ]);
+    let locked = branch_set(&["pr-1"]);
+    let error = api.create_ruleset("n", &locked).unwrap_err();
+    assert!(!is_transient(&error), "{error}");
+    assert!(
+        error.to_string().contains("Administration permission"),
+        "{error}"
+    );
+    let error = api.create_ruleset("n", &locked).unwrap_err();
+    assert!(is_transient(&error), "{error}");
+    let error = api.find_ruleset("n").unwrap_err();
+    assert!(
+        error.to_string().contains("Administration permission"),
+        "{error}"
+    );
+}
+
+#[test]
+fn find_ruleset_refuses_an_include_that_is_not_a_branch() {
+    let (mut api, _) = client(vec![
+        route(
+            "GET",
+            RULESETS,
+            ok(json!([{ "id": 7, "name": "dorfq/locked-heads" }])),
+        ),
+        route(
+            "GET",
+            "/rulesets/7",
+            ok(json!({
+                "id": 7,
+                "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
+            })),
+        ),
+    ]);
+    let error = api.find_ruleset("dorfq/locked-heads").unwrap_err();
+    assert!(!is_transient(&error), "{error}");
+    assert!(error.to_string().contains("is not a branch"), "{error}");
+}
+
+fn runs_path() -> String {
+    format!("/actions/runs?head_sha={A}&per_page=100")
+}
+
+fn workflow_run(id: u64, branch: Option<&str>, status: &str) -> Value {
+    json!({ "id": id, "head_branch": branch, "status": status, "conclusion": null })
+}
+
+#[test]
+fn list_runs_reads_every_page_null_fields_and_completed_from_status() {
+    let page2 = format!("{REPO}/actions/runs?head_sha={A}&per_page=100&page=2");
+    let mut first = ok(json!({ "total_count": 5, "workflow_runs": [
+        workflow_run(1, Some("dorfq/batch/7"), "in_progress"),
+        workflow_run(2, Some("main"), "completed"),
+        workflow_run(4, None, "in_progress"),
+    ] }));
+    first
+        .headers
+        .push(("link", format!("<{page2}>; rel=\"next\"")));
+    let second = ok(json!({ "total_count": 5, "workflow_runs": [
+        workflow_run(3, Some("dorfq/batch/7"), "queued"),
+        { "id": 5, "head_branch": "dorfq/batch/7", "status": null, "conclusion": null },
+    ] }));
+    let (mut api, _) = client(vec![
+        route("GET", &runs_path(), first),
+        (format!("GET {page2}"), second),
+    ]);
+    let run = |id, branch: Option<&str>, completed| WorkflowRun {
+        id: RunId(id),
+        head_branch: branch.map(str::to_owned),
+        completed,
+    };
+    assert_eq!(
+        api.list_runs(&sha(A)).unwrap(),
+        [
+            run(1, Some("dorfq/batch/7"), false),
+            run(2, Some("main"), true),
+            run(4, None, false),
+            run(3, Some("dorfq/batch/7"), false),
+            run(5, Some("dorfq/batch/7"), false),
+        ]
+    );
+}
+
+#[test]
+fn cancel_run_accepts_a_cancel_a_finished_run_and_a_gone_one() {
+    let (mut api, seen) = client(vec![
+        route("POST", "/actions/runs/5/cancel", status(202, json!({}))),
+        route(
+            "POST",
+            "/actions/runs/6/cancel",
+            status(
+                409,
+                json!({ "message": "Cannot cancel a workflow run that is completed." }),
+            ),
+        ),
+        route(
+            "POST",
+            "/actions/runs/7/cancel",
+            status(404, json!({ "message": "Not Found" })),
+        ),
+    ]);
+    for id in [5, 6, 7] {
+        api.cancel_run(RunId(id)).unwrap();
+    }
+    assert_eq!(seen.borrow().len(), 3);
+}
+
+#[test]
+fn a_refused_actions_call_names_the_permission_unless_rate_limited() {
+    let refused = status(
+        403,
+        json!({ "message": "Resource not accessible by integration" }),
+    );
+    let mut limited = status(403, json!({ "message": "secondary rate limit" }));
+    limited.headers.push(("retry-after", "60".to_owned()));
+    let (mut api, _) = client(vec![
+        route("POST", "/actions/runs/5/cancel", refused.clone()),
+        route("POST", "/actions/runs/5/cancel", limited.clone()),
+        route("GET", &runs_path(), refused),
+        route("GET", &runs_path(), limited),
+    ]);
+    let named = |error: &ApiError| {
+        !is_transient(error) && error.to_string().contains("Actions permission: read/write")
+    };
+    let error = api.cancel_run(RunId(5)).unwrap_err();
+    assert!(named(&error), "{error}");
+    let error = api.cancel_run(RunId(5)).unwrap_err();
+    assert!(is_transient(&error), "{error}");
+    let error = api.list_runs(&sha(A)).unwrap_err();
+    assert!(named(&error), "{error}");
+    let error = api.list_runs(&sha(A)).unwrap_err();
+    assert!(is_transient(&error), "{error}");
 }

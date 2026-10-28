@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use dorfq_forge_github::Settings;
+use dorfq_forge_github::{Ci, Settings};
 use dorfq_scheduler::SchedulerConfig;
 use serde::Deserialize;
 
@@ -42,9 +42,21 @@ pub enum ForgeConfig {
         trunk: String,
         /// The intent label.
         label: String,
-        /// The check names that must pass, on pull request heads and batch
-        /// tips.
+        /// The check names that must pass on pull request heads.
         checks: Vec<String>,
+        /// The check names that must pass on batch tips; absent, the same
+        /// as `checks`.
+        #[serde(default)]
+        batch_checks: Option<Vec<String>>,
+        /// Whether a batched pull request's head branch is locked by the
+        /// queue's ruleset while it is batched; absent, off.
+        #[serde(default)]
+        lock_heads: bool,
+        /// The CI system whose runs the queue cancels when it retires a
+        /// batch that is still testing; `"actions"`, or absent to cancel
+        /// nothing.
+        #[serde(default)]
+        ci: Option<Ci>,
         /// The credential the forge runs under.
         auth: AuthConfig,
     },
@@ -142,10 +154,8 @@ impl Config {
                 api_base,
                 owner,
                 repo,
-                trunk,
-                label,
-                checks,
                 auth,
+                ..
             } => {
                 if !api_base.starts_with("https://") {
                     return Err(format!(
@@ -172,16 +182,41 @@ impl Config {
                         return Err(format!("forge.{field} is empty"));
                     }
                 }
-                Settings {
-                    trunk: trunk.clone(),
-                    label: label.clone(),
-                    checks: checks.clone(),
-                }
-                .validate()
-                .map_err(|problem| format!("forge.{problem}"))?;
             }
         }
+        if let Some(settings) = config.forge.github_settings() {
+            settings
+                .validate()
+                .map_err(|problem| format!("forge.{problem}"))?;
+        }
         Ok(config)
+    }
+}
+
+impl ForgeConfig {
+    /// The GitHub forge's settings, `None` for any other forge:
+    /// `batch_checks` absent is `checks`.
+    pub fn github_settings(&self) -> Option<Settings> {
+        let ForgeConfig::GitHub {
+            trunk,
+            label,
+            checks,
+            batch_checks,
+            lock_heads,
+            ci,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(Settings {
+            trunk: trunk.clone(),
+            label: label.clone(),
+            checks: checks.clone(),
+            batch_checks: batch_checks.as_ref().unwrap_or(checks).clone(),
+            lock_heads: *lock_heads,
+            ci: *ci,
+        })
     }
 }
 
@@ -304,12 +339,89 @@ tick_millis = 60000
                 trunk: "main".to_owned(),
                 label: "queue".to_owned(),
                 checks: vec!["check".to_owned()],
+                batch_checks: None,
+                lock_heads: false,
+                ci: None,
                 auth: AuthConfig::Token {
                     env: "DORFQ_GITHUB_TOKEN".to_owned(),
                 },
             }
         );
         assert_eq!(config.driver, DriverConfig { tick_millis: 60000 });
+    }
+
+    #[test]
+    fn github_batch_checks_are_passed_through_and_rejected_when_empty() {
+        let text = GITHUB.replace(
+            "checks = [\"check\"]\n",
+            "checks = [\"check\"]\nbatch_checks = [\"merge\", \"slow\"]\n",
+        );
+        let settings = |text: &str| {
+            Config::parse(text, Path::new("conf"))
+                .unwrap()
+                .forge
+                .github_settings()
+                .unwrap()
+        };
+        let given = settings(&text);
+        assert_eq!(given.checks, ["check"]);
+        assert_eq!(given.batch_checks, ["merge", "slow"]);
+        assert_eq!(settings(GITHUB).batch_checks, ["check"]);
+        let empty = GITHUB.replace(
+            "checks = [\"check\"]\n",
+            "checks = [\"check\"]\nbatch_checks = []\n",
+        );
+        assert_eq!(rejected(&empty), "forge.batch_checks names no check");
+        let blank = GITHUB.replace(
+            "checks = [\"check\"]\n",
+            "checks = [\"check\"]\nbatch_checks = [\"\"]\n",
+        );
+        assert_eq!(rejected(&blank), "forge.batch_checks[0] is empty");
+    }
+
+    #[test]
+    fn github_lock_heads_is_off_unless_set() {
+        let lock_heads = |text: &str| {
+            Config::parse(text, Path::new("conf"))
+                .unwrap()
+                .forge
+                .github_settings()
+                .unwrap()
+                .lock_heads
+        };
+        assert!(!lock_heads(GITHUB));
+        let on = GITHUB.replace(
+            "checks = [\"check\"]\n",
+            "checks = [\"check\"]\nlock_heads = true\n",
+        );
+        assert!(lock_heads(&on));
+        let off = GITHUB.replace(
+            "checks = [\"check\"]\n",
+            "checks = [\"check\"]\nlock_heads = false\n",
+        );
+        assert!(!lock_heads(&off));
+    }
+
+    #[test]
+    fn github_ci_is_absent_unless_set_and_names_a_known_system() {
+        let with_ci = |value: &str| {
+            GITHUB.replace(
+                "checks = [\"check\"]\n",
+                &format!("checks = [\"check\"]\nci = {value}\n"),
+            )
+        };
+        let ci = |text: &str| {
+            Config::parse(text, Path::new("conf"))
+                .unwrap()
+                .forge
+                .github_settings()
+                .unwrap()
+                .ci
+        };
+        assert_eq!(ci(GITHUB), None);
+        assert_eq!(ci(&with_ci("\"actions\"")), Some(Ci::Actions));
+        let message = rejected(&with_ci("\"buildkite\""));
+        assert!(message.contains("buildkite"), "{message}");
     }
 
     const TOKEN_AUTH: &str = "kind = \"token\"\nenv = \"DORFQ_GITHUB_TOKEN\"\n";

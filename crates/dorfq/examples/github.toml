@@ -14,7 +14,10 @@ owner = "example-owner"
 repo = "dorfq"
 trunk = "main"
 label = "queue"
-checks = ["check"]                    # required check names on heads and batch tips
+checks = ["check"]                    # required check names on pull request heads
+# batch_checks = ["check"]            # required check names on batch tips; absent, the same as checks
+# lock_heads = true                   # lock each batched pull request's branch with a ruleset while it is batched; needs Administration: read/write
+# ci = "actions"                      # cancel a retired batch's workflow runs; needs Actions: read/write
 
 [forge.auth]
 kind = "app"

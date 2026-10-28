@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn pull_requests_that_are_not_batchable_have_no_unit() {
-        let mut tip = atomic(held(3, Hold::Review));
+        let mut tip = atomic(held(3, Hold::Protection));
         tip.base = PrBase::Pr(PrNumber(2));
         let s = stacks(vec![ready(1), stacked(2, 1), tip, ready(4)]);
         assert_eq!(units(&s), [vec![4]]);
@@ -320,7 +320,7 @@ mod tests {
             atomic_stacked(2, 1),
             stacked(3, 1),
             ready(4),
-            held(5, Hold::Review),
+            held(5, Hold::Protection),
         ]);
         let groups = s.partition(&numbers(&[1, 3, 2, 5, 4]));
         assert_eq!(
@@ -357,13 +357,13 @@ mod tests {
 
         // An ancestor held back under an un-`Ready` `Atomic` tip, and a
         // pull request whose base is not `Ready`.
-        let mut tip = atomic(held(3, Hold::Review));
+        let mut tip = atomic(held(3, Hold::Protection));
         tip.base = PrBase::Pr(PrNumber(2));
         let s = stacks(vec![
             ready(1),
             stacked(2, 1),
             tip,
-            held(4, Hold::Review),
+            held(4, Hold::Protection),
             stacked(5, 4),
         ]);
         assert_eq!(s.closure(PrNumber(2)), None);

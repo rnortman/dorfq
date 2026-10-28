@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn batchable_holds_back_the_ancestors_of_a_waiting_atomic_tip() {
-        let mut tip = atomic(held(3, Hold::Review));
+        let mut tip = atomic(held(3, Hold::Protection));
         tip.base = PrBase::Pr(PrNumber(2));
         // 4 on 1 is not an ancestor of 3 but loses its base with 1.
         let prs = vec![ready(1), stacked(2, 1), tip, stacked(4, 1), ready(5)];

@@ -1,6 +1,7 @@
 //! The GitHub REST surface the forge uses: the [`GitHubApi`] trait, its
 //! typed results, and [`RestClient`], which implements it over HTTPS.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::time::{Duration, SystemTime};
@@ -53,6 +54,51 @@ pub trait GitHubApi {
     fn list_comments(&mut self, number: PrNumber) -> Result<Vec<String>, ApiError>;
     fn create_comment(&mut self, number: PrNumber, body: &str) -> Result<(), ApiError>;
     fn label_exists(&mut self, label: &str) -> Result<bool, ApiError>;
+    /// The repository ruleset named `name`: its id and the branches, by
+    /// short name, it includes. Two of that name is an error.
+    fn find_ruleset(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<(RulesetId, BTreeSet<String>)>, ApiError>;
+    /// Creates a ruleset named `name` that refuses every update of
+    /// `branches` (short names) to everyone.
+    fn create_ruleset(
+        &mut self,
+        name: &str,
+        branches: &BTreeSet<String>,
+    ) -> Result<RulesetId, ApiError>;
+    /// Replaces the branches ruleset `id` includes; `false` when the
+    /// ruleset no longer exists.
+    fn update_ruleset(
+        &mut self,
+        id: RulesetId,
+        branches: &BTreeSet<String>,
+    ) -> Result<bool, ApiError>;
+    /// Deletes ruleset `id`; an absent ruleset is not an error.
+    fn delete_ruleset(&mut self, id: RulesetId) -> Result<(), ApiError>;
+    /// Every Actions workflow run whose head commit is `head`.
+    fn list_runs(&mut self, head: &Sha) -> Result<Vec<WorkflowRun>, ApiError>;
+    /// Cancels a workflow run; one already finished, or gone, is not an
+    /// error.
+    fn cancel_run(&mut self, id: RunId) -> Result<(), ApiError>;
+}
+
+/// A repository ruleset's id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RulesetId(pub u64);
+
+/// An Actions workflow run's id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RunId(pub u64);
+
+/// One Actions workflow run on a commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRun {
+    pub id: RunId,
+    /// The branch the run was triggered on, as GitHub recorded it; GitHub
+    /// records none for some runs.
+    pub head_branch: Option<String>,
+    pub completed: bool,
 }
 
 /// One ref and the sha it points at.
@@ -135,10 +181,50 @@ pub struct PrDetail {
     pub base: String,
     pub head: Sha,
     pub labels: Vec<String>,
-    /// `None` while GitHub has not computed it.
-    pub mergeable: Option<bool>,
+    /// GitHub's verdict on whether it may merge into its base branch.
+    pub merge_state: MergeState,
+    /// Whether it is a draft.
+    pub draft: bool,
     /// Whether it was merged, by any hand.
     pub merged: bool,
+}
+
+/// A pull request's `mergeable_state`: whether GitHub would merge it into
+/// its base branch now, and if not, why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeState {
+    /// Mergeable, every requirement met.
+    Clean,
+    /// Mergeable, with a check that is not required failing.
+    Unstable,
+    /// Mergeable, with pre-receive hooks.
+    HasHooks,
+    /// Mergeable, but its head is behind the base branch.
+    Behind,
+    /// The base branch's protection rules are not satisfied.
+    Blocked,
+    /// It conflicts with its base branch.
+    Dirty,
+    /// It is a draft.
+    Draft,
+    /// GitHub has not computed it yet.
+    Unknown,
+}
+
+impl MergeState {
+    fn parse(word: &str) -> Option<MergeState> {
+        Some(match word {
+            "clean" => MergeState::Clean,
+            "unstable" => MergeState::Unstable,
+            "has_hooks" => MergeState::HasHooks,
+            "behind" => MergeState::Behind,
+            "blocked" => MergeState::Blocked,
+            "dirty" => MergeState::Dirty,
+            "draft" => MergeState::Draft,
+            "unknown" => MergeState::Unknown,
+            _ => return None,
+        })
+    }
 }
 
 /// One check run or commit status, reduced to what the forge decides on.
@@ -198,6 +284,7 @@ enum Method {
     Get,
     Post,
     Patch,
+    Put,
     Delete,
 }
 
@@ -207,6 +294,7 @@ impl fmt::Display for Method {
             Method::Get => "GET",
             Method::Post => "POST",
             Method::Patch => "PATCH",
+            Method::Put => "PUT",
             Method::Delete => "DELETE",
         })
     }
@@ -516,14 +604,18 @@ impl RestClient {
     }
 
     /// Every page of a list endpoint, following `Link: rel="next"`.
-    fn get_pages(&mut self, path: &str) -> Result<Vec<Value>, ApiError> {
+    fn get_pages(
+        &mut self,
+        path: &str,
+        classify: fn(Method, &str, &HttpResponse) -> ApiError,
+    ) -> Result<Vec<Value>, ApiError> {
         let separator = if path.contains('?') { '&' } else { '?' };
         let mut url = format!("{}{path}{separator}{PER_PAGE}", self.repo_url());
         let mut pages = Vec::new();
         loop {
             let response = self.call_url(Method::Get, path, &url, None)?;
             if response.status != 200 {
-                return Err(failure(Method::Get, path, &response));
+                return Err(classify(Method::Get, path, &response));
             }
             pages.push(response.json(&format!("GET {path}"))?);
             match response.header("link").and_then(next_link) {
@@ -535,7 +627,7 @@ impl RestClient {
 
     fn get_array<T: for<'de> Deserialize<'de>>(&mut self, path: &str) -> Result<Vec<T>, ApiError> {
         let mut items = Vec::new();
-        for page in self.get_pages(path)? {
+        for page in self.get_pages(path, failure)? {
             items.extend(decode::<Vec<T>>(&format!("GET {path}"), page)?);
         }
         Ok(items)
@@ -701,12 +793,21 @@ impl GitHubApi for RestClient {
         let merged = pr
             .merged
             .ok_or_else(|| permanent(format!("{what}: no merged field")))?;
+        let word = pr
+            .mergeable_state
+            .ok_or_else(|| permanent(format!("{what}: no mergeable_state field")))?;
+        let merge_state = MergeState::parse(&word)
+            .ok_or_else(|| permanent(format!("{what}: unknown mergeable_state {word:?}")))?;
+        let draft = pr
+            .draft
+            .ok_or_else(|| permanent(format!("{what}: no draft field")))?;
         Ok(PrDetail {
             open,
             base: pr.base.branch,
             head: parse_sha(&what, &pr.head.sha)?,
             labels: pr.labels.into_iter().map(|l| l.name).collect(),
-            mergeable: pr.mergeable,
+            merge_state,
+            draft,
             merged,
         })
     }
@@ -740,7 +841,7 @@ impl GitHubApi for RestClient {
 
         let path = format!("/commits/{sha}/check-runs");
         let what = format!("GET {path}");
-        for page in self.get_pages(&path)? {
+        for page in self.get_pages(&path, failure)? {
             let runs: CheckRunsJson = decode(&what, page)?;
             for run in runs.check_runs {
                 let outcome = check_run_outcome(&what, &run)?;
@@ -756,7 +857,7 @@ impl GitHubApi for RestClient {
 
         let path = format!("/commits/{sha}/status");
         let what = format!("GET {path}");
-        for page in self.get_pages(&path)? {
+        for page in self.get_pages(&path, failure)? {
             let combined: CombinedStatusJson = decode(&what, page)?;
             for status in combined.statuses {
                 let outcome = match status.state.as_str() {
@@ -818,6 +919,164 @@ impl GitHubApi for RestClient {
             404 => Ok(false),
             _ => Err(failure(Method::Get, &path, &response)),
         }
+    }
+
+    fn find_ruleset(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<(RulesetId, BTreeSet<String>)>, ApiError> {
+        let path = "/rulesets?includes_parents=false";
+        let mut found = Vec::new();
+        for page in self.get_pages(path, admin_failure)? {
+            let listed: Vec<RulesetSummaryJson> = decode(&format!("GET {path}"), page)?;
+            found.extend(listed.into_iter().filter(|r| r.name == name).map(|r| r.id));
+        }
+        let id = match found[..] {
+            [] => return Ok(None),
+            [id] => id,
+            _ => {
+                return Err(permanent(format!(
+                    "GET {path}: {} rulesets are named {name:?}; the queue owns one, \
+                     delete the others",
+                    found.len()
+                )));
+            }
+        };
+        let path = format!("/rulesets/{id}");
+        let what = format!("GET {path}");
+        let response = self.call(Method::Get, &path, None)?;
+        if response.status != 200 {
+            return Err(admin_failure(Method::Get, &path, &response));
+        }
+        let ruleset: RulesetJson = decode(&what, response.json(&what)?)?;
+        let branches = ruleset
+            .conditions
+            .ref_name
+            .include
+            .iter()
+            .map(|name| {
+                name.strip_prefix("refs/heads/")
+                    .map(str::to_owned)
+                    .ok_or_else(|| permanent(format!("{what}: {name:?} is not a branch")))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Some((RulesetId(id), branches)))
+    }
+
+    fn create_ruleset(
+        &mut self,
+        name: &str,
+        branches: &BTreeSet<String>,
+    ) -> Result<RulesetId, ApiError> {
+        let path = "/rulesets";
+        let what = format!("POST {path}");
+        let mut body = ruleset_body(branches);
+        body["name"] = json!(name);
+        let response = self.call(Method::Post, path, Some(&body))?;
+        if response.status != 201 {
+            return Err(admin_failure(Method::Post, path, &response));
+        }
+        let created: RulesetSummaryJson = decode(&what, response.json(&what)?)?;
+        Ok(RulesetId(created.id))
+    }
+
+    fn update_ruleset(
+        &mut self,
+        id: RulesetId,
+        branches: &BTreeSet<String>,
+    ) -> Result<bool, ApiError> {
+        let path = format!("/rulesets/{}", id.0);
+        let response = self.call(Method::Put, &path, Some(&ruleset_body(branches)))?;
+        match response.status {
+            200 => Ok(true),
+            404 => Ok(false),
+            _ => Err(admin_failure(Method::Put, &path, &response)),
+        }
+    }
+
+    fn delete_ruleset(&mut self, id: RulesetId) -> Result<(), ApiError> {
+        let path = format!("/rulesets/{}", id.0);
+        let response = self.call(Method::Delete, &path, None)?;
+        match response.status {
+            204 | 404 => Ok(()),
+            _ => Err(admin_failure(Method::Delete, &path, &response)),
+        }
+    }
+
+    fn list_runs(&mut self, head: &Sha) -> Result<Vec<WorkflowRun>, ApiError> {
+        let path = format!("/actions/runs?head_sha={head}");
+        let what = format!("GET {path}");
+        let mut runs = Vec::new();
+        for page in self.get_pages(&path, actions_failure)? {
+            let listed: WorkflowRunsJson = decode(&what, page)?;
+            runs.extend(listed.workflow_runs.into_iter().map(|run| WorkflowRun {
+                id: RunId(run.id),
+                head_branch: run.head_branch,
+                completed: run.status.as_deref() == Some("completed"),
+            }));
+        }
+        Ok(runs)
+    }
+
+    fn cancel_run(&mut self, id: RunId) -> Result<(), ApiError> {
+        let path = format!("/actions/runs/{}/cancel", id.0);
+        let response = self.call(Method::Post, &path, None)?;
+        match response.status {
+            // 409: the run has already completed.
+            202 | 404 | 409 => Ok(()),
+            _ => Err(actions_failure(Method::Post, &path, &response)),
+        }
+    }
+}
+
+/// The body of the queue's ruleset, less its name: an active branch
+/// ruleset that refuses every update of `branches` to everyone.
+fn ruleset_body(branches: &BTreeSet<String>) -> Value {
+    let include: Vec<String> = branches.iter().map(|b| crate::branch(b)).collect();
+    json!({
+        "target": "branch",
+        "enforcement": "active",
+        "bypass_actors": [],
+        "conditions": { "ref_name": { "include": include, "exclude": [] } },
+        "rules": [{ "type": "update" }],
+    })
+}
+
+/// [`failure`], naming the permission a ruleset call needs when GitHub
+/// refuses it for good with a `403`.
+fn admin_failure(method: Method, path: &str, response: &HttpResponse) -> ApiError {
+    permission_failure(
+        method,
+        path,
+        response,
+        "the Administration permission: read/write, for the queue's branch-lock ruleset",
+    )
+}
+
+/// [`failure`], naming the permission a workflow-run call needs when GitHub
+/// refuses it for good with a `403`.
+fn actions_failure(method: Method, path: &str, response: &HttpResponse) -> ApiError {
+    permission_failure(
+        method,
+        path,
+        response,
+        "the Actions permission: read/write, for cancelling a retired batch's workflow runs",
+    )
+}
+
+/// [`failure`], with "the credential needs `needs`" appended to a
+/// permanent `403`; a rate-limited `403` stays transient.
+fn permission_failure(
+    method: Method,
+    path: &str,
+    response: &HttpResponse,
+    needs: &str,
+) -> ApiError {
+    match failure(method, path, response) {
+        ApiError::Permanent(e) if response.status == 403 => {
+            permanent(format!("{e} (the credential needs {needs})"))
+        }
+        error => error,
     }
 }
 
@@ -1007,14 +1266,20 @@ fn send(agent: &ureq::Agent, request: &HttpRequest<'_>) -> Result<HttpResponse, 
             .header("X-GitHub-Api-Version", "2022-11-28")
             .header("Authorization", authorization)
     }
-    let empty = Value::Null;
+    // A request with no body sends none, rather than a JSON `null`.
+    let send_body = |builder: ureq::RequestBuilder<ureq::typestate::WithBody>| {
+        let builder = headers(builder, authorization);
+        match request.body {
+            Some(body) => builder.send_json(body),
+            None => builder.send_empty(),
+        }
+    };
     let result = match request.method {
         Method::Get => headers(agent.get(request.url), authorization).call(),
         Method::Delete => headers(agent.delete(request.url), authorization).call(),
-        Method::Post => headers(agent.post(request.url), authorization)
-            .send_json(request.body.unwrap_or(&empty)),
-        Method::Patch => headers(agent.patch(request.url), authorization)
-            .send_json(request.body.unwrap_or(&empty)),
+        Method::Post => send_body(agent.post(request.url)),
+        Method::Patch => send_body(agent.patch(request.url)),
+        Method::Put => send_body(agent.put(request.url)),
     };
     let mut response = result.map_err(transport_error)?;
     let headers = response
@@ -1142,8 +1407,11 @@ struct PrJson {
     head: HeadJson,
     base: BranchJson,
     labels: Vec<LabelJson>,
+    /// Only the single-item endpoint carries it.
     #[serde(default)]
-    mergeable: Option<bool>,
+    mergeable_state: Option<String>,
+    #[serde(default)]
+    draft: Option<bool>,
     /// Only the single-item endpoint carries it.
     #[serde(default)]
     merged: Option<bool>,
@@ -1176,6 +1444,39 @@ struct StatusJson {
     context: String,
     state: String,
     updated_at: String,
+}
+
+#[derive(Deserialize)]
+struct RulesetSummaryJson {
+    id: u64,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct RulesetJson {
+    conditions: RulesetConditionsJson,
+}
+
+#[derive(Deserialize)]
+struct RulesetConditionsJson {
+    ref_name: RefNameConditionJson,
+}
+
+#[derive(Deserialize)]
+struct RefNameConditionJson {
+    include: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkflowRunsJson {
+    workflow_runs: Vec<WorkflowRunJson>,
+}
+
+#[derive(Deserialize)]
+struct WorkflowRunJson {
+    id: u64,
+    head_branch: Option<String>,
+    status: Option<String>,
 }
 
 #[derive(Deserialize)]
