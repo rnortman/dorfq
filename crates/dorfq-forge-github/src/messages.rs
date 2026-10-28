@@ -1,13 +1,26 @@
-//! What the forge tells authors (rule 9): one issue comment per transition,
-//! each beginning with a hidden marker so the comment thread is the forge's
-//! own journal of what it has said.
+//! What the forge tells authors (rule 9): one issue comment per transition
+//! the forge tells — what the queue did or decided, and what the author has
+//! to do (**The rule** below) — each beginning with a hidden marker so the
+//! comment thread is the forge's own journal of what it has said.
+//!
+//! # The rule
+//!
+//! The queue tells an author what the queue did or decided, and what the
+//! author has to do that GitHub does not already show on the pull request.
+//! It says nothing about GitHub's own state — a check pending or failed, a
+//! draft, an unmet protection rule, mergeability being recomputed — since
+//! GitHub shows each on the pull request and the queue waits on GitHub to
+//! report it ready; and nothing about the author's own acts, a label
+//! removed or a pull request closed.
+//!
+//! # Markers
 //!
 //! The marker is `<!-- dorfq: <event> -->`, with `event` one of `queued`,
-//! `held`, `testing`, `landed`, `ejected`, `notice`, `withdrawn`,
-//! `blocked`; a `blocked` marker also names the blocker, `blocked #<n>` or
-//! `blocked branch <name>`. A `notice` is the scheduler telling the author
-//! what it believes; it is not a transition, the pull request stays queued,
-//! and every reading of the thread skips it. A pull request whose last
+//! `held`, `testing`, `landed`, `ejected`, `notice`, `blocked`; a `blocked`
+//! marker also names the blocker, `blocked #<n>` or `blocked branch
+//! <name>`. A `notice` is the scheduler telling the author what it
+//! believes; it is not a transition, the pull request stays queued, and
+//! every reading of the thread skips it. A pull request whose last
 //! transition marker is `queued`, `held` or `testing` was greeted already;
 //! any other, or none, means it is entering the queue.
 
@@ -30,8 +43,13 @@ pub enum Event {
     Queued,
     /// The pull request is enqueued but held back for `holds`.
     Held { holds: BTreeSet<Hold> },
-    /// The pull request is in batch `batch`, published at `tip`.
-    Testing { batch: BatchId, tip: Sha },
+    /// The pull request is in batch `batch`, published at `tip`; `locked`
+    /// when its head branch is locked until the batch ends.
+    Testing {
+        batch: BatchId,
+        tip: Sha,
+        locked: bool,
+    },
     /// The pull request landed with batch `batch`; trunk was fast-forwarded
     /// to `tip`.
     Landed { batch: BatchId, tip: Sha },
@@ -40,8 +58,6 @@ pub enum Event {
     /// The scheduler told the author what it believes; the pull request
     /// stays queued.
     Notice { reason: NoticeReason },
-    /// The pull request left the queue by neither landing nor ejection.
-    Withdrawn,
     /// The pull request carries the label but is not enqueued, for `on`.
     Blocked { on: Blocker },
 }
@@ -75,7 +91,6 @@ pub enum Marker {
     Landed,
     Ejected,
     Notice,
-    Withdrawn,
     Blocked,
 }
 
@@ -91,7 +106,6 @@ impl Marker {
             Marker::Landed => "landed",
             Marker::Ejected => "ejected",
             Marker::Notice => "notice",
-            Marker::Withdrawn => "withdrawn",
             Marker::Blocked => "blocked",
         }
     }
@@ -109,7 +123,6 @@ impl Marker {
             Marker::Landed,
             Marker::Ejected,
             Marker::Notice,
-            Marker::Withdrawn,
             Marker::Blocked,
         ]
         .into_iter()
@@ -171,7 +184,6 @@ impl Event {
             Event::Landed { .. } => Marker::Landed,
             Event::Ejected { .. } => Marker::Ejected,
             Event::Notice { .. } => Marker::Notice,
-            Event::Withdrawn => Marker::Withdrawn,
             Event::Blocked { .. } => Marker::Blocked,
         }
     }
@@ -182,47 +194,48 @@ impl Message {
     /// `trunk` and `label` are the configured branch and intent label.
     pub fn body(&self, trunk: &str, label: &str) -> String {
         let text = match &self.event {
-            Event::Queued => format!(
-                "This pull request is in the merge queue. It will be tested in a batch \
-                 with other queued pull requests and landed by fast-forwarding `{trunk}` \
-                 when the batch passes. Removing the `{label}` label withdraws it."
-            ),
-            Event::Held { holds } => format!(
-                "Waiting in the merge queue: {}. It joins a batch once nothing holds it.",
-                list(holds)
-            ),
-            Event::Testing { batch, tip } => format!(
-                "Testing in batch {batch}, branch `{branch}`, tip {tip}.",
-                batch = batch.0,
-                branch = crate::batch_branch(*batch)
-            ),
+            Event::Queued => {
+                format!("In the merge queue. Remove the `{label}` label to take it out.")
+            }
+            Event::Held { holds } => {
+                let sentences: Vec<String> = holds.iter().map(held_sentence).collect();
+                format!("Waiting: {}", sentences.join(" "))
+            }
+            Event::Testing { batch, tip, locked } => {
+                let mut text = format!(
+                    "Testing in batch {batch}: `{branch}` at {tip}.",
+                    batch = batch.0,
+                    branch = crate::batch_branch(*batch)
+                );
+                if *locked {
+                    text.push_str(&format!(
+                        " Its branch is locked until the batch ends; remove the `{label}` \
+                         label to push."
+                    ));
+                }
+                text
+            }
             Event::Landed { batch, tip } => {
                 format!("Landed in batch {}; `{trunk}` is now {tip}.", batch.0)
             }
             Event::Ejected { reason, base } => {
                 format!(
-                    "Ejected from the merge queue: {reason}. {}",
+                    "Ejected: {reason}. {}",
                     next_step(reason, *base, trunk, label)
                 )
             }
             Event::Notice { reason } => notice(reason, trunk),
-            Event::Withdrawn => {
-                "Left the merge queue (label removed, pull request closed, or retargeted)."
-                    .to_owned()
-            }
             Event::Blocked {
                 on: Blocker::Pr(pr),
             } => format!(
-                "Not in the merge queue: its base #{pr} is not queued. It enters the queue \
-                 once #{pr} does, or retarget it onto `{trunk}`.",
+                "Not queued: its base #{pr} is not. Label #{pr}, or retarget this onto `{trunk}`.",
                 pr = pr.0
             ),
             Event::Blocked {
                 on: Blocker::Branch(name),
             } => format!(
-                "Not in the merge queue: it targets `{name}`, which is neither `{trunk}` nor \
-                 the branch of a queued pull request. Retarget it onto `{trunk}` or onto a \
-                 queued pull request's branch."
+                "Not queued: it targets `{name}`, which is neither `{trunk}` nor a queued pull \
+                 request's branch."
             ),
         };
         let marker = match &self.event {
@@ -240,52 +253,54 @@ fn next_step(reason: &EjectReason, base: PrBase, trunk: &str, label: &str) -> St
         EjectReason::Conflicts {
             with: ConflictWith::Pr(pr),
         } if base == PrBase::Pr(*pr) => format!(
-            "It does not merge into its base #{pr}. Rebase onto #{pr}'s branch, then re-add \
-             the `{label}` label.",
+            "Rebase onto #{pr}'s branch and re-add the `{label}` label.",
             pr = pr.0
         ),
         EjectReason::Conflicts {
             with: ConflictWith::Trunk,
-        } => format!("Merge or rebase onto `{trunk}`, then re-add the `{label}` label."),
+        } => format!("Rebase onto `{trunk}` and re-add the `{label}` label."),
         EjectReason::Conflicts {
             with: ConflictWith::Pr(pr),
         } => format!(
-            "#{pr} is ahead of it in the queue. Once #{pr} lands, rebase onto `{trunk}`, \
-             then re-add the `{label}` label.",
+            "Once #{pr} lands, rebase onto `{trunk}` and re-add the `{label}` label.",
             pr = pr.0
         ),
         EjectReason::BatchFailed { batch } => format!(
-            "The batch failed its checks on `{branch}`. Re-add the `{label}` label to try \
-             again.",
+            "See the checks on `{branch}`. Re-add the `{label}` label to try again.",
             branch = crate::batch_branch(*batch)
         ),
-        _ => format!("Re-add the `{label}` label once that is addressed."),
+        _ => format!("Re-add the `{label}` label to try again."),
     }
 }
 
-/// What the scheduler believes about a queued pull request, in a sentence
-/// per reason.
+/// What the scheduler believes about a queued pull request, and what the
+/// queue does next.
 fn notice(reason: &NoticeReason, trunk: &str) -> String {
     match reason {
         NoticeReason::Broken { batch } => format!(
-            "Heads-up from the merge queue: this pull request is probably broken against \
-             `{trunk}`. Batch {n} (`{branch}`) failed and nothing else in it explains the \
-             failure. It stays in the queue and is ejected only if the queue becomes sure; \
-             to settle it sooner, rebase onto `{trunk}` and let its own checks run again.",
+            "Batch {n} (`{branch}`) failed and this pull request is the likely cause. It \
+             stays queued, and is ejected if the queue becomes sure; to settle it, rebase \
+             onto `{trunk}` and let its checks run.",
             n = batch.0,
             branch = crate::batch_branch(*batch)
         ),
         NoticeReason::InteractsWith { pr, batch } => format!(
-            "Heads-up from the merge queue: this pull request probably passes on its own but \
-             fails together with #{pr}, last in batch {n} (`{branch}`). It stays in the queue \
-             and is not tested with #{pr} again. If #{pr} lands first, this one is tested alone \
-             on the new `{trunk}` and ejected if that fails; to settle it sooner, rebase onto \
-             `{trunk}` once #{pr} lands and fix the interaction. If this one lands first, the \
-             interaction is #{pr}'s to fix.",
+            "Batch {n} (`{branch}`) failed; this pull request and #{pr} probably fail only \
+             together. They are not batched together again; once #{pr} lands, this one is \
+             tested alone and ejected if that fails. To settle it, rebase onto `{trunk}` \
+             after #{pr} lands and fix the interaction.",
             pr = pr.0,
             n = batch.0,
             branch = crate::batch_branch(*batch)
         ),
+    }
+}
+
+/// One sentence for a hold the author is told about.
+fn held_sentence(hold: &Hold) -> String {
+    match hold {
+        Hold::AncestorMoved { pr } => format!("#{} has moved; rebase onto it.", pr.0),
+        hold => format!("{hold}."),
     }
 }
 
@@ -307,7 +322,6 @@ impl fmt::Display for Message {
             Event::Landed { tip, .. } => write!(f, "landed as {tip}"),
             Event::Ejected { reason, .. } => write!(f, "ejected: {reason}"),
             Event::Notice { reason } => write!(f, "notice: {reason}"),
-            Event::Withdrawn => f.write_str("withdrawn"),
             Event::Blocked { on } => write!(f, "blocked on {on}"),
         }
     }
@@ -338,11 +352,12 @@ mod tests {
         vec![
             Event::Queued,
             Event::Held {
-                holds: BTreeSet::from([Hold::MergeabilityUnknown, Hold::OwnCiPending]),
+                holds: BTreeSet::from([Hold::AncestorMoved { pr: PrNumber(9) }]),
             },
             Event::Testing {
                 batch: BatchId(7),
                 tip: tip.clone(),
+                locked: true,
             },
             Event::Landed {
                 batch: BatchId(7),
@@ -355,7 +370,6 @@ mod tests {
                 with: ConflictWith::Pr(PrNumber(9)),
             }),
             ejected(EjectReason::BatchFailed { batch: BatchId(7) }),
-            Event::Withdrawn,
             Event::Blocked {
                 on: Blocker::Pr(PrNumber(9)),
             },
@@ -414,7 +428,7 @@ mod tests {
         assert!(!told_blocked(&renamed, &on_branch));
         let later = vec![
             blocked(&on_pr),
-            message(Event::Withdrawn).body("main", "queue"),
+            message(Event::Queued).body("main", "queue"),
         ];
         assert!(!told_blocked(&later, &on_pr));
         assert!(!told_blocked(&[], &on_pr));
@@ -426,95 +440,67 @@ mod tests {
 
     #[test]
     fn bodies_carry_what_the_author_needs() {
-        let bodies: Vec<String> = every_event()
+        let texts: Vec<String> = every_event()
             .into_iter()
-            .map(|e| message(e).body("main", "queue"))
+            .map(|e| {
+                let body = message(e).body("main", "queue");
+                let (_, text) = body.split_once('\n').unwrap();
+                text.to_owned()
+            })
             .collect();
-        assert!(
-            bodies[0].contains("`queue` label withdraws"),
-            "{}",
-            bodies[0]
+        assert_eq!(
+            texts,
+            [
+                "In the merge queue. Remove the `queue` label to take it out.\n".to_owned(),
+                "Waiting: #9 has moved; rebase onto it.\n".to_owned(),
+                format!(
+                    "Testing in batch 7: `dorfq/batch/7` at {TIP}. Its branch is locked until \
+                     the batch ends; remove the `queue` label to push.\n"
+                ),
+                format!("Landed in batch 7; `main` is now {TIP}.\n"),
+                "Ejected: conflicts with trunk. Rebase onto `main` and re-add the `queue` \
+                 label.\n"
+                    .to_owned(),
+                "Ejected: conflicts with #9. Once #9 lands, rebase onto `main` and re-add the \
+                 `queue` label.\n"
+                    .to_owned(),
+                "Ejected: batch 7 failed. See the checks on `dorfq/batch/7`. Re-add the \
+                 `queue` label to try again.\n"
+                    .to_owned(),
+                "Not queued: its base #9 is not. Label #9, or retarget this onto `main`.\n"
+                    .to_owned(),
+                "Not queued: it targets `release`, which is neither `main` nor a queued pull \
+                 request's branch.\n"
+                    .to_owned(),
+                "Ejected: conflicts with #9. Rebase onto #9's branch and re-add the `queue` \
+                 label.\n"
+                    .to_owned(),
+                "Batch 7 (`dorfq/batch/7`) failed and this pull request is the likely cause. \
+                 It stays queued, and is ejected if the queue becomes sure; to settle it, \
+                 rebase onto `main` and let its checks run.\n"
+                    .to_owned(),
+                "Batch 7 (`dorfq/batch/7`) failed; this pull request and #9 probably fail \
+                 only together. They are not batched together again; once #9 lands, this one \
+                 is tested alone and ejected if that fails. To settle it, rebase onto `main` \
+                 after #9 lands and fix the interaction.\n"
+                    .to_owned(),
+            ]
         );
-        assert!(
-            bodies[0].contains("fast-forwarding `main`"),
-            "{}",
-            bodies[0]
-        );
-        assert!(bodies[1].contains(
-            "Waiting in the merge queue: own CI pending, mergeability unknown. It joins"
-        ));
-        assert!(bodies[2].contains("batch 7, branch `dorfq/batch/7`, tip"));
-        assert!(bodies[2].contains(TIP));
-        assert!(bodies[3].contains(&format!("`main` is now {TIP}")));
-        assert!(bodies[4].contains("queue: conflicts with trunk. Merge or rebase onto `main`"));
-        assert!(bodies[4].contains("re-add the `queue` label"));
-        assert!(bodies[5].contains("conflicts with #9. #9 is ahead"));
-        assert!(bodies[5].contains("Once #9 lands, rebase"));
-        assert!(
-            bodies[6].contains("batch 7 failed. The batch failed its checks on `dorfq/batch/7`")
-        );
-        assert!(
-            bodies[7].contains(
-                "Left the merge queue (label removed, pull request closed, or retargeted)."
-            )
-        );
-        assert!(
-            bodies[8].contains(
-                "Not in the merge queue: its base #9 is not queued. It enters the queue \
-                 once #9 does, or retarget it onto `main`."
-            ),
-            "{}",
-            bodies[8]
-        );
-        assert!(
-            bodies[9].contains(
-                "Not in the merge queue: it targets `release`, which is neither `main` nor \
-                 the branch of a queued pull request. Retarget it onto `main` or onto a \
-                 queued pull request's branch."
-            ),
-            "{}",
-            bodies[9]
-        );
-        assert!(
-            bodies[10].contains(
-                "conflicts with #9. It does not merge into its base #9. Rebase onto #9's \
-                 branch, then re-add the `queue` label."
-            ),
-            "{}",
-            bodies[10]
-        );
-        assert!(
-            bodies[11].contains(
-                "Heads-up from the merge queue: this pull request is probably broken against \
-                 `main`. Batch 7 (`dorfq/batch/7`) failed and nothing else in it explains \
-                 the failure. It stays in the queue"
-            ),
-            "{}",
-            bodies[11]
-        );
-        assert!(
-            bodies[11].contains("rebase onto `main` and let its own checks run again."),
-            "{}",
-            bodies[11]
-        );
-        assert!(
-            bodies[12].contains(
-                "probably passes on its own but fails together with #9, last in batch 7 \
-                 (`dorfq/batch/7`). It stays in the queue and is not tested with #9 again"
-            ),
-            "{}",
-            bodies[12]
-        );
-        assert!(
-            bodies[12].contains("rebase onto `main` once #9 lands and fix the interaction."),
-            "{}",
-            bodies[12]
-        );
-        assert!(
-            bodies[12].contains("the interaction is #9's to fix"),
-            "{}",
-            bodies[12]
-        );
+        let unlocked = message(Event::Testing {
+            batch: BatchId(7),
+            tip: Sha::parse(TIP).unwrap(),
+            locked: false,
+        })
+        .body("main", "queue");
+        assert!(!unlocked.contains("locked"), "{unlocked}");
+        let other = message(Event::Ejected {
+            reason: EjectReason::Conflicts {
+                with: ConflictWith::Trunk,
+            },
+            base: PrBase::Pr(PrNumber(9)),
+        })
+        .body("main", "queue");
+        assert!(other.contains("Rebase onto `main`"), "{other}");
     }
 
     #[test]
@@ -527,13 +513,12 @@ mod tests {
             lines,
             [
                 "message to pr 12: queued".to_owned(),
-                "message to pr 12: held: own CI pending, mergeability unknown".to_owned(),
+                "message to pr 12: held: ancestor #9 moved".to_owned(),
                 "message to pr 12: testing in batch 7".to_owned(),
                 format!("message to pr 12: landed as {TIP}"),
                 "message to pr 12: ejected: conflicts with trunk".to_owned(),
                 "message to pr 12: ejected: conflicts with #9".to_owned(),
                 "message to pr 12: ejected: batch 7 failed".to_owned(),
-                "message to pr 12: withdrawn".to_owned(),
                 "message to pr 12: blocked on #9".to_owned(),
                 "message to pr 12: blocked on branch release".to_owned(),
                 "message to pr 12: ejected: conflicts with #9".to_owned(),
@@ -573,12 +558,17 @@ mod tests {
         assert!(needs_greeting(&[]));
         assert!(needs_greeting(&["LGTM".to_owned()]));
         for greeted in ["queued", "held", "testing"] {
-            let thread = vec![body("withdrawn"), body(greeted), "LGTM".to_owned()];
+            let thread = vec![body("landed"), body(greeted), "LGTM".to_owned()];
             assert!(!needs_greeting(&thread), "{greeted}");
-            let notified = vec![body("withdrawn"), body(greeted), body("notice")];
+            let notified = vec![body("landed"), body(greeted), body("notice")];
             assert!(!needs_greeting(&notified), "{greeted} then notice");
+            // An old `withdrawn` comment reads as unmarked: the comment
+            // before it decides.
+            let withdrawn = vec![body(greeted), body("withdrawn")];
+            assert!(!needs_greeting(&withdrawn), "{greeted} then withdrawn");
         }
-        for left in ["landed", "ejected", "withdrawn", "blocked"] {
+        assert!(needs_greeting(&[body("withdrawn")]));
+        for left in ["landed", "ejected", "blocked"] {
             let thread = vec![body("queued"), body(left), "please re-queue".to_owned()];
             assert!(needs_greeting(&thread), "{left}");
             let notified = vec![body("queued"), body(left), body("notice")];

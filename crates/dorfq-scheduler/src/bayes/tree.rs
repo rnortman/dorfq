@@ -662,7 +662,7 @@ mod tests {
         });
         let mut prs: Vec<_> = (1..=n)
             .chain(102..=n + 101)
-            .map(|k| stale(held(k, Hold::Review), 1))
+            .map(|k| stale(held(k, Hold::Protection), 1))
             .collect();
         prs.extend([stale(ready(n + 1), 1), stale(ready(101), 1)]);
         let input = observation(prs, vec![]);

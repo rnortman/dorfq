@@ -13,8 +13,8 @@ use std::rc::Rc;
 use dorfq_core::{PrNumber, Sha};
 
 use crate::api::{
-    ApiError, CheckResult, Commit, Compare, CompareStatus, GitHubApi, Merge, PrDetail, PrSummary,
-    RefEntry, RefUpdate,
+    ApiError, CheckResult, Commit, Compare, CompareStatus, GitHubApi, Merge, MergeState, PrDetail,
+    PrSummary, RefEntry, RefUpdate, RulesetId, RunId, WorkflowRun,
 };
 use crate::branch;
 
@@ -34,8 +34,17 @@ pub struct FakePr {
     pub head_branch: Option<String>,
     pub labels: Vec<String>,
     pub title: String,
-    pub mergeable: Option<bool>,
+    pub merge_state: MergeState,
+    pub draft: bool,
     pub merged: bool,
+}
+
+/// An Actions workflow run.
+#[derive(Debug, Clone)]
+pub struct FakeRun {
+    pub head: Sha,
+    pub head_branch: Option<String>,
+    pub completed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -62,12 +71,25 @@ pub struct State {
     /// A pull request whose next base change applies and then fails
     /// `Transient`, as a response lost in transit would.
     pub lose_set_base: Option<u64>,
+    /// A pull request whose next label removal applies and then fails
+    /// `Transient`, as a response lost in transit would.
+    pub lose_remove_label: Option<u64>,
+    /// The next ruleset creation applies and then fails `Transient`, as a
+    /// response lost in transit would.
+    pub lose_create_ruleset: bool,
+    /// A pull request whose base branch a ruleset locks reads `Blocked`, as
+    /// GitHub may report a base nobody can update.
+    pub lock_blocks_children: bool,
     /// Pull requests every listing returns a second time, at the given head,
     /// as a page boundary shifting under a paginated read does.
     pub listed_again: Vec<(u64, Sha)>,
     /// Open pull requests every listing leaves out, as a page boundary
     /// shifting the other way does.
     pub unlisted: BTreeSet<u64>,
+    /// Rulesets by id: name and the branches, by short name, each locks.
+    pub rulesets: BTreeMap<RulesetId, (String, BTreeSet<String>)>,
+    /// Actions workflow runs by id.
+    pub runs: BTreeMap<RunId, FakeRun>,
     /// Every call, as `"<method> <arguments>"`.
     pub calls: Vec<String>,
     /// Failures to inject: method, a substring of the call's arguments,
@@ -163,7 +185,8 @@ impl FakeGitHub {
                 head_branch: Some(head_branch),
                 labels: vec!["queue".to_owned()],
                 title: format!("Change {number}"),
-                mergeable: Some(true),
+                merge_state: MergeState::Clean,
+                draft: false,
                 merged: false,
             },
         );
@@ -171,13 +194,70 @@ impl FakeGitHub {
     }
 
     /// Moves pull request `number`'s head, and its head branch with it.
+    /// Panics on a branch a ruleset locks.
     pub fn push(&self, number: u64, sha: &Sha) {
+        if let Err(locked) = self.try_push(number, sha) {
+            panic!("{locked}");
+        }
+    }
+
+    /// [`FakeGitHub::push`], refused with the branch's name when a ruleset
+    /// locks it, as GitHub refuses a push.
+    pub fn try_push(&self, number: u64, sha: &Sha) -> Result<(), String> {
         let mut state = self.state();
+        let name = state.prs[&number].head_branch.clone();
+        if let Some(name) = &name
+            && state
+                .rulesets
+                .values()
+                .any(|(_, locked)| locked.contains(name))
+        {
+            return Err(format!("push to {name} refused: a ruleset locks it"));
+        }
         let pr = state.prs.get_mut(&number).expect("pull request exists");
         pr.head = sha.clone();
-        if let Some(name) = pr.head_branch.clone() {
+        if let Some(name) = name {
             state.refs.insert(branch(&name), sha.clone());
         }
+        Ok(())
+    }
+
+    /// The branches the queue's ruleset locks; `None` when there is none.
+    pub fn locked(&self) -> Option<BTreeSet<String>> {
+        self.state()
+            .rulesets
+            .values()
+            .find(|(name, _)| name == crate::LOCK_RULESET)
+            .map(|(_, branches)| branches.clone())
+    }
+
+    /// A workflow run in progress on `head`, triggered on `branch`.
+    pub fn run_on(&self, head: &Sha, branch: &str) -> RunId {
+        self.add_run(head, Some(branch))
+    }
+
+    /// A workflow run in progress on `head` that GitHub records no branch for.
+    pub fn run_without_branch(&self, head: &Sha) -> RunId {
+        self.add_run(head, None)
+    }
+
+    fn add_run(&self, head: &Sha, branch: Option<&str>) -> RunId {
+        let mut state = self.state();
+        state.next += 1;
+        let id = RunId(state.next);
+        state.runs.insert(
+            id,
+            FakeRun {
+                head: head.clone(),
+                head_branch: branch.map(str::to_owned),
+                completed: false,
+            },
+        );
+        id
+    }
+
+    pub fn run_completed(&self, id: RunId) -> bool {
+        self.state().runs[&id].completed
     }
 
     pub fn pr(&self, number: u64) -> std::cell::RefMut<'_, FakePr> {
@@ -232,6 +312,10 @@ impl FakeGitHub {
             "remove_label",
             "create_comment",
             "set_base",
+            "create_ruleset",
+            "update_ruleset",
+            "delete_ruleset",
+            "cancel_run",
         ])
     }
 
@@ -483,7 +567,17 @@ impl GitHubApi for FakeGitHub {
             base: pr.base.clone(),
             head: pr.head.clone(),
             labels: pr.labels.clone(),
-            mergeable: pr.mergeable,
+            merge_state: if state.lock_blocks_children
+                && state
+                    .rulesets
+                    .values()
+                    .any(|(_, locked)| locked.contains(&pr.base))
+            {
+                MergeState::Blocked
+            } else {
+                pr.merge_state
+            },
+            draft: pr.draft,
             merged: pr.merged,
         })
     }
@@ -496,7 +590,7 @@ impl GitHubApi for FakeGitHub {
             .get_mut(&number.0)
             .ok_or_else(|| permanent(format!("set_base {}: no such pull request", number.0)))?;
         pr.base = base.to_owned();
-        pr.mergeable = None;
+        pr.merge_state = MergeState::Unknown;
         if state.lose_set_base == Some(number.0) {
             state.lose_set_base = None;
             return Err(ApiError::Transient(
@@ -529,8 +623,15 @@ impl GitHubApi for FakeGitHub {
 
     fn remove_label(&mut self, number: PrNumber, label: &str) -> Result<(), ApiError> {
         self.enter("remove_label", format!("{} {label}", number.0))?;
-        if let Some(pr) = self.state().prs.get_mut(&number.0) {
+        let mut state = self.state();
+        if let Some(pr) = state.prs.get_mut(&number.0) {
             pr.labels.retain(|l| l != label);
+        }
+        if state.lose_remove_label == Some(number.0) {
+            state.lose_remove_label = None;
+            return Err(ApiError::Transient(
+                format!("remove_label {}: response lost", number.0).into(),
+            ));
         }
         Ok(())
     }
@@ -553,6 +654,92 @@ impl GitHubApi for FakeGitHub {
     fn label_exists(&mut self, label: &str) -> Result<bool, ApiError> {
         self.enter("label_exists", label.to_owned())?;
         Ok(self.state().labels.contains(label))
+    }
+
+    fn find_ruleset(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<(RulesetId, BTreeSet<String>)>, ApiError> {
+        self.enter("find_ruleset", name.to_owned())?;
+        let state = self.state();
+        let found: Vec<_> = state
+            .rulesets
+            .iter()
+            .filter(|(_, (n, _))| n == name)
+            .map(|(&id, (_, branches))| (id, branches.clone()))
+            .collect();
+        match &found[..] {
+            [] => Ok(None),
+            [one] => Ok(Some(one.clone())),
+            _ => Err(permanent(format!(
+                "find_ruleset: two rulesets named {name:?}"
+            ))),
+        }
+    }
+
+    fn create_ruleset(
+        &mut self,
+        name: &str,
+        branches: &BTreeSet<String>,
+    ) -> Result<RulesetId, ApiError> {
+        self.enter("create_ruleset", format!("{name} {branches:?}"))?;
+        let mut state = self.state();
+        state.next += 1;
+        let id = RulesetId(state.next);
+        state
+            .rulesets
+            .insert(id, (name.to_owned(), branches.clone()));
+        if state.lose_create_ruleset {
+            state.lose_create_ruleset = false;
+            return Err(ApiError::Transient("create_ruleset: response lost".into()));
+        }
+        Ok(id)
+    }
+
+    fn update_ruleset(
+        &mut self,
+        id: RulesetId,
+        branches: &BTreeSet<String>,
+    ) -> Result<bool, ApiError> {
+        self.enter("update_ruleset", format!("{} {branches:?}", id.0))?;
+        Ok(match self.state().rulesets.get_mut(&id) {
+            Some((_, locked)) => {
+                locked.clone_from(branches);
+                true
+            }
+            None => false,
+        })
+    }
+
+    fn delete_ruleset(&mut self, id: RulesetId) -> Result<(), ApiError> {
+        self.enter("delete_ruleset", id.0.to_string())?;
+        self.state().rulesets.remove(&id);
+        Ok(())
+    }
+
+    fn list_runs(&mut self, head: &Sha) -> Result<Vec<WorkflowRun>, ApiError> {
+        self.enter("list_runs", head.to_string())?;
+        // Newest first, as GitHub lists them.
+        Ok(self
+            .state()
+            .runs
+            .iter()
+            .rev()
+            .filter(|(_, run)| run.head == *head)
+            .map(|(&id, run)| WorkflowRun {
+                id,
+                head_branch: run.head_branch.clone(),
+                completed: run.completed,
+            })
+            .collect())
+    }
+
+    fn cancel_run(&mut self, id: RunId) -> Result<(), ApiError> {
+        self.enter("cancel_run", id.0.to_string())?;
+        if let Some(run) = self.state().runs.get_mut(&id) {
+            run.completed = true;
+        }
+        Ok(())
     }
 }
 

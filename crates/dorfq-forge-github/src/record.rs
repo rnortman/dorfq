@@ -8,12 +8,18 @@
 //! base: <sha>
 //! member: 12 <sha>
 //! member: 15 <sha>
+//! moved: 15 12 <branch>
 //! state: <state>
 //! ```
 //!
+//! A `moved:` line names a member `land` moves onto trunk, the pull request
+//! it was stacked on, and that pull request's head branch, which the member
+//! is put back on if the batch does not land. The lines are optional in
+//! every state, and each names a member.
 //! `state` is one of `started`, `testing <tip>`, `conflict <pr> trunk`,
 //! `conflict <pr> pr <m>`, `landing <tip>`, `landed <tip>`,
-//! `refused <tip> trunk-moved <sha>`, `refused <tip> member-gone <pr>`.
+//! `refused <tip> trunk-moved <sha>`, `refused <tip> member-gone <pr>`,
+//! `refused <tip> member-held <pr>`.
 //! A probe's record has no `member:` lines.
 //! A `ConflictWith` or `LandRefusal` variant with no form here cannot be
 //! recorded, and the effect that would record it is `Permanent`; a forge
@@ -36,7 +42,19 @@ pub struct Record {
     pub base: Sha,
     /// In batch order.
     pub members: Vec<BatchMember>,
+    /// The stacked members `land` moves onto trunk, in batch order.
+    pub moved: Vec<Moved>,
     pub state: RecordState,
+}
+
+/// A stacked member `land` moves onto trunk before the fast-forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moved {
+    pub pr: PrNumber,
+    /// The pull request it was stacked on.
+    pub base: PrNumber,
+    /// `base`'s head branch, by short name.
+    pub branch: String,
 }
 
 /// What the forge has decided about a batch.
@@ -98,6 +116,12 @@ impl Record {
         for member in &self.members {
             text.push_str(&format!("member: {} {}\n", member.pr.0, member.head));
         }
+        for moved in &self.moved {
+            text.push_str(&format!(
+                "moved: {} {} {}\n",
+                moved.pr.0, moved.base.0, moved.branch
+            ));
+        }
         let state = render_state(&self.state).ok_or_else(|| Unrecordable {
             id: self.id,
             state: self.state.clone(),
@@ -136,16 +160,35 @@ impl Record {
         }
         let base = field(&mut lines, "base", &error).and_then(|v| sha(v, &error))?;
 
-        let mut members = Vec::new();
+        let mut members: Vec<BatchMember> = Vec::new();
+        let mut moved = Vec::new();
         let state = loop {
             let line = lines
                 .next()
                 .ok_or_else(|| error("missing field \"state\"".to_owned()))?;
-            if let Some(member) = line.strip_prefix("member: ") {
+            if let Some(member) = line.strip_prefix("member: ")
+                && moved.is_empty()
+            {
                 let (pr, head) = member
                     .split_once(' ')
                     .ok_or_else(|| error(format!("bad member line {line:?}")))?;
                 members.push(BatchMember::new(pr_number(pr, &error)?, sha(head, &error)?));
+            } else if let Some(entry) = line.strip_prefix("moved: ") {
+                let [pr, base, name] = entry.split(' ').collect::<Vec<_>>()[..] else {
+                    return Err(error(format!("bad moved line {line:?}")));
+                };
+                let pr = pr_number(pr, &error)?;
+                if !members.iter().any(|m| m.pr == pr) {
+                    return Err(error(format!("moved line {line:?} names no member")));
+                }
+                if name.is_empty() {
+                    return Err(error(format!("bad moved line {line:?}")));
+                }
+                moved.push(Moved {
+                    pr,
+                    base: pr_number(base, &error)?,
+                    branch: name.to_owned(),
+                });
             } else if let Some(state) = line.strip_prefix("state: ") {
                 break parse_state(state, &error)?;
             } else {
@@ -160,6 +203,7 @@ impl Record {
             id,
             base,
             members,
+            moved,
             state,
         })
     }
@@ -196,6 +240,10 @@ fn render_state(state: &RecordState) -> Option<String> {
             tip,
             reason: LandRefusal::MemberGone { pr },
         } => format!("refused {tip} member-gone {}", pr.0),
+        RecordState::Refused {
+            tip,
+            reason: LandRefusal::MemberHeld { pr },
+        } => format!("refused {tip} member-held {}", pr.0),
         RecordState::Conflict { .. } | RecordState::Refused { .. } => return None,
     };
     Some(text)
@@ -234,6 +282,12 @@ fn parse_state(
         ["refused", tip, "member-gone", pr] => RecordState::Refused {
             tip: sha(tip, error)?,
             reason: LandRefusal::MemberGone {
+                pr: pr_number(pr, error)?,
+            },
+        },
+        ["refused", tip, "member-held", pr] => RecordState::Refused {
+            tip: sha(tip, error)?,
+            reason: LandRefusal::MemberHeld {
                 pr: pr_number(pr, error)?,
             },
         },
@@ -287,7 +341,19 @@ mod tests {
                 BatchMember::new(PrNumber(12), sha(B)),
                 BatchMember::new(PrNumber(15), sha(C)),
             ],
+            moved: Vec::new(),
             state,
+        }
+    }
+
+    fn stacked(state: RecordState) -> Record {
+        Record {
+            moved: vec![Moved {
+                pr: PrNumber(15),
+                base: PrNumber(12),
+                branch: "feature/base".to_owned(),
+            }],
+            ..record(state)
         }
     }
 
@@ -312,6 +378,10 @@ mod tests {
             RecordState::Refused {
                 tip: sha(T),
                 reason: LandRefusal::MemberGone { pr: PrNumber(12) },
+            },
+            RecordState::Refused {
+                tip: sha(T),
+                reason: LandRefusal::MemberHeld { pr: PrNumber(15) },
             },
         ]
     }
@@ -347,6 +417,58 @@ mod tests {
             assert_eq!(Record::parse(REF, BatchId(7), &text).unwrap(), original);
             let trimmed = text.trim_end_matches('\n');
             assert_eq!(Record::parse(REF, BatchId(7), trimmed).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn moved_lines_render_and_round_trip_in_every_state() {
+        for state in every_state() {
+            let original = stacked(state);
+            let text = original.render().unwrap();
+            assert!(
+                text.contains(&format!(
+                    "member: 15 {C}\nmoved: 15 12 feature/base\nstate: "
+                )),
+                "{text}"
+            );
+            assert_eq!(Record::parse(REF, BatchId(7), &text).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn a_landing_record_without_moved_lines_parses() {
+        let text = format!(
+            "{HEADER}\nid: 7\nbase: {A}\nmember: 12 {B}\nmember: 15 {C}\nstate: landing {T}\n"
+        );
+        let landing = Record::parse(REF, BatchId(7), &text).unwrap();
+        assert!(landing.moved.is_empty());
+        assert_eq!(landing, record(RecordState::Landing { tip: sha(T) }));
+    }
+
+    #[test]
+    fn rejects_malformed_moved_lines() {
+        let good = stacked(RecordState::Landing { tip: sha(T) })
+            .render()
+            .unwrap();
+        for (text, problem) in [
+            (good.replace("moved: 15 ", "moved: 13 "), "names no member"),
+            (
+                good.replace("moved: 15 12 ", "moved: 15 x "),
+                "bad pull request number",
+            ),
+            (good.replace(" feature/base", ""), "bad moved line"),
+            (good.replace(" feature/base", " "), "bad moved line"),
+            (good.replace(" feature/base", " a b"), "bad moved line"),
+            (
+                good.replace(
+                    "moved: 15 12 feature/base\n",
+                    &format!("moved: 15 12 feature/base\nmember: 16 {C}\n"),
+                ),
+                "unexpected line",
+            ),
+        ] {
+            let error = rejected(&text);
+            assert!(error.problem.contains(problem), "{text}: {error}");
         }
     }
 

@@ -15,7 +15,7 @@ use dorfq_core::{
 };
 use dorfq_forge_github::api::{ApiError, Auth, RestClient};
 use dorfq_forge_github::app::AppKey;
-use dorfq_forge_github::{GitHubForge, Settings, system_clock};
+use dorfq_forge_github::{GitHubForge, system_clock};
 use dorfq_forge_mock::{MockForge, Scenario, ScenarioError};
 use dorfq_scheduler::SchedulerConfig;
 
@@ -146,19 +146,15 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
             api_base,
             owner,
             repo,
-            trunk,
-            label,
-            checks,
             auth,
+            ..
         } => {
             let auth = github_auth(auth)?;
             let user_agent = format!("dorfq/{}", crate::version());
             let client = RestClient::new(api_base, owner, repo, auth, &user_agent);
-            let settings = Settings {
-                trunk: trunk.clone(),
-                label: label.clone(),
-                checks: checks.clone(),
-            };
+            let settings = config
+                .github_settings()
+                .expect("a GitHub forge configuration has GitHub settings");
             let forge = GitHubForge::new(
                 Box::new(client),
                 settings,
@@ -238,6 +234,9 @@ mod tests {
             trunk: "main".to_owned(),
             label: "queue".to_owned(),
             checks: vec!["check".to_owned()],
+            batch_checks: None,
+            lock_heads: false,
+            ci: None,
             auth: AuthConfig::Token {
                 env: var.to_owned(),
             },
@@ -261,6 +260,9 @@ mod tests {
             trunk: "main".to_owned(),
             label: "queue".to_owned(),
             checks: vec!["check".to_owned()],
+            batch_checks: None,
+            lock_heads: false,
+            ci: None,
             auth: AuthConfig::App {
                 client_id: "Iv23liTEST".to_owned(),
                 private_key_file,

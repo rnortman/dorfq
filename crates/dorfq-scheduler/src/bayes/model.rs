@@ -729,13 +729,13 @@ mod tests {
         }
         // Held for review, its own CI passed: an alibi like a ready one's.
         model.passed_after(&members(&[5]), 0);
-        model.sync(&prs(stale(held(1, Hold::Review), 3)), &none(), 0, 0);
+        model.sync(&prs(stale(held(1, Hold::Protection), 3)), &none(), 0, 0);
         assert_eq!(model.alibis(PrNumber(1)), Some(&[-3][..]));
         assert_eq!(model.alibis(PrNumber(4)), Some(&[-3][..]));
         // The batch alibi and the own-CI one each count.
         assert_eq!(model.alibis(PrNumber(5)), Some(&[0, -3][..]));
         // The same run seen again is no second alibi.
-        model.sync(&prs(stale(held(1, Hold::Review), 3)), &none(), 0, 0);
+        model.sync(&prs(stale(held(1, Hold::Protection), 3)), &none(), 0, 0);
         assert_eq!(model.alibis(PrNumber(1)), Some(&[-3][..]));
         // Staleness that grows with the landings adds nothing.
         model.sync(

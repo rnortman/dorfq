@@ -335,7 +335,9 @@ impl Ledger {
             .and_then(|o| o.batches.iter().find(|b| b.id == id))
     }
 
-    fn batch_known(&self, id: BatchId) -> bool {
+    /// Whether the latest observation reported batch `id` and no `retire`
+    /// since removed it.
+    pub fn batch_known(&self, id: BatchId) -> bool {
         self.observed_batch(id).is_some() && !self.retired.contains(&id)
     }
 
