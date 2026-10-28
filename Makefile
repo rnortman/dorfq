@@ -28,6 +28,7 @@ help:
 	@echo "  make live-test     run the GitHub forge against a disposable repository (DORFQ_LIVE_REPO, and DORFQ_GITHUB_TOKEN"
 	@echo "                     or DORFQ_GITHUB_APP_CLIENT_ID with DORFQ_GITHUB_APP_KEY_FILE)"
 	@echo "  make optimised     build the dorfq binary optimised"
+	@echo "  make musl          build the portable binary, statically linked against musl"
 	@echo "  make release VERSION=X.Y.Z"
 	@echo "                     cut a release: gather changelog.d and todo.d, bump the crate version, repin"
 	@echo "  make todo-gather   fold todo.d fragments into TODO.md, outside a release"
@@ -102,6 +103,15 @@ sim-report:
 .PHONY: optimised
 optimised:
 	bazel build --config=release //crates/dorfq
+
+# The portable binary: dorfq built for the musl platform and statically linked,
+# so it runs on any x86_64 Linux host whatever libc it has. Prints the path of
+# the optimised build: `bazel-bin` follows whichever mode Bazel last ran in, and
+# `make check` rebuilds this target unoptimised.
+.PHONY: musl
+musl:
+	bazel build --config=release //crates/dorfq:dorfq-musl
+	bazel cquery --config=release --output=files //crates/dorfq:dorfq-musl
 
 # Passthrough to allthechanges for queries and dry runs:
 # `make changes ARGS="todo query"`,

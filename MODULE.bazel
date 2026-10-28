@@ -19,14 +19,58 @@ bazel_dep(name = "buildifier_prebuilt", version = "10.1.0", dev_dependency = Tru
 # that run outside Bazel (rust-analyzer); //tools/pins:pins_test holds the
 # two equal. `rustfmt_version` is stated because the extension otherwise
 # defaults it to a nightly, which would give the lint aspect a different
-# formatter from the one the write-time hook runs.
+# formatter from the one the write-time hook runs. The edition is stated on
+# this tag and on the first repository_set tag below; RUST_EDITION holds the
+# two equal.
 RUST_VERSION = "1.98.0"
 
+RUST_EDITION = "2024"
+
+# Yields the rustfmt and rust-analyzer toolchains, and the compilers for every
+# exec platform but x86_64 Linux, whose set the repository_set tags replace.
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
-    edition = "2024",
+    edition = RUST_EDITION,
     rustfmt_version = RUST_VERSION,
     versions = [RUST_VERSION],
+)
+
+# The default repository set for this exec platform carries one Rust
+# toolchain per target triple, all with the same target constraints (rules_rust
+# gives the musl ABI none), so a musl toolchain added to it could not be told
+# from the gnu one. Replacing the set, under its default name, lets each target
+# name the //tools/platforms:libc value it serves. These tags are the compilers
+# every build on an x86_64 Linux host uses. Only the first tag carries the
+# common attributes; rules_rust refuses them on the others.
+rust.repository_set(
+    name = "rust_linux_x86_64",
+    edition = RUST_EDITION,
+    exec_triple = "x86_64-unknown-linux-gnu",
+    rustfmt_version = RUST_VERSION,
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        "//tools/platforms:glibc",
+    ],
+    target_triple = "x86_64-unknown-linux-gnu",
+    versions = [RUST_VERSION],
+)
+rust.repository_set(
+    name = "rust_linux_x86_64",
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        "//tools/platforms:musl",
+    ],
+    target_triple = "x86_64-unknown-linux-musl",
+)
+rust.repository_set(
+    name = "rust_linux_x86_64",
+    target_compatible_with = [
+        "@platforms//cpu:wasm32",
+        "@platforms//os:none",
+    ],
+    target_triple = "wasm32-unknown-unknown",
 )
 use_repo(rust, "rust_toolchains")
 
@@ -146,9 +190,37 @@ llvm.sysroot(
     label = "@org_chromium_sysroot_linux_x64//sysroot",
     targets = ["linux-x86_64"],
 )
+llvm.extra_target_compatible_with(
+    name = "llvm_toolchain",
+    constraints = ["//tools/platforms:glibc"],
+    targets = ["linux-x86_64"],
+)
 use_repo(llvm, "llvm_toolchain", "llvm_toolchain_llvm")
 
 register_toolchains(
     "@llvm_toolchain//:all",
+    dev_dependency = True,
+)
+
+# A second cc toolchain, for the musl target only: GCC 11.3 cross compilers
+# targeting x86_64-linux-musl with musl 1.2.3, from the Bazel Central
+# Registry, each archive pinned by sha256 inside the module. toolchains_llvm
+# cannot target musl (its linux-x86_64 toolchain hard-codes the gnu triple
+# and a glibc sysroot), so the two toolchains split on //tools/platforms:libc:
+# this one requires :musl, the LLVM one :glibc.
+bazel_dep(name = "toolchains_musl", version = "0.1.29", dev_dependency = True)
+
+toolchains_musl = use_extension(
+    "@toolchains_musl//:toolchains_musl.bzl",
+    "toolchains_musl",
+    dev_dependency = True,
+)
+toolchains_musl.config(
+    extra_target_compatible_with = ["//tools/platforms:musl"],
+)
+use_repo(toolchains_musl, "musl_toolchains_hub")
+
+register_toolchains(
+    "@musl_toolchains_hub//:all",
     dev_dependency = True,
 )

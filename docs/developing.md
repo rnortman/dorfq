@@ -58,6 +58,8 @@ The gate, the changelog fragments and the TODO system are documented in
   `make todo-gather`) folds it into `CHANGELOG.md` or `TODO.md`.
 - `tools/pins/` — a test holding the version pins that appear in more than
   one file equal.
+- `tools/platforms/` — the libc constraint, the musl target platform and the
+  rule that builds a binary for another platform.
 
 ## Lock files
 

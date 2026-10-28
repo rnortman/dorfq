@@ -1,5 +1,6 @@
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("//tools/platforms:platform_binary.bzl", "platform_binary")
 
 VERSION = "0.1.0"
 
@@ -37,6 +38,20 @@ rust_binary(
     deps = all_crate_deps(normal = True) + WORKSPACE_DEPS + [":dorfq_lib"],
 )
 
+# The portable binary: `:dorfq` built for the musl platform, statically
+# linked, so it runs on any x86_64 Linux host whatever its libc. Only an
+# x86_64 Linux host has a musl Rust toolchain; elsewhere this target and the
+# tests that use it are skipped by `//...` and refused when named.
+platform_binary(
+    name = "dorfq-musl",
+    binary = ":dorfq",
+    platform = "//tools/platforms:linux-x86_64-musl",
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
 rust_test(
     name = "dorfq_lib_test",
     size = "small",
@@ -69,4 +84,34 @@ rust_test(
     },
     version = VERSION,
     deps = all_crate_deps(normal_dev = True),
+)
+
+# The same CLI suite, run against the portable binary.
+rust_test(
+    name = "cli_musl_test",
+    size = "small",
+    srcs = ["tests/cli.rs"],
+    crate_root = "tests/cli.rs",
+    data = [
+        "examples/mock.toml",
+        "examples/scenario.toml",
+        ":dorfq-musl",
+    ],
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    rustc_env = {
+        "DORFQ_BIN": "$(rootpath :dorfq-musl)",
+        "DORFQ_EXAMPLE_CONFIG": "$(rootpath examples/mock.toml)",
+    },
+    version = VERSION,
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test(
+    name = "musl_test",
+    size = "small",
+    srcs = ["tests/musl.rs"],
+    crate_root = "tests/musl.rs",
+    data = [":dorfq-musl"],
+    rustc_env = {"DORFQ_MUSL_BIN": "$(rootpath :dorfq-musl)"},
+    version = VERSION,
 )
