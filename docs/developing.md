@@ -38,7 +38,11 @@ The gate, the changelog fragments and the TODO system are documented in
     whose name contains `scratch` or `playground` and treats that repository
     as disposable.
   - `crates/dorfq/` — the application: configuration, provider construction,
-    the driver loop and the `dorfq` binary.
+    the driver loop and the `dorfq` binary. `src/journal/` is the tick
+    journal: its writer and reader (`mod.rs`), and the offline readers
+    behind `dorfq journal` — the event stream (`events.rs`), the summary
+    (`summary.rs`) and the report document (`report.rs`).
+    `testdata/journal-1.jsonl` is the format-1 fixture, never regenerated.
   - `crates/dorfq-sim/` — the simulator: a seeded world that implements the
     forge side of the contract, the loop that runs a scheduler against it,
     the metrics and the `dorfq-sim` binary.

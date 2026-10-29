@@ -37,7 +37,11 @@ scheduler's configuration, the same `[scheduler]` table `dorfq` reads.
 The simulation page has a file picker beside its report select. Load a
 `--json` document there and the page shows it as it shows the published
 reports: the metric table, the comparison against `github-like`, and the
-replay. The playground on the same page runs an edited scenario in the
+replay. A report from a real queue's journal, `dorfq journal report`, opens
+the same way, with one policy and no comparison. A real queue has no truth,
+so the page says "truth unknown" where a simulated report says whether a pull
+request was broken or an ejection justified, and counts those ejections
+under `ejected` alone. The playground on the same page runs an edited scenario in the
 browser, compiled to WebAssembly, without a checkout.
 
 ## Sweeps

@@ -23,4 +23,8 @@ dorfq-forge-github = { path = "../dorfq-forge-github" }
 dorfq-forge-mock = { path = "../dorfq-forge-mock" }
 dorfq-scheduler = { path = "../dorfq-scheduler" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
+
+[dev-dependencies]
+dorfq-sim = { path = "../dorfq-sim" }

@@ -2,6 +2,8 @@
 # all-at-once stub scheduler. Run it from the repository root with
 #   make run ARGS="run --config $PWD/crates/dorfq/examples/mock.toml --exit-when-idle"
 
+# journal = "dorfq.journal"   # append every tick to this file, relative to this one; absent, none
+
 [forge]
 kind = "mock"
 scenario = "scenario.toml"

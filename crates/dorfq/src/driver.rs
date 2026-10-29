@@ -7,27 +7,41 @@ use dorfq_core::{
     BatchState, CiStatus, Forge, ForgeError, Observation, Plan, PrBase, PrStatus, Scheduler,
     SchedulerError,
 };
+use serde::{Deserialize, Serialize};
 
 /// Why a tick ended early.
 #[derive(Debug)]
 pub enum DriverError {
+    /// `observe` failed; nothing was stepped.
+    Observe(ForgeError),
     /// The scheduler could not produce a plan; always fatal.
     Scheduler(SchedulerError),
-    /// A forge call failed; fatal when `Permanent`.
-    Forge(ForgeError),
+    /// The scheduler stepped and an effect then failed: the plan ran up to
+    /// that effect (rule 7), and `report` is what the tick saw and decided.
+    Effect {
+        report: Box<TickReport>,
+        error: ForgeError,
+    },
 }
 
-impl From<ForgeError> for DriverError {
-    fn from(error: ForgeError) -> DriverError {
-        DriverError::Forge(error)
+impl DriverError {
+    /// Whether the process must stop: a `Permanent` forge error or a
+    /// scheduler error.
+    pub fn is_fatal(&self) -> bool {
+        match self {
+            DriverError::Observe(error) | DriverError::Effect { error, .. } => {
+                matches!(error, ForgeError::Permanent(_))
+            }
+            DriverError::Scheduler(_) => true,
+        }
     }
 }
 
 impl fmt::Display for DriverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DriverError::Observe(e) | DriverError::Effect { error: e, .. } => e.fmt(f),
             DriverError::Scheduler(e) => e.fmt(f),
-            DriverError::Forge(e) => e.fmt(f),
         }
     }
 }
@@ -35,8 +49,8 @@ impl fmt::Display for DriverError {
 impl Error for DriverError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            DriverError::Observe(e) | DriverError::Effect { error: e, .. } => Some(e),
             DriverError::Scheduler(e) => Some(e),
-            DriverError::Forge(e) => Some(e),
         }
     }
 }
@@ -49,7 +63,7 @@ pub struct Driver<'a> {
 }
 
 /// What one tick saw and decided.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TickReport {
     /// The tick's number, counting from 0.
     pub tick: u64,
@@ -70,6 +84,11 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// How many ticks have run, the one that failed included.
+    pub fn ticks(&self) -> u64 {
+        self.tick
+    }
+
     /// Observes, steps the scheduler, and executes the plan in the order
     /// `land`, `notify`, `start`, `eject`, `retire`, stopping at the first
     /// error. An error means the rest of the plan was abandoned, or none was
@@ -77,11 +96,28 @@ impl<'a> Driver<'a> {
     pub fn tick(&mut self) -> Result<TickReport, DriverError> {
         let tick = self.tick;
         self.tick += 1;
-        let observation = self.forge.observe()?;
+        let observation = self.forge.observe().map_err(DriverError::Observe)?;
         let plan = self
             .scheduler
             .step(&observation)
             .map_err(DriverError::Scheduler)?;
+        let idle = observation.prs.is_empty() && observation.batches.is_empty() && plan.is_empty();
+        let report = TickReport {
+            tick,
+            observation,
+            plan,
+            idle,
+        };
+        match self.execute(&report.plan) {
+            Ok(()) => Ok(report),
+            Err(error) => Err(DriverError::Effect {
+                report: Box::new(report),
+                error,
+            }),
+        }
+    }
+
+    fn execute(&mut self, plan: &Plan) -> Result<(), ForgeError> {
         for &batch in &plan.land {
             self.forge.land(batch)?;
         }
@@ -97,13 +133,7 @@ impl<'a> Driver<'a> {
         for &batch in &plan.retire {
             self.forge.retire(batch)?;
         }
-        let idle = observation.prs.is_empty() && observation.batches.is_empty() && plan.is_empty();
-        Ok(TickReport {
-            tick,
-            observation,
-            plan,
-            idle,
-        })
+        Ok(())
     }
 }
 

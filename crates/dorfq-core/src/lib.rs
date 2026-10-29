@@ -172,7 +172,9 @@
 //! `Display` arm. A new method on an existing type. Each side picks it up at
 //! its next rebase with no edits. A default that would stand in for a fact
 //! the forge should have supplied is not neutral and is not allowed: such a
-//! fact is required.
+//! fact is required. The new field carries `#[serde(default)]` for its
+//! neutral value (`None` for an `Option<T>`), so a record serialised before
+//! it existed still deserialises.
 //!
 //! **Required: one pull request touching this crate and one site per
 //! consumer.** A new required fact is a `new` parameter: every forge's
@@ -182,7 +184,9 @@
 //! so, never a placeholder. A new variant of an exhaustive enum fails to
 //! compile at every match, and each consumer's arm is written in the same
 //! pull request. A new effect is a [`Plan`] field and a [`Forge`] method
-//! without a default body, so every forge implements it explicitly.
+//! without a default body, so every forge implements it explicitly. A
+//! required change, like anything under **Never**, also bumps the format
+//! number of the application's journal, which records these types as JSON.
 //!
 //! **Never.** A renamed or re-typed field, a changed meaning behind an
 //! unchanged name, a default body on a [`Forge`] method, or a `_` arm in a
@@ -202,12 +206,16 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 /// A pull request, by the forge's number for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct PrNumber(pub u64);
 
 /// A batch, by an id the scheduler chose (rule 5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct BatchId(pub u64);
 
 /// A commit id: exactly 40 lowercase hexadecimal digits.
@@ -230,6 +238,21 @@ impl Sha {
     /// The commit id as text.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Serialised as its 40-character text.
+impl Serialize for Sha {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+/// Deserialised through [`Sha::parse`], so malformed text is an error.
+impl<'de> Deserialize<'de> for Sha {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Sha, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Sha::parse(&text).map_err(serde::de::Error::custom)
     }
 }
 
@@ -256,11 +279,13 @@ impl fmt::Display for InvalidSha {
 impl Error for InvalidSha {}
 
 /// A point in time, in seconds, on the forge's clock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Timestamp(pub u64);
 
 /// A required check's name, as the forge knows it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct CheckName(pub String);
 
 impl fmt::Display for CheckName {
@@ -270,7 +295,7 @@ impl fmt::Display for CheckName {
 }
 
 /// Everything the forge reports in one tick.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Observation {
     /// The forge's clock at this observation: wall time on a real forge,
@@ -354,7 +379,7 @@ impl Observation {
 }
 
 /// One enqueued pull request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct PrSnapshot {
     pub number: PrNumber,
@@ -365,6 +390,7 @@ pub struct PrSnapshot {
     pub status: PrStatus,
     /// Whether its ancestors may land without it. Default
     /// [`StackPolicy::Splittable`].
+    #[serde(default)]
     pub stack: StackPolicy,
     /// Trunk changes the latest own-CI run on this head did not cover: the
     /// pull requests that reached trunk after the trunk that run started
@@ -403,7 +429,8 @@ impl PrSnapshot {
 }
 
 /// A pull request's base branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PrBase {
     Trunk,
     /// Another enqueued pull request's branch.
@@ -411,9 +438,11 @@ pub enum PrBase {
 }
 
 /// Whether a stacked pull request's ancestors may land without it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StackPolicy {
     /// Any base-closed part of its stack may land on its own.
+    #[default]
     Splittable,
     /// It and every ancestor land in one batch or not at all: no ancestor
     /// lands without it while it is enqueued.
@@ -421,7 +450,8 @@ pub enum StackPolicy {
 }
 
 /// The forge's admission verdict on a pull request at its head.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PrStatus {
     /// The forge would land it now at this head.
     Ready,
@@ -435,7 +465,8 @@ pub enum PrStatus {
 
 /// What holds a pull request back. Open: every scheduler's response to a
 /// hold is to wait, whatever it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Hold {
     /// Its own required checks have not finished on its head.
@@ -468,7 +499,8 @@ impl fmt::Display for Hold {
 }
 
 /// The state of a set of CI checks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CiStatus {
     Pending,
     Passed,
@@ -476,7 +508,7 @@ pub enum CiStatus {
 }
 
 /// What failed in a CI run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Failure {
     /// The required checks that failed. Empty when the forge cannot say
@@ -492,7 +524,7 @@ impl Failure {
 }
 
 /// One tracked batch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct BatchStatus {
     pub id: BatchId,
@@ -521,7 +553,7 @@ impl BatchStatus {
 }
 
 /// A batch member and the head the batch was built with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct BatchMember {
     pub pr: PrNumber,
@@ -536,7 +568,8 @@ impl BatchMember {
 }
 
 /// Where a batch is in its life.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BatchState {
     /// Git refused to merge `pr` while building; there is no tip and no CI.
     Conflict { pr: PrNumber, with: ConflictWith },
@@ -562,7 +595,8 @@ impl BatchState {
 
 /// What a pull request or a batch member conflicts with. Open: a consumer
 /// copies it or renders it through `Display`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ConflictWith {
     Trunk,
@@ -582,7 +616,8 @@ impl fmt::Display for ConflictWith {
 
 /// Why the forge declined to land a batch. Open: every consumer's response
 /// to a refusal is the same, whatever the reason.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum LandRefusal {
     /// The batch's base is no longer trunk.
@@ -607,7 +642,7 @@ impl fmt::Display for LandRefusal {
 }
 
 /// A pull request that left the queue between two observations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Departure {
     pub pr: PrNumber,
@@ -628,7 +663,8 @@ impl Departure {
 /// forge ejected since the previous observation is `Ejected`; the rest are
 /// `Merged` when the platform says its content reached trunk, else
 /// `Withdrawn`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Departed {
     /// The queue landed it with `batch`.
     Landed { batch: BatchId },
@@ -653,7 +689,8 @@ impl fmt::Display for Departed {
 
 /// Why a pull request left without landing or ejection. Open: a scheduler
 /// treats every withdrawal alike.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Withdrawal {
     /// Its intent was cleared.
@@ -679,7 +716,7 @@ impl fmt::Display for Withdrawal {
 
 /// What the scheduler asks the forge to do in one tick, executed in the
 /// order `land`, `notify`, `start`, `eject`, `retire` (rule 7).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     pub start: Vec<BatchStart>,
     pub land: Vec<BatchId>,
@@ -700,7 +737,7 @@ impl Plan {
 }
 
 /// A request to build, push and track a batch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct BatchStart {
     pub id: BatchId,
@@ -718,7 +755,7 @@ impl BatchStart {
 }
 
 /// A request to clear a pull request's intent and tell its author why.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Ejection {
     pub pr: PrNumber,
@@ -734,7 +771,8 @@ impl Ejection {
 
 /// Why a pull request leaves the queue without landing. Open: a forge words
 /// the variants it knows as it likes and renders the rest through `Display`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EjectReason {
     /// It does not merge into what the [`ConflictWith`] names.
@@ -754,7 +792,7 @@ impl fmt::Display for EjectReason {
 
 /// A request to tell a pull request's author what the scheduler believes
 /// about it, without acting on it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Notice {
     pub pr: PrNumber,
@@ -770,7 +808,8 @@ impl Notice {
 
 /// What the scheduler believes about a pull request it is not ejecting.
 /// Exhaustive: the simulator judges each reason against its world's truth.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NoticeReason {
     /// It is probably broken against trunk: `batch` failed and nothing
     /// else in that run explains the failure.
@@ -801,6 +840,8 @@ pub trait Scheduler {
     /// Turns the latest observation into a plan. Deterministic (rule 4).
     /// An error is fatal: the scheduler cannot decide, and the process
     /// stops rather than act on a guess.
+    // TODO(scheduler-introspection): a method returning why this step
+    // planned what it did, for the journal to record beside the plan.
     fn step(&mut self, observation: &Observation) -> Result<Plan, SchedulerError>;
 }
 
@@ -1117,5 +1158,307 @@ mod tests {
             ..Plan::default()
         };
         assert!(!plan.is_empty());
+    }
+
+    fn sha_n(n: u64) -> Sha {
+        Sha::parse(&format!("{n:040x}")).unwrap()
+    }
+
+    /// An observation holding every variant of every enum it can carry.
+    fn every_variant_observation() -> Observation {
+        let every_hold = BTreeSet::from([
+            Hold::OwnCiPending,
+            Hold::OwnCiFailed,
+            Hold::MergeabilityUnknown,
+            Hold::Protection,
+            Hold::Draft,
+            Hold::AncestorMoved { pr: PrNumber(1) },
+        ]);
+        let prs = vec![
+            PrSnapshot::new(PrNumber(1), sha_n(1), PrBase::Trunk, PrStatus::Ready, 0),
+            PrSnapshot::new(
+                PrNumber(2),
+                sha_n(2),
+                PrBase::Pr(PrNumber(1)),
+                PrStatus::Waiting(every_hold),
+                3,
+            )
+            .with_stack(StackPolicy::Atomic),
+            PrSnapshot::new(
+                PrNumber(3),
+                sha_n(3),
+                PrBase::Trunk,
+                PrStatus::Conflicting(ConflictWith::Trunk),
+                1,
+            ),
+            PrSnapshot::new(
+                PrNumber(4),
+                sha_n(4),
+                PrBase::Pr(PrNumber(1)),
+                PrStatus::Conflicting(ConflictWith::Pr(PrNumber(1))),
+                2,
+            ),
+        ];
+        let member = |pr: u64| BatchMember::new(PrNumber(pr), sha_n(pr));
+        let testing = |ci: CiStatus| BatchState::Testing { tip: sha_n(99), ci };
+        let batches = vec![
+            BatchStatus::new(
+                BatchId(1),
+                sha_n(10),
+                vec![member(1), member(2)],
+                BatchState::Conflict {
+                    pr: PrNumber(2),
+                    with: ConflictWith::Pr(PrNumber(1)),
+                },
+            ),
+            BatchStatus::new(
+                BatchId(2),
+                sha_n(10),
+                vec![member(1)],
+                BatchState::Conflict {
+                    pr: PrNumber(1),
+                    with: ConflictWith::Trunk,
+                },
+            ),
+            BatchStatus::new(BatchId(3), sha_n(10), vec![], testing(CiStatus::Pending)),
+            BatchStatus::new(
+                BatchId(4),
+                sha_n(11),
+                vec![member(1)],
+                testing(CiStatus::Passed),
+            ),
+            BatchStatus::new(
+                BatchId(5),
+                sha_n(12),
+                vec![member(1)],
+                testing(CiStatus::Failed(Failure::new(BTreeSet::new()))),
+            ),
+            BatchStatus::new(
+                BatchId(6),
+                sha_n(13),
+                vec![member(1)],
+                testing(CiStatus::Failed(Failure::new(BTreeSet::from([
+                    CheckName("lint".into()),
+                    CheckName("build".into()),
+                ])))),
+            ),
+            BatchStatus::new(
+                BatchId(7),
+                sha_n(14),
+                vec![member(1)],
+                BatchState::Landed { tip: sha_n(15) },
+            ),
+            BatchStatus::new(
+                BatchId(8),
+                sha_n(16),
+                vec![member(1)],
+                BatchState::LandRefused {
+                    tip: sha_n(17),
+                    reason: LandRefusal::TrunkMoved { trunk: sha_n(18) },
+                },
+            ),
+            BatchStatus::new(
+                BatchId(9),
+                sha_n(19),
+                vec![member(1)],
+                BatchState::LandRefused {
+                    tip: sha_n(20),
+                    reason: LandRefusal::MemberGone { pr: PrNumber(1) },
+                },
+            ),
+            BatchStatus::new(
+                BatchId(10),
+                sha_n(21),
+                vec![member(1)],
+                BatchState::LandRefused {
+                    tip: sha_n(22),
+                    reason: LandRefusal::MemberHeld { pr: PrNumber(1) },
+                },
+            ),
+        ];
+        let departed = [
+            Departed::Landed { batch: BatchId(7) },
+            Departed::Merged,
+            Departed::Ejected,
+            Departed::Withdrawn(Withdrawal::IntentCleared),
+            Departed::Withdrawn(Withdrawal::Closed),
+            Departed::Withdrawn(Withdrawal::Blocked { on: PrNumber(5) }),
+            Departed::Withdrawn(Withdrawal::Retargeted),
+        ]
+        .into_iter()
+        .zip(20u64..)
+        .map(|(how, pr)| Departure::new(PrNumber(pr), sha_n(pr), how))
+        .collect();
+        Observation::new(
+            Timestamp(1_761_520_000),
+            sha_n(10),
+            42,
+            prs,
+            batches,
+            departed,
+        )
+    }
+
+    /// A plan holding every effect and every reason.
+    fn every_variant_plan() -> Plan {
+        Plan {
+            start: vec![
+                BatchStart::new(BatchId(11), sha_n(10), vec![PrNumber(1), PrNumber(2)]),
+                BatchStart::new(BatchId(12), sha_n(99), vec![]),
+            ],
+            land: vec![BatchId(4)],
+            retire: vec![BatchId(5), BatchId(7)],
+            eject: vec![
+                Ejection::new(
+                    PrNumber(3),
+                    EjectReason::Conflicts {
+                        with: ConflictWith::Trunk,
+                    },
+                ),
+                Ejection::new(
+                    PrNumber(4),
+                    EjectReason::Conflicts {
+                        with: ConflictWith::Pr(PrNumber(1)),
+                    },
+                ),
+                Ejection::new(PrNumber(2), EjectReason::BatchFailed { batch: BatchId(6) }),
+            ],
+            notify: vec![
+                Notice::new(PrNumber(1), NoticeReason::Broken { batch: BatchId(6) }),
+                Notice::new(
+                    PrNumber(2),
+                    NoticeReason::InteractsWith {
+                        pr: PrNumber(1),
+                        batch: BatchId(6),
+                    },
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn every_variant_round_trips_through_json() {
+        let observation = every_variant_observation();
+        let text = serde_json::to_string(&observation).unwrap();
+        let back: Observation = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, observation);
+
+        let plan = every_variant_plan();
+        let text = serde_json::to_string(&plan).unwrap();
+        let back: Plan = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, plan);
+    }
+
+    #[test]
+    fn a_small_observation_and_plan_have_a_fixed_encoding() {
+        let observation = Observation::new(
+            Timestamp(100),
+            sha_n(1),
+            3,
+            vec![
+                PrSnapshot::new(PrNumber(7), sha_n(7), PrBase::Trunk, PrStatus::Ready, 0),
+                PrSnapshot::new(
+                    PrNumber(8),
+                    sha_n(8),
+                    PrBase::Pr(PrNumber(7)),
+                    PrStatus::Waiting(BTreeSet::from([
+                        Hold::AncestorMoved { pr: PrNumber(7) },
+                        Hold::OwnCiPending,
+                    ])),
+                    1,
+                )
+                .with_stack(StackPolicy::Atomic),
+            ],
+            vec![BatchStatus::new(
+                BatchId(3),
+                sha_n(1),
+                vec![BatchMember::new(PrNumber(7), sha_n(7))],
+                BatchState::Testing {
+                    tip: sha_n(9),
+                    ci: CiStatus::Failed(Failure::new(BTreeSet::from([CheckName("check".into())]))),
+                },
+            )],
+            vec![Departure::new(
+                PrNumber(5),
+                sha_n(5),
+                Departed::Landed { batch: BatchId(2) },
+            )],
+        );
+        let s = |n: u64| format!("{n:040x}");
+        let expected = format!(
+            concat!(
+                r#"{{"now":100,"trunk":"{t}","trunk_position":3,"prs":["#,
+                r#"{{"number":7,"head":"{h7}","base":"trunk","status":"ready","stack":"splittable","behind":0}},"#,
+                r#"{{"number":8,"head":"{h8}","base":{{"pr":7}},"#,
+                r#""status":{{"waiting":["own_ci_pending",{{"ancestor_moved":{{"pr":7}}}}]}},"#,
+                r#""stack":"atomic","behind":1}}],"#,
+                r#""batches":[{{"id":3,"base":"{t}","members":[{{"pr":7,"head":"{h7}"}}],"#,
+                r#""state":{{"testing":{{"tip":"{h9}","ci":{{"failed":{{"checks":["check"]}}}}}}}}}}],"#,
+                r#""departed":[{{"pr":5,"head":"{h5}","how":{{"landed":{{"batch":2}}}}}}]}}"#,
+            ),
+            t = s(1),
+            h5 = s(5),
+            h7 = s(7),
+            h8 = s(8),
+            h9 = s(9),
+        );
+        assert_eq!(serde_json::to_string(&observation).unwrap(), expected);
+
+        let plan = Plan {
+            start: vec![BatchStart::new(BatchId(4), sha_n(1), vec![PrNumber(7)])],
+            land: vec![BatchId(3)],
+            retire: vec![BatchId(2)],
+            eject: vec![Ejection::new(
+                PrNumber(8),
+                EjectReason::Conflicts {
+                    with: ConflictWith::Trunk,
+                },
+            )],
+            notify: vec![Notice::new(
+                PrNumber(7),
+                NoticeReason::InteractsWith {
+                    pr: PrNumber(8),
+                    batch: BatchId(3),
+                },
+            )],
+        };
+        let expected = format!(
+            concat!(
+                r#"{{"start":[{{"id":4,"base":"{t}","prs":[7]}}],"land":[3],"retire":[2],"#,
+                r#""eject":[{{"pr":8,"reason":{{"conflicts":{{"with":"trunk"}}}}}}],"#,
+                r#""notify":[{{"pr":7,"reason":{{"interacts_with":{{"pr":8,"batch":3}}}}}}]}}"#,
+            ),
+            t = s(1),
+        );
+        assert_eq!(serde_json::to_string(&plan).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_malformed_sha_fails_to_deserialise_naming_the_input() {
+        for bad in [GOOD[..39].to_owned(), GOOD.to_uppercase()] {
+            let error = serde_json::from_str::<Sha>(&format!("\"{bad}\"")).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains(&format!("{bad:?}")), "{message}");
+        }
+        let sha: Sha = serde_json::from_str(&format!("\"{GOOD}\"")).unwrap();
+        assert_eq!(sha.as_str(), GOOD);
+    }
+
+    #[test]
+    fn a_snapshot_without_stack_reads_as_splittable() {
+        let text =
+            format!(r#"{{"number":7,"head":"{GOOD}","base":"trunk","status":"ready","behind":0}}"#);
+        let pr: PrSnapshot = serde_json::from_str(&text).unwrap();
+        assert_eq!(pr.stack, StackPolicy::Splittable);
+        assert_eq!(
+            pr,
+            PrSnapshot::new(
+                PrNumber(7),
+                Sha::parse(GOOD).unwrap(),
+                PrBase::Trunk,
+                PrStatus::Ready,
+                0
+            )
+        );
     }
 }

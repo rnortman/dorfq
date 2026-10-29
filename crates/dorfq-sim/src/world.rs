@@ -211,6 +211,8 @@ fn delay(rng: &mut SplitMix64, per_hour: f64) -> u64 {
 }
 
 impl World {
+    // TODO(sim-scripted-world): a constructor from a given state and a
+    // scripted history of exogenous events.
     /// A world at time 0 under `admission` whose first arrival is drawn
     /// from `streams`.
     pub fn new(config: WorldConfig, admission: Admission, streams: Streams) -> World {

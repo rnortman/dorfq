@@ -357,7 +357,7 @@ fn failure(at: u64, error: ForgeError) -> SimError {
 }
 
 /// The trace event for a step.
-fn step_event(t: u64, o: &Observation, plan: &Plan) -> TraceEvent {
+pub fn step_event(t: u64, o: &Observation, plan: &Plan) -> TraceEvent {
     let in_flight = o
         .batches
         .iter()

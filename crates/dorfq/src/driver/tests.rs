@@ -233,8 +233,12 @@ fn transient_on_start_abandons_the_plan_and_the_next_tick_proceeds() {
         let error = driver.tick().unwrap_err();
         assert!(matches!(
             error,
-            DriverError::Forge(ForgeError::Transient(_))
+            DriverError::Effect {
+                error: ForgeError::Transient(_),
+                ..
+            }
         ));
+        assert!(!error.is_fatal());
         let report = driver.tick().unwrap();
         assert_eq!(report.tick, 1);
     }
@@ -263,15 +267,24 @@ fn transient_on_start_abandons_the_plan_and_the_next_tick_proceeds() {
 }
 
 #[test]
-fn transient_on_eject_leaves_retire_uncalled() {
+fn transient_on_eject_after_start_reports_what_the_tick_saw_and_planned() {
     let mut forge = FakeForge::new(busy_observation());
     forge.fail = Some(("eject", Kind::Transient));
     let mut scheduler = ScriptedScheduler::new(vec![full_plan()]);
     let error = Driver::new(&mut forge, &mut scheduler).tick().unwrap_err();
-    assert!(matches!(
-        error,
-        DriverError::Forge(ForgeError::Transient(_))
-    ));
+    assert!(!error.is_fatal());
+    assert_eq!(error.to_string(), "transient forge error: eject flaked");
+    let DriverError::Effect {
+        report,
+        error: ForgeError::Transient(_),
+    } = error
+    else {
+        panic!("expected a transient effect error, got {error:?}");
+    };
+    assert_eq!(report.tick, 0);
+    assert_eq!(report.observation, busy_observation());
+    assert_eq!(report.plan, full_plan());
+    assert!(!report.idle);
     assert_eq!(
         forge.calls,
         [
@@ -295,7 +308,10 @@ fn transient_on_land_leaves_notify_uncalled() {
     let error = Driver::new(&mut forge, &mut scheduler).tick().unwrap_err();
     assert!(matches!(
         error,
-        DriverError::Forge(ForgeError::Transient(_))
+        DriverError::Effect {
+            error: ForgeError::Transient(_),
+            ..
+        }
     ));
     assert_eq!(forge.calls, ["observe ", "land 1"]);
 }
@@ -308,10 +324,45 @@ fn permanent_is_returned() {
     let error = Driver::new(&mut forge, &mut scheduler).tick().unwrap_err();
     assert!(matches!(
         error,
-        DriverError::Forge(ForgeError::Permanent(_))
+        DriverError::Effect {
+            error: ForgeError::Permanent(_),
+            ..
+        }
     ));
+    assert!(error.is_fatal());
     assert_eq!(error.to_string(), "permanent forge error: land refused");
     assert_eq!(forge.calls, ["observe ", "land 1"]);
+}
+
+#[test]
+fn a_permanent_observe_error_is_fatal() {
+    let mut forge = FakeForge::new(busy_observation());
+    forge.fail = Some(("observe", Kind::Permanent));
+    let mut scheduler = ScriptedScheduler::new(vec![full_plan()]);
+    let error = Driver::new(&mut forge, &mut scheduler).tick().unwrap_err();
+    assert!(matches!(
+        error,
+        DriverError::Observe(ForgeError::Permanent(_))
+    ));
+    assert!(error.is_fatal());
+    assert_eq!(error.to_string(), "permanent forge error: observe refused");
+}
+
+#[test]
+fn a_report_round_trips_through_json() {
+    let report = TickReport {
+        tick: 4,
+        observation: busy_observation(),
+        plan: full_plan(),
+        idle: false,
+    };
+    let text = serde_json::to_string(&report).unwrap();
+    assert!(
+        text.starts_with(r#"{"tick":4,"observation":{"now":42,"#),
+        "{text}"
+    );
+    let back: TickReport = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, report);
 }
 
 #[test]
@@ -322,8 +373,9 @@ fn failed_observation_skips_the_scheduler() {
     let error = Driver::new(&mut forge, &mut scheduler).tick().unwrap_err();
     assert!(matches!(
         error,
-        DriverError::Forge(ForgeError::Transient(_))
+        DriverError::Observe(ForgeError::Transient(_))
     ));
+    assert!(!error.is_fatal());
     assert_eq!(scheduler.seen, 0);
     assert_eq!(forge.calls, ["observe "]);
 }
@@ -333,8 +385,30 @@ fn a_scheduler_error_is_returned_and_nothing_is_executed() {
     let mut forge = FakeForge::new(busy_observation());
     let error = Driver::new(&mut forge, &mut Stumped).tick().unwrap_err();
     assert!(matches!(error, DriverError::Scheduler(_)));
+    assert!(error.is_fatal());
     assert_eq!(error.to_string(), "scheduler error: posterior underflow");
     assert_eq!(forge.calls, ["observe "]);
+}
+
+/// `main` numbers a failed tick's journal line `ticks() - 1`: the count
+/// takes the tick before it can fail, at `observe` or in the step.
+#[test]
+fn ticks_counts_each_tick_before_it_can_fail() {
+    let mut forge = FakeForge::new(busy_observation());
+    forge.fail = Some(("observe", Kind::Transient));
+    let mut stumped = Stumped;
+    let mut driver = Driver::new(&mut forge, &mut stumped);
+    assert_eq!(driver.ticks(), 0);
+    assert!(matches!(driver.tick(), Err(DriverError::Observe(_))));
+    assert_eq!(driver.ticks(), 1);
+    assert!(matches!(driver.tick(), Err(DriverError::Scheduler(_))));
+    assert_eq!(driver.ticks(), 2);
+
+    let mut forge = FakeForge::new(busy_observation());
+    let mut scheduler = ScriptedScheduler::new(Vec::new());
+    let mut driver = Driver::new(&mut forge, &mut scheduler);
+    let report = driver.tick().unwrap();
+    assert_eq!(report.tick, driver.ticks() - 1);
 }
 
 #[test]
