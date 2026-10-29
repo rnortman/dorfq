@@ -204,6 +204,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "dorfq-core",
+ "httparse",
  "ring",
  "serde",
  "serde_json",

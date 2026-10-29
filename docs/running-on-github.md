@@ -11,6 +11,8 @@ In order:
 3. Run the [live lane](#the-live-lane) against a throwaway repository.
 4. Set up [branch protection and CI](#branch-protection-and-ci).
 5. [Configure and run](#configuration-and-running) the queue.
+6. Optionally, point [webhooks](#webhooks) at it, so it hears of changes as
+   they happen instead of polling for them.
 
 Before labelling anything, read [what the label means](#the-label).
 
@@ -39,8 +41,8 @@ Workflows is needed because GitHub refuses a merge or a ref update that adds
 or changes a file under `.github/workflows/` to a credential without it, and
 the queue makes both for every queued pull request that touches CI; without
 it the first such batch stops the queue. Checks is what GitHub's permission
-reference names for listing a commit's check runs, which the queue does on
-every observation.
+reference names for listing a commit's check runs, which the queue does each
+time it reads a pull request or a testing batch.
 
 With `lock_heads = true` the queue owns a repository ruleset,
 `dorfq/locked-heads`, that locks the head branch of every pull request in a
@@ -68,8 +70,9 @@ is not Actions leaves the setting absent.
 
 1. Create the app: the account's *Settings → Developer settings → GitHub
    Apps → New GitHub App*. Give it a name (its comments appear as
-   `<name>[bot]`) and any homepage URL, deactivate *Webhook* (dorfq polls),
-   and under *Where can this GitHub App be installed?* choose only this
+   `<name>[bot]`) and any homepage URL. Under *Webhook*, activate it as
+   [Webhooks](#webhooks) describes, or deactivate it and let the queue poll.
+   Under *Where can this GitHub App be installed?* choose only this
    account.
 2. Give it the repository permissions above.
 3. *Generate a private key*. GitHub downloads a `.pem`; store it where the
@@ -113,8 +116,8 @@ review requirements, code owners and stale-review dismissal apply exactly as
 the repository configures them. A pull request GitHub blocks, or a draft, is
 held, not withdrawn; the queue posts nothing about it — GitHub shows why on
 the pull request. A new head is held until it passes again. A pull request
-held by the repository at the latest observation is not landed, even if its
-batch passed. With `lock_heads` on, while a pull request is in a batch its
+held by the repository when the queue last read it, or when it reads it
+again at the moment of landing, is not landed, even if its batch passed. With `lock_heads` on, while a pull request is in a batch its
 head branch is locked, so nobody can push to it; removing the label
 withdraws it and, while the queue is running, unlocks the branch at its next
 observation. A head in a fork cannot be locked. With `lock_heads` off, or for
@@ -177,8 +180,10 @@ on `main`.
 ## Configuration and running
 
 Copy `crates/dorfq/examples/github.toml` and set `owner`, `repo` and
-`[forge.auth]`. `api_base` is `https://<host>/api/v3` on GitHub Enterprise;
-`tick_millis` is the polling interval. `checks` names the checks that must
+`[forge.auth]`. `api_base` is `https://<host>/api/v3` on GitHub Enterprise.
+`[forge.refresh]` sets how often each thing the queue reads is read again
+unprompted, and `[forge.webhook]` whether GitHub's deliveries prompt it;
+[Webhooks](#webhooks) says what each costs. `checks` names the checks that must
 pass on a pull request's head; `batch_checks`, the checks that must pass on a
 batch tip, for a repository whose merge CI reports under other names than
 its pull-request CI; absent, it is `checks`. Either may name an Actions job
@@ -211,6 +216,198 @@ To keep it running, `crates/dorfq/examples/systemd/` has a user unit and a
 system unit; each says where it expects the binary, the configuration and
 the token or the app's key. `make local-deploy` installs the binary where the
 user unit expects it and restarts the unit if it is running.
+
+## Webhooks
+
+Without webhooks the queue learns of every change by reading GitHub again:
+each queued pull request every `pr_secs`, each testing batch and trunk every
+`batch_secs`, the labelled pull requests and the batch records every
+`listing_secs`. With webhooks GitHub tells it what moved, and it reads that
+one thing at once; the intervals become a backstop. A delivery is only ever
+a prompt to read: the queue believes GitHub's API, never a payload, and
+ignores every delivery whose signature does not verify.
+
+### Choosing a profile
+
+- **Webhooks** (`examples/github.toml` as shipped): `listing_secs = 300`,
+  `pr_secs = 1800`, `batch_secs = 300`, and a `[forge.webhook]` table. The
+  intervals bound how long a dropped delivery goes unnoticed: GitHub does
+  not retry a delivery that failed, and the queue does not ask for
+  redelivery.
+- **Polling** (the commented block in the example): no `[forge.webhook]`,
+  and `listing_secs = 60`, `pr_secs = 120`, `batch_secs = 30`. Use it when
+  GitHub cannot reach the queue, behind a firewall for instance; the queue
+  then needs only outbound HTTPS. Every change reaches it within the
+  intervals, at the cost of more API calls: each queued pull request costs
+  about three calls every `pr_secs`.
+
+What a stale read costs, interval by interval:
+
+- `pr_secs`: a push to a queued head that the queue has not read yet can
+  be batched at its old head; the batch then refuses to land that member
+  and its run is wasted. A queued pull request's mergeability is as of its last read: one that
+  trunk's latest landing put in conflict is still batched as clean until
+  then, its merge onto the batch branch fails, and the queue ejects it
+  before any CI runs, at the cost of one build attempt for the other
+  members. A draft or a dismissed approval is always caught at landing,
+  whatever the interval.
+- `batch_secs`: a batch's verdict, and a push to trunk by another hand, are
+  seen this late.
+- `listing_secs`: a newly labelled pull request joins the pool this late.
+
+### Setting up the hook
+
+Generate a secret (`openssl rand -hex 32`), export it where the queue runs
+under the name `secret_env` gives (`DORFQ_WEBHOOK_SECRET` in the example;
+the systemd units read it from the same environment file as the
+credential), and set:
+
+```toml
+[forge.webhook]
+listen = "127.0.0.1:8787"
+secret_env = "DORFQ_WEBHOOK_SECRET"
+```
+
+The queue refuses to start, naming the variable, if it is unset, and naming
+the address if it cannot bind it.
+
+Then point GitHub at it. The payload URL is the proxy's public URL (below);
+any path reaches the queue. Set the secret above and the content type
+`application/json`, and subscribe to these events:
+
+- Pull requests
+- Pull request reviews
+- Check runs
+- Check suites
+- Pushes
+- Statuses — only when a name in `checks` or `batch_checks` is a commit
+  status context rather than a check run, Buildkite's for instance
+
+For an app, this is the app's own webhook: on the app's settings page,
+activate *Webhook*, fill in the URL and secret, and under *Permissions &
+events → Subscribe to events* tick the events. GitHub offers an event only
+once the app has the permission it belongs to; Statuses is offered with
+Commit statuses: read.
+
+For a token, which has no webhook of its own, add a repository webhook:
+*Settings → Webhooks → Add webhook* on the repository, which needs admin on
+it. Choose *Let me select individual events* and tick the events above.
+
+An app's webhook receives the deliveries of every repository the app is
+installed on, the live lane's throwaway repository included. The queue
+answers them all and acts only on those whose repository is the configured
+`owner/repo`.
+
+GitHub sends a `ping` when the hook is saved. *Recent Deliveries* (under
+the app's *Advanced* tab, or on the repository webhook's page) shows each
+delivery's response: `204` means the queue verified it. `401` is a secret
+that does not match, `411` a proxy that forwarded the body without its
+length, `413` a body over 25 MiB; the queue writes one line on stderr for
+each of these three. Nothing in `make live-test` exercises the hook: the
+first real delivery the receiver sees is the one this `ping` sends.
+
+### Following a delivery through the log
+
+The queue writes its diagnostics to stderr and its tick lines to stdout;
+a log that captures only one stream shows half the chain (`journalctl`
+captures both under the shipped units). In order, a delivery leaves:
+
+- at startup, `webhook receiver listening on <address>`;
+- per verified delivery, one line with its id (the id *Recent Deliveries*
+  shows), its event, its action, and either the hint it became or why it
+  became none — for the `ping`, `no hint: the queue does not watch this
+  event`;
+- per hint, what the queue made due: a pull request, a batch or trunk,
+  `due now` or `due in <n> s` when it was read less than five seconds ago,
+  or that a commit matched nothing the queue holds;
+- when a rate-limit pause, a backoff after a failure, the retry of a
+  comment post that failed, or the five-second floor holds the next tick
+  past the hints, `next tick in <n> s` and why;
+- when a hinted pull request the queue did not hold is read and found not
+  open or not labelled, `read; not open and labelled "<label>"; not queued`;
+- then, on stdout, `message to pr <n>: <what>` for each comment the
+  observation owes the author — a greeting, why the pull request is not
+  enqueued, what holds it — and for each a batch started, a landing or an
+  ejection posts in the same tick;
+- then the tick line on stdout, printed when the observation changed.
+
+What each line, or its absence, means:
+
+- No `listening on` line with `[forge.webhook]` set: the process did not get
+  that far; the startup error says why.
+- `502` or `504` in *Recent Deliveries*: the request did not reach the
+  receiver. Check the proxy's upstream; with `listen` on loopback, the proxy
+  must run on the same host.
+- `204` in *Recent Deliveries* and no delivery line: a receiver holding the
+  secret verified it, but not the one whose log you are reading. Check
+  which process listens on the proxy's upstream address — another or an
+  older instance, or a binary from before these lines existed — and that
+  the log captures stderr.
+- `no hint: repository … is not the queue's …`: `owner` and `repo` in the
+  configuration do not name the repository the hook is on.
+- `no hint: the pull request does not carry the label …`: the label on the
+  pull request is not `forge.label`.
+- `read; not open and labelled …; not queued`: what GitHub's API reported
+  for a hinted pull request the queue did not hold. After an `unlabeled` or
+  `closed` delivery it is routine: the queue removes the label itself when it
+  lands or ejects a pull request, and reads that pull request once more when
+  the delivery's hint arrives. After a `labeled` or `opened` delivery it means
+  the delivery said the pull request carried the label and the API did not;
+  look at the pull request on GitHub.
+- A tick line and no `message to pr` line before it: the queue observed the
+  pull request and owes nothing — its thread already says why it is
+  blocked, or what holds it — or the post failed transiently and is being
+  retried: each failed attempt writes `kept the comment for message to pr
+  <n>: …; retrying` on stderr with GitHub's error, and after a hint `next
+  tick in <n> s: retrying a comment post` says when the next attempt is. A
+  post GitHub refused for good is `dropped the comment for …` on stderr.
+
+### The reverse proxy
+
+The receiver speaks plain HTTP and serves one connection at a time. Bind it
+to loopback or a private address and put a reverse proxy in front that
+terminates TLS. With `nginx`:
+
+```nginx
+location /dorfq/webhook {
+    client_max_body_size 25m;
+    client_body_timeout 10s;
+    proxy_pass http://127.0.0.1:8787;
+}
+```
+
+With `caddy`:
+
+```caddyfile
+handle /dorfq/webhook {
+    request_body {
+        max_size 25MB
+    }
+    reverse_proxy 127.0.0.1:8787
+}
+```
+
+with the read timeout set in the server's global options
+(`servers { timeouts { read_body 10s } }`).
+
+The receiver requires a `Content-Length` and answers a chunked body `411`,
+so the proxy must forward the body with its length. `nginx` does by
+default: leave `proxy_request_buffering` at `on`. `caddy` forwards the
+length it received; there is nothing to set.
+
+The body limit and the body timeout protect the receiver's time, not its
+life. It already refuses any declared body over 25 MiB before reading it and
+drops any connection still unfinished ten seconds after it was accepted, so
+nothing a client sends can stop the queue. But a client that holds a
+connection for those ten seconds delays every delivery queued behind it,
+and GitHub gives up on a delivery after ten seconds; the proxy drops such
+traffic before it reaches the receiver. A receiver reachable without the
+proxy can be slowed, so that the queue falls back on its intervals, but not
+stopped.
+
+If the receiver's thread ever stops, the queue stops with it, with the
+cause on stderr: a queue configured for webhooks does not run on without
+them.
 
 ## While it runs
 

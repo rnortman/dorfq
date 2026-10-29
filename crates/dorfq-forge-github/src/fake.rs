@@ -9,12 +9,13 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
+use std::time::SystemTime;
 
 use dorfq_core::{PrNumber, Sha};
 
 use crate::api::{
-    ApiError, CheckResult, Commit, Compare, CompareStatus, GitHubApi, Merge, MergeState, PrDetail,
-    PrSummary, RefEntry, RefUpdate, RulesetId, RunId, WorkflowRun,
+    ApiError, CheckResult, Commit, Compare, CompareStatus, GitHubApi, Merge, MergeState, OpenPr,
+    PrDetail, RefEntry, RefUpdate, RulesetId, RunId, WorkflowRun,
 };
 use crate::branch;
 
@@ -80,9 +81,9 @@ pub struct State {
     /// A pull request whose base branch a ruleset locks reads `Blocked`, as
     /// GitHub may report a base nobody can update.
     pub lock_blocks_children: bool,
-    /// Pull requests every listing returns a second time, at the given head,
-    /// as a page boundary shifting under a paginated read does.
-    pub listed_again: Vec<(u64, Sha)>,
+    /// Pull requests every listing returns a second time, as a page
+    /// boundary shifting under a paginated read does.
+    pub listed_again: Vec<u64>,
     /// Open pull requests every listing leaves out, as a page boundary
     /// shifting the other way does.
     pub unlisted: BTreeSet<u64>,
@@ -90,6 +91,9 @@ pub struct State {
     pub rulesets: BTreeMap<RulesetId, (String, BTreeSet<String>)>,
     /// Actions workflow runs by id.
     pub runs: BTreeMap<RunId, FakeRun>,
+    /// The pause the next [`GitHubApi::rate_limit_pause`] reports, as a
+    /// rate-limited response would have recorded it; taken by that call.
+    pub rate_limit_pause: Option<SystemTime>,
     /// Every call, as `"<method> <arguments>"`.
     pub calls: Vec<String>,
     /// Failures to inject: method, a substring of the call's arguments,
@@ -532,27 +536,33 @@ impl GitHubApi for FakeGitHub {
         })
     }
 
-    fn list_open_prs(&mut self) -> Result<Vec<PrSummary>, ApiError> {
-        self.enter("list_open_prs", String::new())?;
+    fn list_labelled(&mut self, label: &str) -> Result<Vec<PrNumber>, ApiError> {
+        self.enter("list_labelled", label.to_owned())?;
         let state = self.state();
-        let summary = |number: u64, pr: &FakePr, head: &Sha| PrSummary {
-            number: PrNumber(number),
-            head: head.clone(),
-            base: pr.base.clone(),
-            head_branch: pr.head_branch.clone(),
-            labels: pr.labels.clone(),
-            title: pr.title.clone(),
-        };
-        let mut listing: Vec<PrSummary> = state
+        let mut listing: Vec<PrNumber> = state
             .prs
             .iter()
-            .filter(|(number, pr)| pr.open && !state.unlisted.contains(number))
-            .map(|(&number, pr)| summary(number, pr, &pr.head))
+            .filter(|(number, pr)| {
+                pr.open && pr.labels.iter().any(|l| l == label) && !state.unlisted.contains(number)
+            })
+            .map(|(&number, _)| PrNumber(number))
             .collect();
-        for (number, head) in &state.listed_again {
-            listing.push(summary(*number, &state.prs[number], head));
-        }
+        listing.extend(state.listed_again.iter().map(|&n| PrNumber(n)));
         Ok(listing)
+    }
+
+    fn open_pr_with_head(&mut self, branch: &str) -> Result<Option<OpenPr>, ApiError> {
+        self.enter("open_pr_with_head", branch.to_owned())?;
+        Ok(self
+            .state()
+            .prs
+            .iter()
+            .find(|(_, pr)| pr.open && pr.head_branch.as_deref() == Some(branch))
+            .map(|(&number, pr)| OpenPr {
+                number: PrNumber(number),
+                head: pr.head.clone(),
+                base: pr.base.clone(),
+            }))
     }
 
     fn get_pr(&mut self, number: PrNumber) -> Result<PrDetail, ApiError> {
@@ -566,6 +576,8 @@ impl GitHubApi for FakeGitHub {
             open: pr.open,
             base: pr.base.clone(),
             head: pr.head.clone(),
+            head_branch: pr.head_branch.clone(),
+            title: pr.title.clone(),
             labels: pr.labels.clone(),
             merge_state: if state.lock_blocks_children
                 && state
@@ -740,6 +752,10 @@ impl GitHubApi for FakeGitHub {
             run.completed = true;
         }
         Ok(())
+    }
+
+    fn rate_limit_pause(&mut self) -> Option<SystemTime> {
+        self.state().rate_limit_pause.take()
     }
 }
 

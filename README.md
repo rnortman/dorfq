@@ -21,8 +21,8 @@ to your Github installation and bot credentials.
 
 DorfQ is operating as its own merge queue. The core functionality is there;
 operational support for managing it in the real world is somewhat lacking, as is
-developer-facing tooling. There are a few inefficiencies in the Github API usage
-and in the Bayesian reasoning that are still being improved. Only Github is
+developer-facing tooling. There are a few inefficiencies in the Bayesian
+reasoning that are still being improved. Only Github is
 supported as a backend forge, though the forge interface is abstracted so
 others can be plugged in later.
 

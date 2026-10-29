@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dorfq_core::{ForgeError, PrNumber, Sha};
 use serde::Deserialize;
@@ -38,8 +38,12 @@ pub trait GitHubApi {
     /// How `head` stands to `base`, the commits `head` has that `base` does
     /// not, and their merge base.
     fn compare(&mut self, base: &Sha, head: &Sha) -> Result<Compare, ApiError>;
-    /// Every open pull request in the repository.
-    fn list_open_prs(&mut self) -> Result<Vec<PrSummary>, ApiError>;
+    /// The numbers of the open pull requests carrying `label`, in the
+    /// listing's order; a number may appear twice.
+    fn list_labelled(&mut self, label: &str) -> Result<Vec<PrNumber>, ApiError>;
+    /// The lowest-numbered open pull request whose head branch is `branch`
+    /// in this repository.
+    fn open_pr_with_head(&mut self, branch: &str) -> Result<Option<OpenPr>, ApiError>;
     fn get_pr(&mut self, number: PrNumber) -> Result<PrDetail, ApiError>;
     /// Changes the branch a pull request targets.
     fn set_base(&mut self, number: PrNumber, base: &str) -> Result<(), ApiError>;
@@ -81,6 +85,10 @@ pub trait GitHubApi {
     /// Cancels a workflow run; one already finished, or gone, is not an
     /// error.
     fn cancel_run(&mut self, id: RunId) -> Result<(), ApiError>;
+    /// The instant before which GitHub asked for no further requests, as the
+    /// latest rate-limited response since the last call said; cleared by
+    /// the call. Not a request.
+    fn rate_limit_pause(&mut self) -> Option<SystemTime>;
 }
 
 /// A repository ruleset's id.
@@ -161,16 +169,11 @@ pub enum CompareStatus {
 
 /// An open pull request, as the list endpoint reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrSummary {
+pub struct OpenPr {
     pub number: PrNumber,
     pub head: Sha,
     /// The branch it targets.
     pub base: String,
-    /// Its head branch's name, when the head lives in this repository;
-    /// `None` for a head in a fork, which no pull request here can target.
-    pub head_branch: Option<String>,
-    pub labels: Vec<String>,
-    pub title: String,
 }
 
 /// One pull request, as the single-item endpoint reports it.
@@ -180,6 +183,10 @@ pub struct PrDetail {
     /// The branch it targets.
     pub base: String,
     pub head: Sha,
+    /// Its head branch's name, when the head lives in this repository;
+    /// `None` for a head in a fork, which no pull request here can target.
+    pub head_branch: Option<String>,
+    pub title: String,
     pub labels: Vec<String>,
     /// GitHub's verdict on whether it may merge into its base branch.
     pub merge_state: MergeState,
@@ -405,6 +412,9 @@ pub struct RestClient {
     credential: Credential,
     transport: Transport,
     now: Clock,
+    /// The end of the latest rate-limit pause a response asked for, until
+    /// [`GitHubApi::rate_limit_pause`] takes it.
+    paused_until: Option<SystemTime>,
 }
 
 const PER_PAGE: &str = "per_page=100";
@@ -466,6 +476,7 @@ impl RestClient {
             credential,
             transport,
             now,
+            paused_until: None,
         }
     }
 
@@ -484,7 +495,8 @@ impl RestClient {
             owner: _,
             credential,
             transport,
-            now,
+            now: clock,
+            paused_until,
         } = self;
         let (key, repo, installation, token) = match credential {
             Credential::Token(bearer) => return Ok(bearer.clone()),
@@ -495,7 +507,7 @@ impl RestClient {
                 token,
             } => (key, repo, installation, token),
         };
-        let now = now();
+        let now = clock();
         if let Some(cached) = token {
             // A clock that stepped back since the mint makes the token look
             // younger, never older.
@@ -514,8 +526,15 @@ impl RestClient {
                 let doing = "finding the app's installation";
                 let path = format!("{repo_path}/installation");
                 let url = format!("{api_base}{path}");
-                let found: InstallationJson =
-                    app_call(transport, doing, Method::Get, &path, &url, &jwt, None)?;
+                let found: InstallationJson = app_call(
+                    (transport, clock, paused_until),
+                    doing,
+                    Method::Get,
+                    &path,
+                    &url,
+                    &jwt,
+                    None,
+                )?;
                 *installation = Some(found.id);
                 found.id
             }
@@ -525,7 +544,7 @@ impl RestClient {
         let url = format!("{api_base}{path}");
         let body = json!({ "repositories": [repo.as_str()] });
         let minted: AccessTokenJson = app_call(
-            transport,
+            (transport, clock, paused_until),
             doing,
             Method::Post,
             &path,
@@ -593,7 +612,14 @@ impl RestClient {
         body: Option<&Value>,
     ) -> Result<HttpResponse, ApiError> {
         let authorization = self.authorization()?;
-        let response = exchange(&mut self.transport, method, path, url, &authorization, body)?;
+        let response = exchange(
+            (&mut self.transport, &self.now, &mut self.paused_until),
+            method,
+            path,
+            url,
+            &authorization,
+            body,
+        )?;
         if response.status == 401 && matches!(self.credential, Credential::App { .. }) {
             return Err(permanent(format!(
                 "{method} {path}: HTTP 401: {} ({INSTALLATION_TOKEN_REJECTED})",
@@ -756,29 +782,33 @@ impl GitHubApi for RestClient {
         compare_of(&what, compared)
     }
 
-    fn list_open_prs(&mut self) -> Result<Vec<PrSummary>, ApiError> {
-        let path = "/pulls?state=open";
-        let what = format!("GET {path}");
-        let found: Vec<PrJson> = self.get_array(path)?;
-        found
+    fn list_labelled(&mut self, label: &str) -> Result<Vec<PrNumber>, ApiError> {
+        // The issues endpoint filters by label on GitHub's side and lists
+        // pull requests as issues that carry a `pull_request` key.
+        let path = format!("/issues?state=open&labels={}", encode(label));
+        let found: Vec<IssueJson> = self.get_array(&path)?;
+        Ok(found
             .into_iter()
-            .map(|pr| {
-                // GitHub compares repository names case-insensitively.
-                let local = pr
-                    .head
-                    .repo
-                    .as_ref()
-                    .is_some_and(|r| r.full_name.eq_ignore_ascii_case(&self.repo_name));
-                Ok(PrSummary {
-                    number: PrNumber(pr.number),
-                    head: parse_sha(&what, &pr.head.sha)?,
-                    base: pr.base.branch,
-                    head_branch: local.then_some(pr.head.branch),
-                    labels: pr.labels.into_iter().map(|l| l.name).collect(),
-                    title: pr.title,
-                })
-            })
-            .collect()
+            .filter(|issue| issue.pull_request.is_some())
+            .map(|issue| PrNumber(issue.number))
+            .collect())
+    }
+
+    fn open_pr_with_head(&mut self, branch: &str) -> Result<Option<OpenPr>, ApiError> {
+        let path = format!(
+            "/pulls?state=open&head={}",
+            encode(&format!("{}:{branch}", self.owner))
+        );
+        let what = format!("GET {path}");
+        let found: Vec<PrJson> = self.get_array(&path)?;
+        let Some(lowest) = found.into_iter().min_by_key(|pr| pr.number) else {
+            return Ok(None);
+        };
+        Ok(Some(OpenPr {
+            number: PrNumber(lowest.number),
+            head: parse_sha(&what, &lowest.head.sha)?,
+            base: lowest.base.branch,
+        }))
     }
 
     fn get_pr(&mut self, number: PrNumber) -> Result<PrDetail, ApiError> {
@@ -801,10 +831,18 @@ impl GitHubApi for RestClient {
         let draft = pr
             .draft
             .ok_or_else(|| permanent(format!("{what}: no draft field")))?;
+        // GitHub compares repository names case-insensitively.
+        let local = pr
+            .head
+            .repo
+            .as_ref()
+            .is_some_and(|r| r.full_name.eq_ignore_ascii_case(&self.repo_name));
         Ok(PrDetail {
             open,
             base: pr.base.branch,
             head: parse_sha(&what, &pr.head.sha)?,
+            head_branch: local.then_some(pr.head.branch),
+            title: pr.title,
             labels: pr.labels.into_iter().map(|l| l.name).collect(),
             merge_state,
             draft,
@@ -1027,6 +1065,10 @@ impl GitHubApi for RestClient {
             _ => Err(actions_failure(Method::Post, &path, &response)),
         }
     }
+
+    fn rate_limit_pause(&mut self) -> Option<SystemTime> {
+        self.paused_until.take()
+    }
 }
 
 /// The body of the queue's ruleset, less its name: an active branch
@@ -1094,9 +1136,15 @@ fn check_run_outcome(what: &str, run: &CheckRunJson) -> Result<CheckOutcome, Api
     }
 }
 
-/// One request through `transport`; any status is returned.
+/// What every request passes through: the transport, the clock, and where
+/// a rate-limited response's pause is recorded.
+type Exchange<'a> = (&'a mut Transport, &'a Clock, &'a mut Option<SystemTime>);
+
+/// One request through the transport; any status is returned. A
+/// rate-limited response records its pause, kept if later than one already
+/// recorded.
 fn exchange(
-    transport: &mut Transport,
+    (transport, clock, paused_until): Exchange<'_>,
     method: Method,
     path: &str,
     url: &str,
@@ -1109,20 +1157,25 @@ fn exchange(
         authorization,
         body,
     };
-    transport(&request).map_err(|e| {
+    let response = transport(&request).map_err(|e| {
         let message = format!("{method} {path}: {}", e.message);
         if e.transient {
             ApiError::Transient(message.into())
         } else {
             ApiError::Permanent(message.into())
         }
-    })
+    })?;
+    if let Some(limit) = rate_limit(&response) {
+        let until = limit.until(clock());
+        *paused_until = Some(paused_until.map_or(until, |earlier| earlier.max(until)));
+    }
+    Ok(response)
 }
 
 /// One request authorised by the app's JWT, decoded from a 2xx response.
 /// Every error says what was being `doing`.
 fn app_call<T: for<'de> Deserialize<'de>>(
-    transport: &mut Transport,
+    through: Exchange<'_>,
     doing: &str,
     method: Method,
     path: &str,
@@ -1134,7 +1187,7 @@ fn app_call<T: for<'de> Deserialize<'de>>(
         ApiError::Transient(e) => ApiError::Transient(format!("{doing}: {e}").into()),
         ApiError::Permanent(e) => ApiError::Permanent(format!("{doing}: {e}").into()),
     };
-    let response = exchange(transport, method, path, url, jwt, body).map_err(in_context)?;
+    let response = exchange(through, method, path, url, jwt, body).map_err(in_context)?;
     if response.status == 401 {
         return Err(permanent(format!(
             "{doing}: {method} {path}: HTTP 401: {} ({JWT_REJECTED})",
@@ -1153,19 +1206,11 @@ fn failure(method: Method, path: &str, response: &HttpResponse) -> ApiError {
     let status = response.status;
     let detail = github_message(response);
     let message = format!("{method} {path}: HTTP {status}: {detail}");
-    // A secondary rate limit may carry neither header; its message says
-    // what it is.
-    let rate_limited = response.header("x-ratelimit-remaining") == Some("0")
-        || response.header("retry-after").is_some()
-        || detail.to_ascii_lowercase().contains("secondary rate limit");
-    if status == 429 || (status == 403 && rate_limited) {
-        let until = match (
-            response.header("retry-after"),
-            response.header("x-ratelimit-reset"),
-        ) {
-            (Some(seconds), _) => format!("retry after {seconds} s"),
-            (None, Some(reset)) => format!("limit resets at unix time {reset}"),
-            (None, None) => "retry after at least 60 s".to_owned(),
+    if let Some(limit) = rate_limit(response) {
+        let until = match limit {
+            RateLimit::After(seconds) => format!("retry after {seconds} s"),
+            RateLimit::ResetAt(reset) => format!("limit resets at unix time {reset}"),
+            RateLimit::Unstated => format!("retry after at least {UNSTATED_PAUSE_SECS} s"),
         };
         return ApiError::Transient(format!("{message} (rate limited; {until})").into());
     }
@@ -1180,6 +1225,67 @@ fn failure(method: Method, path: &str, response: &HttpResponse) -> ApiError {
         return ApiError::Transient(message.into());
     }
     permanent(message)
+}
+
+/// How long a rate limit that names no time pauses the queue.
+const UNSTATED_PAUSE_SECS: u64 = 60;
+
+/// When a rate-limited response says requests may resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateLimit {
+    /// `retry-after`: this many seconds from now.
+    After(u64),
+    /// `x-ratelimit-reset` with `x-ratelimit-remaining` at `0`: this unix
+    /// time.
+    ResetAt(u64),
+    /// No `retry-after` and the primary limit not exhausted, or the header
+    /// that would name the time not readable as whole seconds: a secondary
+    /// limit known only by its status or message.
+    Unstated,
+}
+
+impl RateLimit {
+    fn until(self, now: SystemTime) -> SystemTime {
+        match self {
+            RateLimit::After(seconds) => now + Duration::from_secs(seconds),
+            RateLimit::ResetAt(reset) => UNIX_EPOCH + Duration::from_secs(reset),
+            RateLimit::Unstated => now + Duration::from_secs(UNSTATED_PAUSE_SECS),
+        }
+    }
+}
+
+/// The rate limit a response reports: a `429`, or a `403` with the
+/// primary limit exhausted, a `retry-after`, or a secondary limit's
+/// message. `None` for any other response.
+fn rate_limit(response: &HttpResponse) -> Option<RateLimit> {
+    let status = response.status;
+    // A secondary rate limit may carry neither header; its message says
+    // what it is.
+    let rate_limited = status == 429
+        || status == 403
+            && (response.header("x-ratelimit-remaining") == Some("0")
+                || response.header("retry-after").is_some()
+                || github_message(response)
+                    .to_ascii_lowercase()
+                    .contains("secondary rate limit"));
+    if !rate_limited {
+        return None;
+    }
+    let seconds = |name| {
+        response
+            .header(name)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    // Every response carries `x-ratelimit-reset`, the primary window's end;
+    // it says when requests may resume only once that window is exhausted.
+    let exhausted = response.header("x-ratelimit-remaining") == Some("0");
+    Some(
+        match (seconds("retry-after"), seconds("x-ratelimit-reset")) {
+            (Some(after), _) => RateLimit::After(after),
+            (None, Some(reset)) if exhausted => RateLimit::ResetAt(reset),
+            (None, _) => RateLimit::Unstated,
+        },
+    )
 }
 
 /// GitHub's `message` field from an error body followed by the detail of each
@@ -1397,6 +1503,14 @@ struct HeadJson {
     branch: String,
     /// Null for a head in a deleted fork.
     repo: Option<RepoJson>,
+}
+
+#[derive(Deserialize)]
+struct IssueJson {
+    number: u64,
+    /// Present only on an issue that is a pull request.
+    #[serde(default)]
+    pull_request: Option<Value>,
 }
 
 #[derive(Deserialize)]

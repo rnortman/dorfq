@@ -34,6 +34,7 @@ use dorfq_core::{
 use dorfq_forge_github::api::{Auth, GitHubApi, RefUpdate, RestClient};
 use dorfq_forge_github::app::AppKey;
 use dorfq_forge_github::messages::{Marker, last_marker};
+use dorfq_forge_github::refresh::Refresh;
 use dorfq_forge_github::{Ci, GitHubForge, LOCK_RULESET, Settings, system_clock};
 use serde_json::{Value, json};
 
@@ -184,12 +185,20 @@ impl Target {
             batch_checks: vec![CHECK.to_owned()],
             lock_heads: self.lock_heads,
             ci: self.ci,
+            // Every entity is due a second after its read, so each
+            // `observe_until` attempt, `PAUSE` apart, reads what it waits on.
+            refresh: Refresh {
+                listing: Duration::from_secs(1),
+                pr: Duration::from_secs(1),
+                batch: Duration::from_secs(1),
+            },
         };
         GitHubForge::new(
             Box::new(self.client()),
             settings,
             Box::new(system_clock),
             Box::new(std::io::stdout()),
+            None,
         )
         .map_err(at("constructing the forge"))
     }
@@ -329,14 +338,12 @@ impl Repo {
     /// queue ref and every branch under `stale_prefix`, and creates the label
     /// if it is missing.
     fn clean(&mut self, stale_prefix: &str) -> Result<(), String> {
-        for pr in self
+        for number in self
             .client
-            .list_open_prs()
+            .list_labelled(LABEL)
             .map_err(at("listing pull requests"))?
         {
-            if pr.labels.iter().any(|l| l == LABEL) {
-                self.close(pr.number)?;
-            }
+            self.close(number)?;
         }
         for prefix in ["refs/heads/dorfq/", "refs/dorfq/", stale_prefix] {
             for entry in self.client.list_refs(prefix).map_err(at("listing refs"))? {

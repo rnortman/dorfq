@@ -141,6 +141,8 @@ fn get_pr_decodes_every_field() {
             open: true,
             base: "main".to_owned(),
             head: sha(B),
+            head_branch: Some("topic".to_owned()),
+            title: "change 12".to_owned(),
             labels: vec!["queue".to_owned(), "bug".to_owned()],
             merge_state: MergeState::Unknown,
             draft: true,
@@ -512,69 +514,62 @@ fn compare_not_found_is_permanent() {
     assert!(!is_transient(&error));
 }
 
+/// An issue as the issues endpoint lists it; a pull request carries a
+/// `pull_request` key.
+fn issue_json(number: u64, pull_request: bool) -> Value {
+    let mut issue = json!({ "number": number, "title": format!("issue {number}") });
+    if pull_request {
+        issue["pull_request"] = json!({ "url": format!("{REPO}/pulls/{number}") });
+    }
+    issue
+}
+
 #[test]
-fn list_follows_link_next() {
-    let page2 = format!("{REPO}/pulls?state=open&per_page=100&page=2");
-    let mut first = ok(json!([pr_json(1, A, &["queue"], "unknown")]));
+fn list_labelled_follows_link_next_and_keeps_only_pull_requests() {
+    let path = "/issues?state=open&labels=merge%20queue&per_page=100";
+    let page2 = format!("{REPO}/issues?state=open&labels=merge%20queue&per_page=100&page=2");
+    let mut first = ok(json!([issue_json(1, true), issue_json(3, false)]));
     first.headers.push((
         "link",
         format!("<{page2}>; rel=\"next\", <{page2}>; rel=\"last\""),
     ));
-    let mut second = ok(json!([pr_json(2, B, &[], "unknown")]));
+    let mut second = ok(json!([issue_json(2, true)]));
     second.headers.push((
         "link",
-        format!("<{REPO}/pulls?page=1>; rel=\"prev\", <{REPO}/pulls?page=1>; rel=\"first\""),
+        format!("<{REPO}/issues?page=1>; rel=\"prev\", <{REPO}/issues?page=1>; rel=\"first\""),
     ));
     let (mut api, seen) = client(vec![
-        route("GET", "/pulls?state=open&per_page=100", first),
+        route("GET", path, first),
         (format!("GET {page2}"), second),
     ]);
-    let prs = api.list_open_prs().unwrap();
     assert_eq!(
-        prs,
-        vec![
-            PrSummary {
-                number: PrNumber(1),
-                head: sha(A),
-                base: "main".to_owned(),
-                head_branch: Some("topic".to_owned()),
-                labels: vec!["queue".to_owned()],
-                title: "change 1".to_owned(),
-            },
-            PrSummary {
-                number: PrNumber(2),
-                head: sha(B),
-                base: "main".to_owned(),
-                head_branch: Some("topic".to_owned()),
-                labels: vec![],
-                title: "change 2".to_owned(),
-            },
-        ]
+        api.list_labelled("merge queue").unwrap(),
+        [PrNumber(1), PrNumber(2)]
     );
     assert_eq!(seen.borrow().len(), 2);
 }
 
 #[test]
 fn a_failed_later_page_fails_the_list() {
-    let page2 = format!("{REPO}/pulls?state=open&per_page=100&page=2");
-    let mut first = ok(json!([pr_json(1, A, &["queue"], "unknown")]));
+    let page2 = format!("{REPO}/issues?state=open&labels=queue&per_page=100&page=2");
+    let mut first = ok(json!([issue_json(1, true)]));
     first
         .headers
         .push(("link", format!("<{page2}>; rel=\"next\"")));
     let (mut api, _) = client(vec![
-        route("GET", "/pulls?state=open&per_page=100", first),
+        route("GET", "/issues?state=open&labels=queue&per_page=100", first),
         (
             format!("GET {page2}"),
             status(502, json!({ "message": "Bad Gateway" })),
         ),
     ]);
-    let error = api.list_open_prs().unwrap_err();
+    let error = api.list_labelled("queue").unwrap_err();
     assert!(is_transient(&error), "{error}");
     assert!(error.to_string().contains("HTTP 502"), "{error}");
 }
 
 #[test]
-fn list_reads_each_base_and_head_branch_but_not_a_forks() {
+fn get_pr_reads_each_head_branch_but_not_a_forks() {
     let mut stacked = pr_json(1, A, &["queue"], "unknown");
     stacked["base"]["ref"] = json!("feature/one");
     stacked["head"]["ref"] = json!("feature/two");
@@ -584,25 +579,56 @@ fn list_reads_each_base_and_head_branch_but_not_a_forks() {
     fork["head"]["repo"]["full_name"] = json!("someone/widgets");
     let mut deleted_fork = pr_json(4, C, &[], "unknown");
     deleted_fork["head"]["repo"] = Value::Null;
-    let (mut api, _) = client(vec![route(
-        "GET",
-        "/pulls?state=open&per_page=100",
-        ok(json!([stacked, shouting, fork, deleted_fork])),
-    )]);
-    let prs = api.list_open_prs().unwrap();
-    let got: Vec<(u64, &str, Option<&str>)> = prs
-        .iter()
-        .map(|p| (p.number.0, p.base.as_str(), p.head_branch.as_deref()))
-        .collect();
+    let (mut api, _) = client(vec![
+        route("GET", "/pulls/1", ok(stacked)),
+        route("GET", "/pulls/2", ok(shouting)),
+        route("GET", "/pulls/3", ok(fork)),
+        route("GET", "/pulls/4", ok(deleted_fork)),
+    ]);
+    let mut got = Vec::new();
+    for n in 1..=4 {
+        let pr = api.get_pr(PrNumber(n)).unwrap();
+        got.push((n, pr.base, pr.head_branch));
+    }
+    let branch = |name: &str| Some(name.to_owned());
     assert_eq!(
         got,
         vec![
-            (1, "feature/one", Some("feature/two")),
-            (2, "main", Some("topic")),
-            (3, "main", None),
-            (4, "main", None),
+            (1, "feature/one".to_owned(), branch("feature/two")),
+            (2, "main".to_owned(), branch("topic")),
+            (3, "main".to_owned(), None),
+            (4, "main".to_owned(), None),
         ]
     );
+}
+
+#[test]
+fn open_pr_with_head_asks_for_the_branch_in_this_repository_and_takes_the_lowest() {
+    let mut later = pr_json(9, B, &[], "unknown");
+    later["base"]["ref"] = json!("release");
+    let earlier = pr_json(4, C, &[], "unknown");
+    // The route matches the whole query, so it is what checks the filter.
+    let (mut api, _) = client(vec![
+        route(
+            "GET",
+            "/pulls?state=open&head=acme%3Afeature%2Fone&per_page=100",
+            ok(json!([later, earlier])),
+        ),
+        route(
+            "GET",
+            "/pulls?state=open&head=acme%3Agone&per_page=100",
+            ok(json!([])),
+        ),
+    ]);
+    assert_eq!(
+        api.open_pr_with_head("feature/one").unwrap(),
+        Some(OpenPr {
+            number: PrNumber(4),
+            head: sha(C),
+            base: "main".to_owned(),
+        })
+    );
+    assert_eq!(api.open_pr_with_head("gone").unwrap(), None);
 }
 
 #[test]
@@ -781,18 +807,178 @@ fn rate_limit_message_names_the_reset_time() {
 }
 
 #[test]
-fn secondary_rate_limit_without_headers_says_wait_a_minute() {
-    let c = status(
+fn secondary_rate_limit_without_retry_after_says_wait_a_minute() {
+    let mut c = status(
         403,
         json!({ "message": "You have exceeded a secondary rate limit." }),
     );
+    c.headers.push(("x-ratelimit-remaining", "4321".to_owned()));
+    c.headers
+        .push(("x-ratelimit-reset", "1792000000".to_owned()));
     let (mut api, _) = client(vec![route("GET", "/labels/queue", c)]);
     let error = api.label_exists("queue").unwrap_err();
     assert!(is_transient(&error));
-    assert!(
-        error.to_string().contains("retry after at least 60 s"),
-        "{error}"
+    let text = error.to_string();
+    assert!(text.contains("retry after at least 60 s"), "{text}");
+    assert!(!text.contains("1792000000"), "{text}");
+}
+
+/// A client at `now` seconds after the epoch whose `GET /labels/queue`
+/// answers each of `responses` in turn.
+fn labels_client(now: u64, responses: Vec<Canned>) -> RestClient {
+    let routes = responses
+        .into_iter()
+        .map(|c| route("GET", "/labels/queue", c))
+        .collect();
+    let clock = Rc::new(Cell::new(UNIX_EPOCH + Duration::from_secs(now)));
+    client_with(Auth::Token(TOKEN.to_owned()), routes, clock).0
+}
+
+fn paused_at(seconds: u64) -> Option<SystemTime> {
+    Some(UNIX_EPOCH + Duration::from_secs(seconds))
+}
+
+fn limited(code: u16, message: &str, headers: &[(&'static str, &str)]) -> Canned {
+    let mut c = status(code, json!({ "message": message }));
+    c.headers
+        .extend(headers.iter().map(|(n, v)| (*n, (*v).to_owned())));
+    c
+}
+
+#[test]
+fn a_rate_limited_response_records_when_requests_may_resume() {
+    let cases: Vec<(Canned, Option<SystemTime>)> = vec![
+        // `retry-after` counts from the client's clock.
+        (
+            limited(403, "secondary rate limit", &[("retry-after", "90")]),
+            paused_at(1000 + 90),
+        ),
+        (
+            limited(429, "slow down", &[("retry-after", "7")]),
+            paused_at(1007),
+        ),
+        // `x-ratelimit-reset` is the unix time it names.
+        (
+            limited(
+                403,
+                "API rate limit exceeded",
+                &[
+                    ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", "1792000000"),
+                ],
+            ),
+            paused_at(1_792_000_000),
+        ),
+        // Both: `retry-after` wins.
+        (
+            limited(
+                429,
+                "slow down",
+                &[("retry-after", "30"), ("x-ratelimit-reset", "1792000000")],
+            ),
+            paused_at(1030),
+        ),
+        // A secondary limit carries the primary window's headers, as every
+        // response does; with that window not exhausted its reset names
+        // nothing: a minute.
+        (
+            limited(
+                403,
+                "You have exceeded a secondary rate limit.",
+                &[
+                    ("x-ratelimit-limit", "5000"),
+                    ("x-ratelimit-remaining", "4321"),
+                    ("x-ratelimit-reset", "1792000000"),
+                ],
+            ),
+            paused_at(1060),
+        ),
+        (
+            limited(
+                429,
+                "slow down",
+                &[
+                    ("x-ratelimit-remaining", "17"),
+                    ("x-ratelimit-reset", "1792000000"),
+                ],
+            ),
+            paused_at(1060),
+        ),
+        // Neither: a minute.
+        (
+            limited(403, "You have exceeded a secondary rate limit.", &[]),
+            paused_at(1060),
+        ),
+        (limited(429, "slow down", &[]), paused_at(1060)),
+        // A header that is not whole seconds counts as absent.
+        (
+            limited(429, "slow down", &[("retry-after", "soon")]),
+            paused_at(1060),
+        ),
+        // Not a rate limit: nothing recorded.
+        (limited(403, "Resource not accessible", &[]), None),
+        (limited(500, "boom", &[("retry-after", "5")]), None),
+        (
+            limited(403, "Forbidden", &[("x-ratelimit-remaining", "12")]),
+            None,
+        ),
+    ];
+    for (canned, expected) in cases {
+        let code = canned.status;
+        let mut api = labels_client(1000, vec![canned]);
+        assert_eq!(api.rate_limit_pause(), None);
+        api.label_exists("queue").unwrap_err();
+        assert_eq!(api.rate_limit_pause(), expected, "HTTP {code}");
+        // Taken by the call: a second call reports nothing.
+        assert_eq!(api.rate_limit_pause(), None, "HTTP {code}");
+    }
+}
+
+#[test]
+fn the_later_of_two_recorded_pauses_stands_until_taken() {
+    let mut api = labels_client(
+        1000,
+        vec![
+            limited(429, "slow down", &[("retry-after", "120")]),
+            limited(429, "slow down", &[("retry-after", "10")]),
+            limited(429, "slow down", &[("retry-after", "300")]),
+        ],
     );
+    api.label_exists("queue").unwrap_err();
+    api.label_exists("queue").unwrap_err();
+    assert_eq!(api.rate_limit_pause(), paused_at(1120));
+    api.label_exists("queue").unwrap_err();
+    assert_eq!(api.rate_limit_pause(), paused_at(1300));
+}
+
+#[test]
+fn a_rate_limited_page_of_a_listing_records_its_pause() {
+    let path = format!("/commits/{A}/check-runs");
+    let (mut api, _) = client(vec![(
+        format!("GET {REPO}{path}?{PER_PAGE}"),
+        limited(403, "secondary rate limit", &[("retry-after", "45")]),
+    )]);
+    assert!(is_transient(&api.checks(&sha(A)).unwrap_err()));
+    assert_eq!(api.rate_limit_pause(), paused_at(45));
+}
+
+#[test]
+fn a_rate_limited_token_mint_records_its_pause() {
+    let clock = Rc::new(Cell::new(UNIX_EPOCH + Duration::from_secs(2000)));
+    let (mut api, _) = client_with(
+        app(),
+        vec![
+            installation(),
+            (
+                MINT.to_owned(),
+                limited(429, "slow down", &[("retry-after", "15")]),
+            ),
+        ],
+        clock,
+    );
+    let error = api.label_exists("queue").unwrap_err();
+    assert!(is_transient(&error), "{error}");
+    assert_eq!(api.rate_limit_pause(), paused_at(2015));
 }
 
 #[test]

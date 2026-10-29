@@ -1,5 +1,5 @@
 {
-  "checksum": "b28f043ae6ed42fa219320f2bb1fd61a279d6cd6cff087d679989e1b0c03ef94",
+  "checksum": "6b3eeb1277fcc3d5138a1749557dd94814addbf427dd79bea028eef9646253e1",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -917,6 +917,10 @@
             "target": "base64"
           },
           {
+            "id": "httparse 1.10.1",
+            "target": "httparse"
+          },
+          {
             "id": "ring 0.17.14",
             "target": "ring"
           },
@@ -1320,6 +1324,10 @@
     "httparse 1.10.1": {
       "build_script_attrs": {},
       "common_attrs": {
+        "crate_features": [
+          "default",
+          "std"
+        ],
         "edition": "2018",
         "extra_deps": [
           ":build_script_build"
@@ -4728,6 +4736,7 @@
   "direct_deps": [
     "base64 0.23.1",
     "clap 4.6.7",
+    "httparse 1.10.1",
     "ring 0.17.14",
     "serde 1.0.229",
     "serde_json 1.0.154",

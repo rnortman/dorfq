@@ -6,8 +6,10 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver};
 
 use dorfq_core::{
     BatchId, BatchStart, EjectReason, Forge, ForgeError, NoticeReason, Observation, PrNumber,
@@ -15,11 +17,12 @@ use dorfq_core::{
 };
 use dorfq_forge_github::api::{ApiError, Auth, RestClient};
 use dorfq_forge_github::app::AppKey;
-use dorfq_forge_github::{GitHubForge, system_clock};
+use dorfq_forge_github::webhook::{Hint, Listener};
+use dorfq_forge_github::{GitHubForge, Settings, system_clock};
 use dorfq_forge_mock::{MockForge, Scenario, ScenarioError};
 use dorfq_scheduler::SchedulerConfig;
 
-use crate::config::{AuthConfig, ForgeConfig};
+use crate::config::{AuthConfig, ForgeConfig, WebhookConfig};
 
 /// A provider that could not be built.
 #[derive(Debug)]
@@ -31,6 +34,14 @@ pub enum ProviderError {
     /// The environment variable that should hold the GitHub token is unset,
     /// empty or not UTF-8.
     MissingToken { var: String },
+    /// The environment variable that should hold the webhook secret is
+    /// unset, empty or not UTF-8.
+    MissingWebhookSecret { var: String },
+    /// The webhook receiver could not bind its address.
+    Listen {
+        address: SocketAddr,
+        error: io::Error,
+    },
     /// The GitHub App's private key file could not be read.
     ReadPrivateKey { path: PathBuf, error: io::Error },
     /// The GitHub App's private key file is not a usable key; the message
@@ -54,6 +65,12 @@ impl fmt::Display for ProviderError {
                 "environment variable {var}, which should hold the GitHub token, \
                  is unset, empty or not UTF-8"
             ),
+            ProviderError::MissingWebhookSecret { var } => write!(
+                f,
+                "environment variable {var}, which should hold the webhook secret, \
+                 is unset, empty or not UTF-8"
+            ),
+            ProviderError::Listen { error, .. } => error.fmt(f),
             ProviderError::ReadPrivateKey { path, error } => write!(
                 f,
                 "cannot read the GitHub App private key {}: {error}",
@@ -75,6 +92,8 @@ impl Error for ProviderError {
             ProviderError::ReadScenario { error, .. } => Some(error),
             ProviderError::Scenario { error, .. } => Some(error),
             ProviderError::MissingToken { .. } => None,
+            ProviderError::MissingWebhookSecret { .. } => None,
+            ProviderError::Listen { error, .. } => Some(error),
             ProviderError::ReadPrivateKey { error, .. } => Some(error),
             ProviderError::PrivateKey { .. } => None,
             ProviderError::GitHub(error) => Some(error),
@@ -90,13 +109,24 @@ pub struct BuiltForge {
     /// scenario's pull requests that have not arrived. A forge whose events
     /// come from the world never has any.
     pub has_scheduled_events: Box<dyn Fn() -> bool>,
+    /// Blocks until the next tick is due, given how the last one ended.
+    pub wait: Box<dyn FnMut(Outcome)>,
 }
 
-/// A [`MockForge`] behind a [`Forge`], still reachable through the other
-/// handles on it.
-pub(crate) struct SharedMock(pub(crate) Rc<RefCell<MockForge>>);
+/// How a tick ended, for [`BuiltForge::wait`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// It ran to the end, or failed for good.
+    Done,
+    /// A forge call failed transiently; the tick is to be retried.
+    Transient,
+}
 
-impl Forge for SharedMock {
+/// A forge behind a [`Forge`], still reachable through the other handles on
+/// it.
+pub(crate) struct Shared<F>(pub(crate) Rc<RefCell<F>>);
+
+impl<F: Forge> Forge for Shared<F> {
     fn observe(&mut self) -> Result<Observation, ForgeError> {
         self.0.borrow_mut().observe()
     }
@@ -123,6 +153,8 @@ impl Forge for SharedMock {
 }
 
 /// Builds the configured forge. Either forge writes its messages to stdout.
+/// The mock's `wait` returns at once; the GitHub forge's waits on its
+/// refresh schedule and, with a webhook configured, its receiver's hints.
 pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
     match config {
         ForgeConfig::Mock { scenario } => {
@@ -136,10 +168,11 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
                 error,
             })?;
             let mock = Rc::new(RefCell::new(MockForge::new(parsed, Box::new(io::stdout()))));
-            let forge = SharedMock(Rc::clone(&mock));
+            let forge = Shared(Rc::clone(&mock));
             Ok(BuiltForge {
                 forge: Box::new(forge),
                 has_scheduled_events: Box::new(move || mock.borrow().awaiting_arrivals()),
+                wait: Box::new(|_| {}),
             })
         }
         ForgeConfig::GitHub {
@@ -147,37 +180,83 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
             owner,
             repo,
             auth,
+            webhook,
             ..
         } => {
+            let secret = webhook.as_ref().map(webhook_secret).transpose()?;
             let auth = github_auth(auth)?;
             let user_agent = format!("dorfq/{}", crate::version());
             let client = RestClient::new(api_base, owner, repo, auth, &user_agent);
             let settings = config
                 .github_settings()
                 .expect("a GitHub forge configuration has GitHub settings");
+            let hints = match webhook.as_ref().zip(secret) {
+                Some((webhook, secret)) => {
+                    let repository = format!("{owner}/{repo}");
+                    Some(listen(webhook.listen, secret, repository, &settings)?.1)
+                }
+                None => None,
+            };
             let forge = GitHubForge::new(
                 Box::new(client),
                 settings,
                 Box::new(system_clock),
                 Box::new(io::stdout()),
+                hints,
             )
             .map_err(ProviderError::GitHub)?;
+            let forge = Rc::new(RefCell::new(forge));
+            let waiting = Rc::clone(&forge);
             Ok(BuiltForge {
-                forge: Box::new(forge),
+                forge: Box::new(Shared(forge)),
                 has_scheduled_events: Box::new(|| false),
+                wait: Box::new(move |outcome| {
+                    waiting.borrow_mut().wait(outcome == Outcome::Transient)
+                }),
             })
         }
     }
+}
+
+/// The webhook secret from the environment variable `webhook` names.
+fn webhook_secret(webhook: &WebhookConfig) -> Result<String, ProviderError> {
+    env_secret(&webhook.secret_env).ok_or_else(|| ProviderError::MissingWebhookSecret {
+        var: webhook.secret_env.clone(),
+    })
+}
+
+/// The value of environment variable `var`; `None` when it is unset, empty
+/// or not UTF-8.
+fn env_secret(var: &str) -> Option<String> {
+    env::var(var).ok().filter(|value| !value.is_empty())
+}
+
+/// Starts the webhook receiver on `address`, filtering by `repository`
+/// (`owner/repo`) and `settings`; the receiver and the channel its hints
+/// arrive on. Writes a stderr line naming the address it listens on.
+fn listen(
+    address: SocketAddr,
+    secret: String,
+    repository: String,
+    settings: &Settings,
+) -> Result<(Listener, Receiver<Hint>), ProviderError> {
+    let (send, receive) = mpsc::channel();
+    let listener = Listener::spawn(address, secret, repository, settings.clone(), send)
+        .map_err(|error| ProviderError::Listen { address, error })?;
+    eprintln!(
+        "dorfq: webhook receiver listening on {}",
+        listener.address()
+    );
+    Ok((listener, receive))
 }
 
 /// Loads the credential the configuration names: the token from its
 /// environment variable, or the app's key from its file.
 fn github_auth(config: &AuthConfig) -> Result<Auth, ProviderError> {
     match config {
-        AuthConfig::Token { env: var } => match env::var(var) {
-            Ok(token) if !token.is_empty() => Ok(Auth::Token(token)),
-            _ => Err(ProviderError::MissingToken { var: var.clone() }),
-        },
+        AuthConfig::Token { env: var } => env_secret(var)
+            .map(Auth::Token)
+            .ok_or_else(|| ProviderError::MissingToken { var: var.clone() }),
         AuthConfig::App {
             client_id,
             private_key_file,
@@ -207,6 +286,7 @@ pub fn scheduler(config: &SchedulerConfig) -> Box<dyn Scheduler> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RefreshConfig;
 
     #[test]
     fn missing_scenario_names_the_path() {
@@ -237,6 +317,12 @@ mod tests {
             batch_checks: None,
             lock_heads: false,
             ci: None,
+            refresh: RefreshConfig {
+                listing_secs: 60,
+                pr_secs: 120,
+                batch_secs: 30,
+            },
+            webhook: None,
             auth: AuthConfig::Token {
                 env: var.to_owned(),
             },
@@ -247,6 +333,52 @@ mod tests {
             "{error:?}"
         );
         assert!(error.to_string().contains(var), "{error}");
+    }
+
+    #[test]
+    fn github_with_unset_webhook_secret_variable_names_it_before_any_request() {
+        let var = "DORFQ_TEST_WEBHOOK_SECRET_THAT_IS_NEVER_SET";
+        assert!(env::var_os(var).is_none(), "{var} is set");
+        let mut config = github_app(test_tmpdir().join("no-such-app-key.pem"));
+        let ForgeConfig::GitHub { webhook, .. } = &mut config else {
+            unreachable!("github_app builds a GitHub configuration");
+        };
+        *webhook = Some(WebhookConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            secret_env: var.to_owned(),
+        });
+        let error = forge(&config).err().unwrap();
+        assert!(
+            matches!(error, ProviderError::MissingWebhookSecret { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains(var), "{error}");
+    }
+
+    #[test]
+    fn the_webhook_receiver_binds_and_a_taken_address_is_named() {
+        let settings = github_app(PathBuf::from("unused.pem"))
+            .github_settings()
+            .unwrap();
+        let (listener, _hints) = listen(
+            "127.0.0.1:0".parse().unwrap(),
+            "secret".to_owned(),
+            "alice/widgets".to_owned(),
+            &settings,
+        )
+        .unwrap();
+        let address = listener.address();
+        assert_ne!(address.port(), 0);
+        let error = listen(
+            address,
+            "secret".to_owned(),
+            "alice/widgets".to_owned(),
+            &settings,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(error, ProviderError::Listen { .. }), "{error:?}");
+        assert!(error.to_string().contains(&address.to_string()), "{error}");
     }
 
     /// A GitHub configuration under the app credential, against an address
@@ -263,6 +395,12 @@ mod tests {
             batch_checks: None,
             lock_heads: false,
             ci: None,
+            refresh: RefreshConfig {
+                listing_secs: 60,
+                pr_secs: 120,
+                batch_secs: 30,
+            },
+            webhook: None,
             auth: AuthConfig::App {
                 client_id: "Iv23liTEST".to_owned(),
                 private_key_file,
