@@ -9,6 +9,7 @@ use dorfq_scheduler::SchedulerConfig;
 use serde_json::Value;
 
 use super::*;
+use events::Event;
 
 /// A fresh directory for one test.
 fn dir(name: &str) -> PathBuf {
@@ -61,7 +62,7 @@ fn header(started: u64) -> Header {
 }
 
 fn open(path: &Path, started: u64) -> (Writer, Vec<String>) {
-    Writer::open(path, header(started)).unwrap()
+    Writer::open(path, header(started), None, &mut |_, _| {}).unwrap()
 }
 
 /// Every line of the file at `path`, as JSON.
@@ -354,7 +355,7 @@ fn a_file_that_is_not_a_journal_is_refused_and_left_unchanged() {
         let dir = dir(&format!("foreign-{name}"));
         let path = dir.join("q.journal");
         fs::write(&path, text).unwrap();
-        let Err(error) = Writer::open(&path, header(1000)) else {
+        let Err(error) = Writer::open(&path, header(1000), None, &mut |_, _| {}) else {
             panic!("{name}: opened");
         };
         let message = error.to_string();
@@ -385,7 +386,7 @@ fn a_first_line_of_the_header_cap_is_read_and_a_longer_one_is_refused_unchanged(
         let dir = dir(&format!("header-cap-{name}"));
         let path = dir.join("q.journal");
         fs::write(&path, &text).unwrap();
-        let Err(error) = Writer::open(&path, header(2000)) else {
+        let Err(error) = Writer::open(&path, header(2000), None, &mut |_, _| {}) else {
             panic!("{name}: opened");
         };
         let message = error.to_string();
@@ -622,6 +623,293 @@ fn a_header_whose_scheduler_is_not_a_table_names_the_path_and_line() {
     header["scheduler"] = Value::from("bayes");
     let message = read_error("read-scheduler-string", &format!("{header}\n"));
     assert!(message.contains("q.journal:1:"), "{message}");
+}
+
+/// Each event as the line `dorfq journal events` prints for it.
+fn event_lines(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap())
+        .collect()
+}
+
+/// The lines of the text file at `path`.
+fn text_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn derive_at(path: &Path) -> Vec<Event> {
+    events::derive(
+        &read(std::slice::from_ref(&path.to_owned()))
+            .unwrap()
+            .entries,
+    )
+}
+
+#[test]
+fn opening_a_segment_seeds_entry_by_entry_and_the_first_live_tick_continues_it() {
+    let path = dir("seed").join("q.journal");
+    let (mut writer, _) = open(&path, 1000);
+    writer.record(0, 1001, &busy(0, 5)).unwrap();
+    writer.record(1, 1002, &busy(1, 6)).unwrap();
+    let observe = Err(DriverError::Observe(ForgeError::Transient("x".into())));
+    writer.record(2, 1003, &observe).unwrap();
+    let effect = Err(DriverError::Effect {
+        report: Box::new(report(3, observation(8, &[1]), start_plan())),
+        error: ForgeError::Transient("y".into()),
+    });
+    writer.record(3, 1004, &effect).unwrap();
+    drop(writer);
+    let before = derive_at(&path);
+    let mut calls = Vec::new();
+    let mut seeded = Vec::new();
+    let (mut writer, _) = Writer::open(&path, header(2000), None, &mut |o, events| {
+        calls.push(o.map(|o| o.now.0));
+        seeded.extend_from_slice(events);
+    })
+    .unwrap();
+    // Header, report, `same`, error, report with an error: one call each.
+    assert_eq!(calls, [None, Some(5), None, None, Some(8)]);
+    assert_eq!(seeded, before);
+    let live = writer.record(0, 2001, &busy(0, 9)).unwrap();
+    assert!(
+        matches!(live[0].kind, events::Kind::Restart { started: 2000, .. }),
+        "{live:?}"
+    );
+    assert!(
+        !live
+            .iter()
+            .any(|e| matches!(e.kind, events::Kind::Arrive { .. })),
+        "{live:?}"
+    );
+    seeded.extend(live);
+    assert_eq!(seeded, derive_at(&path));
+}
+
+#[test]
+fn an_error_before_any_observation_is_written_once_when_the_next_process_observes() {
+    let dir = dir("seed-waiting");
+    let path = dir.join("q.journal");
+    let events = dir.join("q.events");
+    let (mut writer, _) = Writer::open(&path, header(1000), Some(&events), &mut |_, _| {}).unwrap();
+    let fatal = Err(DriverError::Scheduler(SchedulerError::new("stumped")));
+    assert!(writer.record(0, 1001, &fatal).unwrap().is_empty());
+    drop(writer);
+    let mut seeded = Vec::new();
+    let (mut writer, _) = Writer::open(&path, header(2000), Some(&events), &mut |_, e| {
+        seeded.extend_from_slice(e)
+    })
+    .unwrap();
+    // `derive` releases the error and the restart at the end; the seed and
+    // the file wait for an observation.
+    let derived = event_lines(&derive_at(&path));
+    let written = text_lines(&events);
+    assert!(
+        written.len() < derived.len() && derived.starts_with(&written),
+        "{written:?} {derived:?}"
+    );
+    assert!(seeded.is_empty(), "{seeded:?}");
+    writer.record(0, 2001, &busy(0, 7)).unwrap();
+    let derived = derive_at(&path);
+    assert_eq!(text_lines(&events), event_lines(&derived));
+    let at_7 = |name: &str| {
+        derived
+            .iter()
+            .filter(|e| e.t == 7 && kind_of(e) == name)
+            .count()
+    };
+    assert_eq!((at_7("error"), at_7("restart")), (1, 1), "{derived:?}");
+}
+
+#[test]
+fn a_restart_on_a_segment_begun_at_an_idle_rotation_continues_the_events_file() {
+    let fatal = || Err(DriverError::Scheduler(SchedulerError::new("stumped")));
+    // The rotating process exits on an error; exits before its next tick.
+    for (name, last) in [("error", Some(fatal())), ("quiet", None)] {
+        let dir = dir(&format!("seed-rotated-{name}"));
+        let path = dir.join("q.journal");
+        let events = dir.join("q.events");
+        let (mut writer, _) =
+            Writer::open(&path, header(1000), Some(&events), &mut |_, _| {}).unwrap();
+        writer.record(0, 1001, &busy(0, 5)).unwrap();
+        writer.record(1, 1002, &idle(1, 6)).unwrap();
+        if let Some(last) = &last {
+            writer.record(2, 1003, last).unwrap();
+        }
+        drop(writer);
+        let (mut writer, _) =
+            Writer::open(&path, header(2000), Some(&events), &mut |_, _| {}).unwrap();
+        writer.record(0, 2001, &busy(0, 7)).unwrap();
+        let mut written = text_lines(&dir.join("q.events.1000"));
+        written.extend(text_lines(&events));
+        let all = read(&[dir.join("q.journal.1000"), path]).unwrap();
+        let derived = events::derive(&all.entries);
+        assert_eq!(written, event_lines(&derived), "{name}");
+        let errors: Vec<u64> = derived
+            .iter()
+            .filter(|e| kind_of(e) == "error")
+            .map(|e| e.t)
+            .collect();
+        let expected: &[u64] = if last.is_some() { &[7] } else { &[] };
+        assert_eq!(errors, expected, "{name}");
+    }
+}
+
+#[test]
+fn a_segment_of_another_format_is_closed_with_its_events_file() {
+    let dir = dir("other-format-events");
+    let path = dir.join("q.journal");
+    let events = dir.join("q.events");
+    fs::write(&path, "{\"journal\":2,\"opened\":900,\"shape\":\"new\"}\n").unwrap();
+    fs::write(&events, "{\"t\":1,\"kind\":\"old\"}\n").unwrap();
+    let (mut writer, _) = Writer::open(&path, header(1000), Some(&events), &mut |_, _| {}).unwrap();
+    assert_eq!(
+        names(&dir),
+        ["q.events", "q.events.900", "q.journal", "q.journal.900"]
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("q.events.900")).unwrap(),
+        "{\"t\":1,\"kind\":\"old\"}\n"
+    );
+    assert_eq!(fs::read_to_string(&events).unwrap(), "");
+    let written = writer.record(0, 1001, &busy(0, 5)).unwrap();
+    assert_eq!(text_lines(&events), event_lines(&written));
+    assert_eq!(event_lines(&written), event_lines(&derive_at(&path)));
+}
+
+#[test]
+fn an_events_path_naming_the_journal_s_own_file_is_refused() {
+    let dir = dir("events-same-file");
+    let path = dir.join("q.journal");
+    drop(open(&path, 1000));
+    let text = fs::read_to_string(&path).unwrap();
+    fs::hard_link(&path, dir.join("linked")).unwrap();
+    for events in [
+        path.clone(),
+        dir.join(".").join("q.journal"),
+        dir.join("..")
+            .join(dir.file_name().unwrap())
+            .join("q.journal"),
+        dir.join("linked"),
+    ] {
+        let Err(error) = Writer::open(&path, header(2000), Some(&events), &mut |_, _| {}) else {
+            panic!("{}: opened", events.display());
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("events names the journal's own file"),
+            "{message}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+    assert_eq!(names(&dir), ["linked", "q.journal"]);
+}
+
+fn kind_of(event: &Event) -> String {
+    serde_json::to_value(event).unwrap()["kind"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn the_events_file_rotates_with_the_journal_under_the_same_name() {
+    let dir = dir("events-rotate");
+    let path = dir.join("q.journal");
+    let events = dir.join("q.events");
+    let (mut writer, _) = Writer::open(&path, header(1000), Some(&events), &mut |_, _| {}).unwrap();
+    let mut written = writer.record(0, 1001, &busy(0, 5)).unwrap();
+    written.extend(writer.record(1, 1002, &idle(1, 6)).unwrap());
+    written.extend(writer.record(2, 1003, &busy(2, 7)).unwrap());
+    assert_eq!(
+        names(&dir),
+        ["q.events", "q.events.1000", "q.journal", "q.journal.1000"]
+    );
+    let mut lines = text_lines(&dir.join("q.events.1000"));
+    lines.extend(text_lines(&events));
+    assert_eq!(lines, event_lines(&written));
+    let all = read(&[dir.join("q.journal.1000"), path]).unwrap();
+    assert_eq!(lines, event_lines(&events::derive(&all.entries)));
+}
+
+#[test]
+fn a_name_taken_on_either_side_moves_both_closed_names_to_one_free_suffix() {
+    let dir = dir("events-collide");
+    let path = dir.join("q.journal");
+    let events = dir.join("q.events");
+    fs::write(dir.join("q.journal.1000"), "").unwrap();
+    fs::write(dir.join("q.events.1000.1"), "").unwrap();
+    let (mut writer, _) = Writer::open(&path, header(1000), Some(&events), &mut |_, _| {}).unwrap();
+    writer.record(0, 1001, &busy(0, 5)).unwrap();
+    writer.record(1, 1002, &idle(1, 6)).unwrap();
+    assert_eq!(
+        names(&dir),
+        [
+            "q.events",
+            "q.events.1000.1",
+            "q.events.1000.2",
+            "q.journal",
+            "q.journal.1000",
+            "q.journal.1000.2"
+        ]
+    );
+    assert_eq!(fs::read_to_string(dir.join("q.journal.1000")).unwrap(), "");
+    assert_eq!(fs::read_to_string(dir.join("q.events.1000.1")).unwrap(), "");
+    assert!(!text_lines(&dir.join("q.events.1000.2")).is_empty());
+}
+
+#[test]
+fn an_unterminated_last_events_line_is_cut_off_with_a_note() {
+    let dir = dir("events-cut");
+    let path = dir.join("q.journal");
+    let events = dir.join("q.events");
+    let (mut writer, _) = Writer::open(&path, header(1000), Some(&events), &mut |_, _| {}).unwrap();
+    writer.record(0, 1001, &busy(0, 5)).unwrap();
+    drop(writer);
+    let whole = fs::read_to_string(&events).unwrap();
+    fs::write(&events, whole.clone() + "{\"t\":5,").unwrap();
+    let (_writer, notes) =
+        Writer::open(&path, header(2000), Some(&events), &mut |_, _| {}).unwrap();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("q.events"), "{}", notes[0]);
+    assert!(
+        notes[0].contains(&format!("line {}", whole.lines().count() + 1)),
+        "{}",
+        notes[0]
+    );
+    assert_eq!(fs::read_to_string(&events).unwrap(), whole);
+}
+
+#[test]
+fn a_segment_with_a_line_that_does_not_read_is_refused_before_the_header() {
+    let path = dir("seed-corrupt").join("q.journal");
+    let text = format!("{}\nnot json\n", header_line());
+    fs::write(&path, &text).unwrap();
+    let Err(error) = Writer::open(&path, header(2000), None, &mut |_, _| {}) else {
+        panic!("opened");
+    };
+    let message = error.to_string();
+    assert!(message.contains("q.journal:2: not JSON"), "{message}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), text);
+}
+
+#[test]
+fn entries_yield_what_read_collects_and_note_an_unterminated_last_line() {
+    let path = dir("entries-partial").join("q.journal");
+    two_process_segment(&path);
+    let mut text = fs::read(&path).unwrap();
+    text.extend_from_slice(b"{\"tick\":1,");
+    fs::write(&path, &text).unwrap();
+    let read = read(std::slice::from_ref(&path)).unwrap();
+    let mut entries = entries(&path).unwrap();
+    let collected: Vec<Entry> = entries.by_ref().map(Result::unwrap).collect();
+    assert_eq!(collected, read.entries);
+    assert_eq!(entries.notes, read.notes);
+    assert_eq!(entries.notes.len(), 1);
 }
 
 /// One configuration of every scheduler kind, `bayes` under both

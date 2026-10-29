@@ -10,7 +10,7 @@ use dorfq_core::{
 };
 use serde_json::Value;
 
-use super::super::events::derive;
+use super::super::events::{Fold, derive};
 use super::*;
 
 const FIXTURE: &str = include_str!("../../../testdata/journal-1.jsonl");
@@ -183,7 +183,13 @@ fn write_the_format_1_fixture() {
     let path = fixture.with_extension("writing");
     let scheduler = every_scheduler().remove(2);
     let start = 1_761_520_000;
-    let (mut writer, _) = Writer::open(&path, Header::start("mock", &scheduler, start)).unwrap();
+    let (mut writer, _) = Writer::open(
+        &path,
+        Header::start("mock", &scheduler, start),
+        None,
+        &mut |_, _| {},
+    )
+    .unwrap();
     writer
         .record(
             0,
@@ -215,7 +221,13 @@ fn write_the_format_1_fixture() {
     writer.record(3, start + 181, &Err(observe)).unwrap();
     drop(writer);
     let restart = start + 600;
-    let (mut writer, _) = Writer::open(&path, Header::start("mock", &scheduler, restart)).unwrap();
+    let (mut writer, _) = Writer::open(
+        &path,
+        Header::start("mock", &scheduler, restart),
+        None,
+        &mut |_, _| {},
+    )
+    .unwrap();
     writer
         .record(
             0,
@@ -367,4 +379,17 @@ fn the_fixture_derives_its_events() {
     ];
     let expected: Vec<&str> = expected.iter().flat_map(|s| s.split_whitespace()).collect();
     assert_eq!(kinds, expected);
+}
+
+#[test]
+fn the_fixture_folded_entry_by_entry_and_taken_each_time_is_derive() {
+    let entries = fixture("fixture-fold");
+    let mut fold = Fold::default();
+    let mut events = Vec::new();
+    for entry in &entries {
+        fold.entry(entry);
+        events.extend(fold.take());
+    }
+    events.extend(fold.finish());
+    assert_eq!(events, derive(&entries));
 }

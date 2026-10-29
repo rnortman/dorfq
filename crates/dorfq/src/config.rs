@@ -21,10 +21,15 @@ pub struct Config {
     /// The tick journal's path; absent, no journal is written. Relative
     /// paths are resolved against the configuration file's directory at
     /// load.
-    // TODO(telemetry-export): the event stream written live beside the
-    // journal, and the summary and events pushed over OTLP/HTTP.
     #[serde(default)]
     pub journal: Option<PathBuf>,
+    /// The events file's path, beside the journal and rotated with it;
+    /// absent, no events file is written. Needs `journal`. Relative paths
+    /// are resolved as `journal`'s.
+    // TODO(telemetry-export): the summary's figures and the events pushed
+    // over OTLP/HTTP.
+    #[serde(default)]
+    pub events: Option<PathBuf>,
     pub forge: ForgeConfig,
     pub scheduler: SchedulerConfig,
 }
@@ -192,8 +197,14 @@ impl Config {
             .scheduler
             .validate()
             .map_err(|e| format!("scheduler: {e}"))?;
-        if let Some(journal) = &mut config.journal {
-            *journal = dir.join(journal.as_path());
+        if config.events.is_some() && config.journal.is_none() {
+            return Err("events needs journal".to_owned());
+        }
+        for path in [&mut config.journal, &mut config.events]
+            .into_iter()
+            .flatten()
+        {
+            *path = dir.join(path.as_path());
         }
         match &mut config.forge {
             ForgeConfig::Mock { scenario } => {
@@ -311,6 +322,7 @@ kind = "all-at-once"
             config,
             Config {
                 journal: None,
+                events: None,
                 forge: ForgeConfig::Mock {
                     scenario: PathBuf::from("conf/scenario.toml"),
                 },
@@ -334,6 +346,33 @@ kind = "all-at-once"
             journal("/var/lib/q.journal"),
             Some(PathBuf::from("/var/lib/q.journal"))
         );
+    }
+
+    #[test]
+    fn a_relative_events_path_is_resolved_and_an_absolute_one_kept() {
+        let events = |path: &str| {
+            Config::parse(
+                &format!("journal = \"q.journal\"\nevents = {path:?}\n{VALID}"),
+                Path::new("conf"),
+            )
+            .unwrap()
+            .events
+        };
+        assert_eq!(events("q.events"), Some(PathBuf::from("conf/q.events")));
+        assert_eq!(
+            events("/var/lib/q.events"),
+            Some(PathBuf::from("/var/lib/q.events"))
+        );
+    }
+
+    #[test]
+    fn events_without_a_journal_is_rejected_naming_both() {
+        let error = Config::parse(
+            &format!("events = \"q.events\"\n{VALID}"),
+            Path::new("conf"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "events needs journal");
     }
 
     #[test]

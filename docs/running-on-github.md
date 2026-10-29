@@ -454,13 +454,18 @@ error when a tick failed, including the fatal one the process exits on.
 Each line is flushed before the queue waits, so a crash loses at most the
 tick in progress. Without the key nothing is written.
 
-Nothing reads the journal at start. A restart builds the scheduler fresh, as
-it does without a journal, and appends to the file: each process begins its
-lines with a header naming the dorfq version, the forge and the
-`[scheduler]` settings it ran with. A last line cut off by a crash is cut
-back at the next start, with a line on stderr saying so. A file at the path
-that dorfq did not write stops the run at start, before any API call, and is
-left as it was; point `journal` elsewhere.
+At start the queue reads the current segment once, line by line, so that
+the event stream it derives as it runs continues from what the segment
+recorded. The scheduler is still built fresh, as it is without a journal:
+nothing it decided is recovered. A restart appends to the file: each
+process begins its lines with a header naming the dorfq version, the forge
+and the `[scheduler]` settings it ran with. A last line cut off by a crash is
+cut back at the next start, with a line on stderr saying so. A file at the
+path that dorfq did not write stops the run at start, before any API call,
+and is left as it was; point `journal` elsewhere. A segment with a line that
+does not read stops the run at start the same way, naming the path and the
+line, as `dorfq journal` refuses it; point `journal` elsewhere or repair the
+file.
 
 The current file is one *segment*. A segment is closed and a fresh one
 opened at the same path when the queue goes idle after work — the tick that
@@ -482,10 +487,59 @@ rule renames the files it rotates, and its names collide with dorfq's own
 `.1`, `.2` suffixes; do not point one at the journal.
 
 An upgrade that changes the journal's format closes a segment written in the
-old format as a rotation would, opens a fresh one, and says so on stderr;
-the run does not stop. The new build's `dorfq journal` still reads the old
-segment. A segment in a format newer than the build reading it is refused,
+old format as a rotation would, with the events file, opens fresh ones, and
+says so on stderr; the run does not stop. The new build's `dorfq journal`
+still reads the old segment. A segment in a format newer than the build reading it is refused,
 naming the formats that build reads.
+
+### The events file
+
+Set `events = "<path>"` beside `journal`, resolved the same way, and the
+queue also writes the event stream as it runs: each tick's events, one JSON
+object per line, exactly the lines `dorfq journal events` prints. `events`
+without `journal` is refused at load, and an `events` path that is the
+journal's own file, under any name, stops the run at start. Each tick's events are appended and
+flushed after its journal line, before the queue waits; the file has no
+header. It rotates with the journal: when a journal segment is closed as
+`<path>.<opened>`, the events file is closed as `<events>.<opened>` with the
+same `<opened>`, and a fresh one is opened empty. When either name is
+taken, both get the first `.1`, `.2` suffix free for both, so the names
+always pair. A tailing reader sees appends, then a rename at rotation.
+
+The events segments, concatenated in order, are `dorfq journal events` over
+the journal segments read together. One events segment is not by itself the
+stream of the journal segment beside it: it continues the one before, as a
+journal segment does, so a pull request queued across a rotation has its
+`arrive` in an earlier events segment, while `dorfq journal events` over the
+later journal segment alone would say it arrived there. The file begins
+where `events` was first set; what the journal recorded before is only in
+the journal.
+
+A process continues the stream from the current segment alone. When it
+starts on a segment that has no observation yet — the queue stopped after a
+rotation and before its next tick — what came before the rotation is not
+read: after an idle rotation nothing is queued and the stream continues
+exactly, but after a 64 MiB rotation the pull requests still queued arrive
+again, the batches it adopts start again, and those gone meanwhile get no
+`lost`, as `dorfq journal events` over that segment alone says. The segment
+opened fresh after a format change starts the stream the same way. Across
+such a restart the events segments and `dorfq journal events` over the
+journal segments read together differ; the journal is the record.
+
+An event is written once it has a time. The error of a tick that failed
+after a start or a rotation and before the next observation, and the
+`restart` it follows, take the time
+of the next observation, so they appear when a process next observes — the
+one after a restart, if this one exits first. Until then the
+events file lacks them; `dorfq journal events` over the journal places them
+at the last observation's time. An events file whose last line was cut off
+by a crash is cut back at the next start, with a line on stderr. A failure to
+write or rename the events file stops the queue, as a journal failure does.
+The tick's journal line is written first, so the events of the tick that
+failed, or those after the last line written, are only in the journal: no
+later process writes them, and `dorfq journal events` is the authority.
+Retention is yours, as for the journal: the same job can treat `<events>.*`
+as it treats `<path>.*`.
 
 The journal holds pull request numbers, commit shas, check names, batch ids,
 the reasons the queue gave and its scheduler settings: no titles, no logins,

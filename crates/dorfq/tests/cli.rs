@@ -244,8 +244,8 @@ fn github_app_with_missing_key_file_exits_one_naming_it() {
 }
 
 /// A configuration in its own directory under `TEST_TMPDIR`, playing the
-/// shipped scenario with `journal = "q.journal"`; returns the configuration
-/// and the directory.
+/// shipped scenario with `journal = "q.journal"` and `events = "q.events"`;
+/// returns the configuration and the directory.
 fn journaled_config(name: &str) -> (PathBuf, PathBuf) {
     let dir = PathBuf::from(std::env::var("TEST_TMPDIR").expect("TEST_TMPDIR under bazel test"))
         .join(name);
@@ -259,7 +259,7 @@ fn journaled_config(name: &str) -> (PathBuf, PathBuf) {
     fs::write(
         &config,
         format!(
-            "journal = \"q.journal\"\n\n[forge]\nkind = \"mock\"\nscenario = {:?}\n\n[scheduler]\nkind = \"all-at-once\"\n",
+            "journal = \"q.journal\"\nevents = \"q.events\"\n\n[forge]\nkind = \"mock\"\nscenario = {:?}\n\n[scheduler]\nkind = \"all-at-once\"\n",
             scenario.display().to_string()
         ),
     )
@@ -324,10 +324,19 @@ fn a_fatal_tick_is_journaled_before_the_exit() {
         .last()
         .and_then(|line| line.strip_prefix("dorfq: "))
         .expect("a dorfq: line");
-    let journal = fs::read_to_string(dir.join("q.journal")).expect("read journal");
-    let last = journal.lines().last().expect("a line");
-    assert!(last.contains("\"fatal\":true"), "{journal}");
+    let written = fs::read_to_string(dir.join("q.journal")).expect("read journal");
+    let last = written.lines().last().expect("a line");
+    assert!(last.contains("\"fatal\":true"), "{written}");
     assert!(last.contains(message), "{message:?} not in {last}");
+    // The tick failed observing, so its error waits for the next process's
+    // first observation to give it a time; the reader releases it at the
+    // journal's end.
+    let events = fs::read_to_string(dir.join("q.events")).expect("read events");
+    assert_eq!(events, "");
+    let derived = journal(&["events"], &[dir.join("q.journal")]);
+    let last = derived.lines().last().expect("an event");
+    assert!(last.contains("\"kind\":\"error\""), "{derived}");
+    assert!(last.contains("\"fatal\":true"), "{derived}");
 }
 
 #[test]
@@ -388,6 +397,15 @@ fn the_journal_verbs_read_a_runs_segments() {
 
     let events = journal(&["events"], &segments);
     assert!(events.lines().all(|l| l.starts_with("{\"t\":")), "{events}");
+    // The events file beside each journal segment, concatenated, is what
+    // `dorfq journal events` prints over the segments.
+    let mut written = String::new();
+    for segment in &segments {
+        let name = segment.file_name().and_then(|n| n.to_str()).expect("UTF-8");
+        let beside = segment.with_file_name(name.replacen("q.journal", "q.events", 1));
+        written += &fs::read_to_string(&beside).expect("an events segment beside");
+    }
+    assert_eq!(written, events);
     assert!(events.contains("\"kind\":\"arrive\""), "{events}");
     assert!(events.contains("\"kind\":\"land\""), "{events}");
 

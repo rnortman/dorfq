@@ -94,10 +94,7 @@ fn read_journal(verb: Verb) -> ExitCode {
     }
     let events = journal::events::derive(&read.entries);
     let text = match &verb {
-        Verb::Events { .. } => events
-            .iter()
-            .map(|event| serde_json::to_string(event).expect("an event serialises") + "\n")
-            .collect(),
+        Verb::Events { .. } => events.iter().map(journal::events::line).collect(),
         Verb::Metrics { json, .. } => {
             let summary = journal::summary::summarise(&events);
             if *json {
@@ -159,7 +156,7 @@ fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
         None => None,
         Some(path) => {
             let header = Header::start(config.forge.kind(), &config.scheduler, unix_now());
-            match journal::Writer::open(path, header) {
+            match journal::Writer::open(path, header, config.events.as_deref(), &mut |_, _| {}) {
                 Ok((writer, notes)) => {
                     for note in notes {
                         eprintln!("dorfq: {note}");

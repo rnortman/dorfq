@@ -4,12 +4,13 @@
 //! plans the scheduler made.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use dorfq_core::{BatchId, Forge, NoticeReason, Scheduler};
 use dorfq_sim::{Admission, End, Streams, World, WorldConfig};
 
-use super::super::events::derive;
+use super::super::events::{Fold, derive};
 use super::super::summary::summarise;
 use super::*;
 use crate::driver::Driver;
@@ -99,6 +100,8 @@ struct Run {
     end: End,
     /// The journal's segments, in order.
     segments: Vec<PathBuf>,
+    /// The events file's segments, in order.
+    events: Vec<PathBuf>,
     /// The tick whose eject the harness failed.
     failed: Option<u64>,
 }
@@ -132,7 +135,13 @@ fn run(
         failed: Rc::clone(&failed),
     };
     let path = dir.join("q.journal");
-    let (mut writer, _) = Writer::open(&path, Header::start("sim", scheduler, EPOCH)).unwrap();
+    let (mut writer, _) = Writer::open(
+        &path,
+        Header::start("sim", scheduler, EPOCH),
+        Some(&dir.join("q.events")),
+        &mut |_, _| {},
+    )
+    .unwrap();
     let mut built = scheduler.build();
     let mut driver = Driver::new(&mut forge, built.as_mut());
     let mut reports = Vec::new();
@@ -177,18 +186,24 @@ fn run(
         }
     }
     drop(forge);
-    let mut segments: Vec<PathBuf> = names(dir)
-        .into_iter()
-        .filter(|name| name.starts_with("q.journal."))
-        .map(|name| dir.join(name))
-        .collect();
-    segments.push(path);
+    let segments_of = |stem: &str| {
+        let mut segments: Vec<PathBuf> = names(dir)
+            .into_iter()
+            .filter(|name| name.starts_with(&format!("{stem}.")))
+            .map(|name| dir.join(name))
+            .collect();
+        segments.push(dir.join(stem));
+        segments
+    };
+    let segments = segments_of("q.journal");
+    let events = segments_of("q.events");
     let failed = *failed.borrow();
     Run {
         reports,
         world: Rc::into_inner(world).unwrap().into_inner(),
         end: End::drained(emptied.expect("the world drained")),
         segments,
+        events,
         failed,
     }
 }
@@ -347,4 +362,76 @@ fn a_journal_of_every_tick_replays_into_the_same_plans() {
 #[test]
 fn a_journal_with_a_failed_effect_replays_into_the_same_plans() {
     replays_into_the_same_plans("failed", true, Some(10));
+}
+
+#[test]
+fn the_events_file_is_derive_over_the_journal_and_the_fold_stays_bounded() {
+    let dir = dir("harness-events");
+    let run = run(&dir, world(24, 0.02), &every_scheduler()[2], true, None);
+    assert!(run.segments.len() > 2, "{:?}", run.segments);
+    // Each closed events segment carries its journal segment's name.
+    let stems: Vec<String> = run
+        .events
+        .iter()
+        .map(|p| p.display().to_string().replace("q.events", "q.journal"))
+        .collect();
+    let journal: Vec<String> = run
+        .segments
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    assert_eq!(stems, journal);
+    let entries = read(&run.segments).unwrap().entries;
+    let derived = derive(&entries);
+    let written: Vec<String> = run
+        .events
+        .iter()
+        .flat_map(|path| {
+            fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let expected: Vec<String> = derived
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap())
+        .collect();
+    assert_eq!(written, expected);
+
+    let mut fold = Fold::default();
+    let mut events = Vec::new();
+    let mut recent: [BTreeSet<u64>; 2] = Default::default();
+    let mut ejected = false;
+    for entry in &entries {
+        fold.entry(entry);
+        events.extend(fold.take());
+        let Entry::Tick(Line {
+            kind: LineKind::Report { report, .. },
+            ..
+        }) = entry
+        else {
+            continue;
+        };
+        let o = &report.observation;
+        recent = [
+            recent[1].clone(),
+            o.batches.iter().map(|b| b.id.0).collect(),
+        ];
+        let kept = |id: &u64| recent.iter().any(|ids| ids.contains(id));
+        assert!(fold.tips.values().all(kept), "tick {}", report.tick);
+        assert!(fold.landed.iter().all(kept), "tick {}", report.tick);
+        assert!(
+            fold.ejections
+                .keys()
+                .all(|pr| o.prs.iter().any(|s| s.number.0 == *pr)),
+            "tick {}",
+            report.tick
+        );
+        ejected |= !fold.ejections.is_empty();
+    }
+    assert!(ejected, "no ejection reason was ever held");
+    events.extend(fold.finish());
+    assert_eq!(events, derived);
 }
