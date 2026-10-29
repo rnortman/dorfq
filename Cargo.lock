@@ -191,6 +191,7 @@ dependencies = [
  "dorfq-forge-mock",
  "dorfq-scheduler",
  "dorfq-sim",
+ "httparse",
  "serde",
  "serde_json",
  "toml",

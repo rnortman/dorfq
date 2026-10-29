@@ -3,8 +3,16 @@
 //! `DORFQ_EXAMPLE_CONFIG`; this test does not build under `cargo test`.
 
 use std::fs;
+use std::io::{ErrorKind, Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use serde_json::Value;
 
 #[test]
 fn version_flag_prints_name_and_version() {
@@ -303,6 +311,9 @@ fn a_journaled_run_leaves_a_closed_segment_and_a_current_one() {
     assert!(current.contains("\"cause\":\"rotate\""), "{current}");
 }
 
+// TODO(test-missing-fatal-tick-telemetry-wiring): a fatal tick after ticks
+// that observed, with `[telemetry]`: the final export arrives before the
+// exit, without the fatal tick's gauges.
 #[test]
 fn a_fatal_tick_is_journaled_before_the_exit() {
     // As in `permanent_forge_error_exits_one`: the mock's first message
@@ -466,5 +477,304 @@ fn journal_report_over_an_empty_file_exits_one_saying_it_holds_no_header() {
     assert!(
         stderr.contains("dorfq: the journal holds no header"),
         "stderr: {stderr:?}"
+    );
+}
+
+/// One request a [`Collector`] received.
+struct Received {
+    path: String,
+    content_type: String,
+    body: Vec<u8>,
+}
+
+/// A loopback OTLP/HTTP collector: accepts on `127.0.0.1` until stopped,
+/// answers every request `200` with an empty JSON object, and records it.
+struct Collector {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    received: Arc<Mutex<Vec<Received>>>,
+    thread: thread::JoinHandle<()>,
+}
+
+impl Collector {
+    fn start() -> Collector {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let port = listener.local_addr().expect("local address").port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let thread = {
+            let stop = Arc::clone(&stop);
+            let received = Arc::clone(&received);
+            thread::spawn(move || {
+                let mut connections = Vec::new();
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let received = Arc::clone(&received);
+                            connections.push(thread::spawn(move || serve(stream, &received)));
+                        }
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                }
+                for connection in connections {
+                    connection.join().expect("a connection thread");
+                }
+            })
+        };
+        Collector {
+            port,
+            stop,
+            received,
+            thread,
+        }
+    }
+
+    /// Stops accepting, waits for every connection to close, and returns
+    /// what was received, in order.
+    fn stop(self) -> Vec<Received> {
+        self.stop.store(true, Ordering::SeqCst);
+        self.thread.join().expect("the collector thread");
+        std::mem::take(&mut *self.received.lock().expect("the record"))
+    }
+}
+
+/// Serves requests on `stream` until the client closes it.
+fn serve(mut stream: TcpStream, received: &Mutex<Vec<Received>>) {
+    stream.set_nonblocking(false).expect("blocking stream");
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut request = httparse::Request::new(&mut headers);
+        let parsed = request.parse(&buffer).expect("an HTTP request");
+        if let httparse::Status::Complete(head) = parsed {
+            let header = |name: &str| {
+                request
+                    .headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case(name))
+                    .map(|h| String::from_utf8(h.value.to_vec()).expect("a UTF-8 header"))
+            };
+            let length: usize =
+                header("content-length").map_or(0, |v| v.parse().expect("a length"));
+            if buffer.len() >= head + length {
+                assert_eq!(request.method, Some("POST"));
+                received.lock().expect("the record").push(Received {
+                    path: request.path.expect("a path").to_owned(),
+                    content_type: header("content-type").unwrap_or_default(),
+                    body: buffer[head..head + length].to_vec(),
+                });
+                buffer.drain(..head + length);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                    )
+                    .expect("answer");
+                continue;
+            }
+        }
+        match stream.read(&mut chunk).expect("read a request") {
+            0 => return,
+            n => buffer.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// Appends a `[telemetry]` table pointing at `port` to `config`.
+fn with_telemetry(config: &Path, port: u16, extra: &str) {
+    let mut text = fs::read_to_string(config).expect("read config");
+    text.push_str(&format!(
+        "\n[telemetry]\notlp_endpoint = \"http://127.0.0.1:{port}\"\ninterval_secs = 3600\n{extra}"
+    ));
+    fs::write(config, text).expect("write config");
+}
+
+/// The metric named `name` in an OTLP/JSON metrics request.
+fn metric<'a>(body: &'a Value, name: &str) -> Option<&'a Value> {
+    body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        .as_array()
+        .expect("metrics")
+        .iter()
+        .find(|m| m["name"] == name)
+}
+
+/// The `asInt` values of a gauge's points.
+fn ints(metric: &Value) -> Vec<u64> {
+    metric["gauge"]["dataPoints"]
+        .as_array()
+        .expect("points")
+        .iter()
+        .map(|p| {
+            p["asInt"]
+                .as_str()
+                .expect("asInt is a string")
+                .parse()
+                .expect("an integer")
+        })
+        .collect()
+}
+
+/// The string value of the attribute `key` among `attributes`.
+fn attribute<'a>(attributes: &'a Value, key: &str) -> Option<&'a str> {
+    attributes
+        .as_array()?
+        .iter()
+        .find(|a| a["key"] == key)
+        .and_then(|a| a["value"]["stringValue"].as_str())
+}
+
+#[test]
+fn a_run_with_telemetry_pushes_its_gauges_and_every_event() {
+    let collector = Collector::start();
+    let (config, dir) = journaled_config("telemetry-run");
+    with_telemetry(&config, collector.port, "");
+    let output = Command::new(env!("DORFQ_BIN"))
+        .args(["run", "--config"])
+        .arg(&config)
+        .arg("--exit-when-idle")
+        .output()
+        .expect("spawn dorfq");
+    let received = collector.stop();
+    assert!(output.status.success(), "dorfq run: {output:?}");
+    for request in &received {
+        assert!(
+            request.path == "/v1/metrics" || request.path == "/v1/logs",
+            "{}",
+            request.path
+        );
+        assert_eq!(request.content_type, "application/json");
+    }
+    let bodies = |path: &str| -> Vec<Value> {
+        received
+            .iter()
+            .filter(|r| r.path == path)
+            .map(|r| serde_json::from_slice(&r.body).expect("a JSON body"))
+            .collect()
+    };
+    let metrics = bodies("/v1/metrics");
+    let logs = bodies("/v1/logs");
+    assert!(
+        !metrics.is_empty() && !logs.is_empty(),
+        "{} requests",
+        received.len()
+    );
+
+    let last = metrics.last().expect("a metrics body");
+    let resource = &last["resourceMetrics"][0]["resource"]["attributes"];
+    assert_eq!(attribute(resource, "service.name"), Some("dorfq"));
+    assert_eq!(
+        attribute(resource, "service.version"),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    let queue = metric(last, "dorfq_queue_prs").expect("dorfq_queue_prs");
+    assert_eq!(ints(queue), [0, 0, 0]);
+    for point in queue["gauge"]["dataPoints"].as_array().expect("points") {
+        assert!(
+            attribute(&point["attributes"], "status").is_some(),
+            "{point}"
+        );
+    }
+    let batches = metric(last, "dorfq_batches").expect("dorfq_batches");
+    assert_eq!(ints(batches).len(), 6);
+
+    // The idle tick that ended the run rotated the events file with the
+    // journal: the closed segment, then the current one.
+    let mut closed: Vec<PathBuf> = fs::read_dir(&dir)
+        .expect("read dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("q.events."))
+        })
+        .collect();
+    closed.sort();
+    closed.push(dir.join("q.events"));
+    let events: String = closed
+        .iter()
+        .map(|path| fs::read_to_string(path).expect("read events"))
+        .collect();
+    let lines: Vec<&str> = events.lines().collect();
+    let parsed: Vec<Value> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("an event"))
+        .collect();
+    let landed: usize = parsed
+        .iter()
+        .filter(|e| e["kind"] == "land")
+        .map(|e| e["members"].as_array().expect("members").len())
+        .sum();
+    let ejected = parsed.iter().filter(|e| e["kind"] == "eject").count();
+    assert!(landed > 0 && ejected > 0, "{events}");
+    let landed_prs = metric(last, "dorfq_window_landed_prs").expect("landed");
+    assert_eq!(ints(landed_prs), [landed as u64]);
+    let ejected_prs = metric(last, "dorfq_window_ejected_prs").expect("ejected");
+    assert_eq!(ints(ejected_prs), [ejected as u64]);
+    assert!(metric(last, "dorfq_tick_age_seconds").is_some());
+    assert!(metric(last, "dorfq_queue_blocked_prs").is_none());
+    assert!(metric(last, "dorfq_api_rate_limit_remaining").is_none());
+
+    let records: Vec<&Value> = logs
+        .iter()
+        .flat_map(|body| {
+            body["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+                .as_array()
+                .expect("log records")
+        })
+        .collect();
+    assert_eq!(records.len(), lines.len());
+    for ((record, line), event) in records.iter().zip(&lines).zip(&parsed) {
+        assert_eq!(record["body"]["stringValue"], *line);
+        assert_eq!(
+            attribute(&record["attributes"], "kind"),
+            event["kind"].as_str()
+        );
+    }
+}
+
+/// The process is handed the collector's address through every standard
+/// OpenTelemetry endpoint variable; without `[telemetry]` it must use none.
+#[test]
+fn a_run_without_telemetry_opens_no_connection() {
+    let collector = Collector::start();
+    let endpoint = format!("http://127.0.0.1:{}", collector.port);
+    let (config, _) = journaled_config("telemetry-none");
+    let output = Command::new(env!("DORFQ_BIN"))
+        .args(["run", "--config"])
+        .arg(&config)
+        .arg("--exit-when-idle")
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint)
+        .env(
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+            format!("{endpoint}/v1/metrics"),
+        )
+        .env(
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            format!("{endpoint}/v1/logs"),
+        )
+        .output()
+        .expect("spawn dorfq");
+    let received = collector.stop();
+    assert!(output.status.success(), "dorfq run: {output:?}");
+    assert!(received.is_empty(), "{} requests", received.len());
+}
+
+#[test]
+fn telemetry_with_an_unset_authorization_variable_exits_one_naming_it() {
+    let var = "DORFQ_TEST_OTLP_AUTHORIZATION_UNSET";
+    let (config, _) = journaled_config("telemetry-unset-authorization");
+    with_telemetry(&config, 1, &format!("authorization_env = \"{var}\"\n"));
+    run_exits_one_naming(
+        &config,
+        &format!("dorfq: telemetry.authorization_env {var} is unset"),
+        |command| {
+            command.env_remove(var);
+        },
     );
 }

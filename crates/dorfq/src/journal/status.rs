@@ -385,7 +385,7 @@ pub(crate) fn state(state: &BatchState) -> String {
 }
 
 /// The status structure and the last document handed over: the live loop's
-/// side of the status issue.
+/// side of the status document: the status issue and the telemetry read it.
 #[derive(Debug, Default)]
 pub struct Live {
     status: Status,
@@ -413,20 +413,26 @@ impl Live {
         self.status.tick(observation, events);
     }
 
-    /// The rendered body when the document differs from the last one handed
-    /// over, which it then records; `None` when it does not, and before the
-    /// first live observation, when the structure says nothing about the
-    /// repository as this process sees it.
-    pub fn changed(&mut self, version: &str, started: u64) -> Option<String> {
-        if !self.observed {
+    /// The document as it stands; `None` before the first live observation,
+    /// when the structure says nothing about the repository as this process
+    /// sees it.
+    pub fn document(&self) -> Option<Document> {
+        self.observed.then(|| self.status.document())
+    }
+
+    /// The greatest forge time seen; see [`Status::now`].
+    pub fn now(&self) -> u64 {
+        self.status.now()
+    }
+
+    /// The rendered body of `document` when it differs from the last one
+    /// handed over, which it then records; `None` when it does not.
+    pub fn changed(&mut self, document: &Document, version: &str, started: u64) -> Option<String> {
+        if self.last.as_ref() == Some(document) {
             return None;
         }
-        let document = self.status.document();
-        if self.last.as_ref() == Some(&document) {
-            return None;
-        }
-        let body = render(&document, self.status.now(), version, started);
-        self.last = Some(document);
+        let body = render(document, self.status.now(), version, started);
+        self.last = Some(document.clone());
         Some(body)
     }
 }

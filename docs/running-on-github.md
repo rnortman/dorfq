@@ -210,7 +210,8 @@ change explains. `eject_above` is the belief at which a failed run's
 culprit is ejected; `notify_above`, at most `eject_above`, the belief at
 which its author is told it is probably broken without an ejection, and at
 which each of two pull requests that fail only together is told so,
-naming the other.
+naming the other. A `[telemetry]` table pushes the queue's gauges and
+events to an OpenTelemetry collector; [Telemetry](#telemetry) describes it.
 
 Run it wherever outbound HTTPS is available:
 
@@ -686,6 +687,146 @@ own under 60,000. A body over that loses, in order, the oldest rows of the
 event table, then the event table itself (the figure lines stay), then the
 queue table's newest rows, replaced by `… and N more`. The batches table is
 never cut.
+
+## Telemetry
+
+The queue can push its gauges and its events to an OpenTelemetry collector
+over OTLP/HTTP, as JSON:
+
+```toml
+journal = "dorfq.journal"
+
+[telemetry]
+otlp_endpoint = "http://127.0.0.1:4318"
+interval_secs = 60
+authorization_env = "DORFQ_OTLP_AUTHORIZATION"
+```
+
+- `otlp_endpoint` is the collector's OTLP/HTTP base URL, `http://` or
+  `https://`; the queue posts to `<otlp_endpoint>/v1/metrics` and
+  `<otlp_endpoint>/v1/logs`. A path is kept (`https://host/otlp` posts to
+  `https://host/otlp/v1/metrics`), and a trailing `/` is dropped.
+- `interval_secs` is the time between exports, from 1 to 86400 (a day).
+- `authorization_env`, optional, names the environment variable holding the
+  `Authorization` header's whole value: `Basic <base64>` for Grafana Cloud,
+  `Bearer <token>` elsewhere. Absent, no header is sent. Over `http://` the
+  header travels unencrypted, so a collector reached across a network you do
+  not control, a hosted one, needs `https://`.
+
+`[telemetry]` needs `journal`: the gauges and the events come from the
+stream the queue derives as it journals. It works under either forge.
+
+A configuration the queue cannot use stops it at load: `telemetry needs
+journal`; `telemetry.otlp_endpoint "<url>" is not a URL: …`, `… is not an
+http:// or https:// URL`, `… has no host` or `… has an invalid port`;
+`telemetry.otlp_endpoint carries credentials; use authorization_env` or
+`telemetry.otlp_endpoint has a query or fragment` (an endpoint that could
+hold a secret is not repeated); `telemetry.interval_secs is 0` or `… is above 86400`;
+`telemetry.authorization_env is empty`. At start, before the forge is
+reached, the variable `authorization_env` names must be set:
+`telemetry.authorization_env <var> is unset, empty or not UTF-8`, or
+`… holds a value that is not a valid HTTP header value` for one with a
+trailing newline or another byte a header cannot carry. Neither message
+shows the value. Whether the collector answers is not checked at start.
+
+### The metrics
+
+Every export carries these, in the scope `dorfq`, under the resource
+`service.name = dorfq`, `service.version = <the dorfq version>`:
+
+| Metric | Unit | Attributes | Value |
+|---|---|---|---|
+| `dorfq_queue_prs` | `{pull_request}` | `status`: `ready`, `waiting`, `conflicting` | pull requests queued, by status |
+| `dorfq_batches` | `{batch}` | `state`: `testing`, `passed`, `failed`, `landed`, `refused`, `conflict` | batches in flight, by state |
+| `dorfq_oldest_queued_seconds` | `s` | | how long the oldest queued pull request has been queued; 0 when none is |
+| `dorfq_window_landed_prs` | `{pull_request}` | `window_seconds` | pull requests landed |
+| `dorfq_window_landed_batches` | `{batch}` | `window_seconds` | batches landed |
+| `dorfq_window_ejected_prs` | `{pull_request}` | `window_seconds` | pull requests ejected |
+| `dorfq_window_refused_landings` | `{batch}` | `window_seconds` | landings GitHub refused |
+| `dorfq_window_runs` | `{run}` | `verdict`: `passed`, `failed`, `cancelled`; `window_seconds` | batch runs ended |
+| `dorfq_window_batch_run_seconds` | `s` | `quantile`: `0.5`, `0.95`; `window_seconds` | batch run time |
+| `dorfq_window_land_seconds` | `s` | `quantile`; `window_seconds` | time from arrival to landing |
+| `dorfq_tick_age_seconds` | `s` | | time since the queue last observed the repository |
+| `dorfq_queue_blocked_prs` | `{pull_request}` | | pull requests labelled but not enqueued, told they are blocked; GitHub only |
+| `dorfq_api_rate_limit_remaining` | `{request}` | | the last `x-ratelimit-remaining` GitHub sent for a repository request; GitHub only |
+| `dorfq_telemetry_export_failures_total` | `{request}` | | export requests that failed, since start (a cumulative sum) |
+| `dorfq_telemetry_events_dropped_total` | `{event}` | | events dropped from a full buffer, since start (a cumulative sum) |
+
+The status of a queued pull request and the state of a batch are those the
+status issue shows, without what follows the `:`. The `window_` figures are
+the status issue's last-24-hours figures, and `window_seconds` is 86400 on
+each: a figure counts what ended in the trailing 24 hours of the forge's
+clock, and a run or a lifetime still open is in none. The pool gauges are
+not windowed. Every status, state and verdict is sent, zero included, so
+zero is never confused with absent; a metric or point is absent only when
+its value is unknown: a percentile with no samples, `dorfq_tick_age_seconds`
+before the first observation, the two GitHub-only gauges under the mock
+forge, and the rate limit before the first repository request.
+
+A metric's time is the host time of the export that carries it. The queue's
+figures change only when it ticks, so between ticks each export repeats
+them with its own time, and `dorfq_tick_age_seconds` says how old they are.
+No metrics are sent before the first tick that observes the repository.
+
+### The log records
+
+Every event the events file would hold is sent as one log record, in order:
+its body is the events file's line, its time the event's own (the forge's
+clock), its observed time the host time of the tick that produced it. Its
+attributes are `kind`, and `pr` and `batch` when the event names them. An
+`error` event is severity `ERROR`, `FATAL` when fatal; every other event
+`INFO`. Events the queue replays from the journal at start are not sent
+again.
+
+### Delivery
+
+The queue never waits on the collector: a thread of its own exports every
+`interval_secs`, whatever the queue is doing, and once more when the queue
+exits, idle or fatal. An export is one `/v1/metrics` request, then the
+pending log records in requests of 1,000. A request is bounded by 10
+seconds; any answer but a 2xx is a failure, and a redirect is not followed.
+
+A failed request is counted in `dorfq_telemetry_export_failures_total` and
+tried again at the next interval; a refused log request keeps its records
+and the ones after it for then. Each path says it once on stderr when it
+starts failing, `dorfq: telemetry: export to /v1/logs failed: <error>;
+retrying every 60s`, with a refused answer's status and its first 200 bytes
+on one line, and once when it recovers, `dorfq: telemetry: export to
+/v1/logs resumed after <n> failed requests`. A collector that takes metrics
+and refuses logs is reported for `/v1/logs` alone, once.
+
+Up to 10,000 events wait for delivery. Past that the oldest are dropped and
+counted in `dorfq_telemetry_events_dropped_total`, with one line, `dorfq:
+telemetry: 10000 events pending; dropping the oldest until the collector
+takes them`; when log records are next delivered the count is written,
+appended to the `resumed` line or as `dorfq: telemetry: <m> events dropped
+while the buffer was full`. Every event stays in the events file whatever
+the collector does.
+
+The export at exit can delay the exit. Against an unreachable collector it
+waits for the export in flight, if any, and then the final one: up to four
+request timeouts, 40 seconds. A slow collector working through a full
+buffer can extend this to a few minutes: each export is one metrics request
+and up to 10,000 / 1,000 log requests, each up to 10 seconds.
+
+A stop by signal runs no export: `systemctl stop` and `restart`, and so
+`make local-deploy`, end the process at once, during an exit export or not.
+The events not yet delivered reach the events file only, uncounted in
+`dorfq_telemetry_events_dropped_total`, and the next start does not send
+them: up to `interval_secs` of log records per stop, more while the
+collector is failing.
+
+### What to alert on
+
+- `dorfq_tick_age_seconds` above a few refresh intervals: the queue no
+  longer observes the repository — observing fails, or the loop is stuck.
+- No samples for two intervals: the process has stopped, by a stop or on a
+  fatal error: a scheduler error or a permanent forge error.
+- Log records with `kind = error`: a tick that failed. A failure after the
+  queue observed, such as a merge or a CI start GitHub refused, does not age
+  `dorfq_tick_age_seconds`; these records are its signal.
+- A rising `dorfq_telemetry_export_failures_total`: the collector, not the
+  queue.
 
 ## Stacks
 

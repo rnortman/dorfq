@@ -29,3 +29,4 @@ ureq = { workspace = true }
 
 [dev-dependencies]
 dorfq-sim = { path = "../dorfq-sim" }
+httparse = { workspace = true }

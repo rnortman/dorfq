@@ -85,7 +85,12 @@ rust_test(
         "DORFQ_EXAMPLE_CONFIG": "$(rootpath examples/mock.toml)",
     },
     version = VERSION,
-    deps = all_crate_deps(normal_dev = True),
+    # As under Cargo, an integration test links the package's dependencies
+    # as well as its dev-dependencies.
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )
 
 # The same CLI suite, run against the portable binary.
@@ -105,7 +110,10 @@ rust_test(
         "DORFQ_EXAMPLE_CONFIG": "$(rootpath examples/mock.toml)",
     },
     version = VERSION,
-    deps = all_crate_deps(normal_dev = True),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )
 
 rust_test(

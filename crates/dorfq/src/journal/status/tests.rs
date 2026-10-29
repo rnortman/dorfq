@@ -491,7 +491,9 @@ fn live_hands_a_body_over_exactly_when_the_document_differs() {
     let mut sink: Vec<String> = Vec::new();
     let mut tick = |live: &mut Live, o: Option<&Observation>, events: &[Event]| {
         live.tick(o, events);
-        if let Some(body) = live.changed("0.1.0", DAY) {
+        if let Some(document) = live.document()
+            && let Some(body) = live.changed(&document, "0.1.0", DAY)
+        {
             sink.push(body);
         }
     };
@@ -542,7 +544,7 @@ fn an_error_tick_adds_only_its_error_to_the_window() {
 }
 
 #[test]
-fn live_hands_nothing_over_until_a_live_tick_observes() {
+fn live_has_no_document_until_a_live_tick_observes() {
     let mut live = Live::new();
     live.seed(
         Some(&observation(DAY, vec![ready(1)], Vec::new())),
@@ -551,15 +553,20 @@ fn live_hands_nothing_over_until_a_live_tick_observes() {
     // The first live tick fails before observing: the seeded pool is the
     // previous process's, not what this one sees.
     live.tick(None, &[]);
-    assert_eq!(live.changed("0.1.0", DAY + 3600), None);
+    assert_eq!(live.document(), None);
     live.tick(
         Some(&observation(DAY + 3600, vec![ready(1)], Vec::new())),
         &[step(DAY + 3600)],
     );
+    assert_eq!(live.now(), DAY + 3600);
+    let document = live
+        .document()
+        .expect("a live observation gives a document");
     let body = live
-        .changed("0.1.0", DAY + 3600)
-        .expect("a live observation hands a body over");
+        .changed(&document, "0.1.0", DAY + 3600)
+        .expect("the first document is handed over");
     assert!(body.contains("| #1 | ready |"));
+    assert_eq!(live.changed(&document, "0.1.0", DAY + 3600), None);
 }
 
 #[test]

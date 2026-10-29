@@ -1,5 +1,5 @@
 {
-  "checksum": "f67755b0f99fa35aa69862b920f4b378a724e31b0f16c00cdc3326640ea2075c",
+  "checksum": "0cad1bd08adb30bc3435fc6b5351960e127847ecfe6c01c6db9cf26a74842b57",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -873,6 +873,12 @@
           {
             "id": "ureq 3.5.0",
             "target": "ureq"
+          }
+        ],
+        "deps_dev": [
+          {
+            "id": "httparse 1.10.1",
+            "target": "httparse"
           }
         ],
         "edition": "2024"

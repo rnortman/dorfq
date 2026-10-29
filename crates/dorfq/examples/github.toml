@@ -14,6 +14,13 @@
 # rotated with it; needs journal. See docs/running-on-github.md.
 # events = "dorfq.events"
 
+# Telemetry: the queue's gauges and its events pushed over OTLP/HTTP to a
+# collector, every interval_secs; needs journal. See docs/running-on-github.md.
+# [telemetry]
+# otlp_endpoint = "http://127.0.0.1:4318"          # the collector's OTLP/HTTP base; /v1/metrics and /v1/logs are appended
+# interval_secs = 60
+# authorization_env = "DORFQ_OTLP_AUTHORIZATION"   # the environment variable holding the Authorization header's value, if the collector needs one
+
 [forge]
 kind = "github"
 api_base = "https://api.github.com"   # GitHub Enterprise: https://<host>/api/v3

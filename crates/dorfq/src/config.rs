@@ -27,8 +27,6 @@ pub struct Config {
     /// The events file's path, beside the journal and rotated with it;
     /// absent, no events file is written. Needs `journal`. Relative paths
     /// are resolved as `journal`'s.
-    // TODO(telemetry-export): the summary's figures and the events pushed
-    // over OTLP/HTTP.
     #[serde(default)]
     pub events: Option<PathBuf>,
     /// Where the queue pushes its gauges and events; absent, nothing is
