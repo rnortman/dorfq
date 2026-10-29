@@ -57,6 +57,10 @@ pub trait GitHubApi {
     /// Comment bodies on a pull request, oldest first.
     fn list_comments(&mut self, number: PrNumber) -> Result<Vec<String>, ApiError>;
     fn create_comment(&mut self, number: PrNumber, body: &str) -> Result<(), ApiError>;
+    /// What issue `number` is; `None` when there is no such issue.
+    fn get_issue(&mut self, number: u64) -> Result<Option<IssueDetail>, ApiError>;
+    /// Replaces issue `number`'s body.
+    fn set_issue_body(&mut self, number: u64, body: &str) -> Result<(), ApiError>;
     fn label_exists(&mut self, label: &str) -> Result<bool, ApiError>;
     /// The repository ruleset named `name`: its id and the branches, by
     /// short name, it includes. Two of that name is an error.
@@ -194,6 +198,14 @@ pub struct PrDetail {
     pub draft: bool,
     /// Whether it was merged, by any hand.
     pub merged: bool,
+}
+
+/// One issue, as the single-item endpoint reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IssueDetail {
+    /// The issue is a pull request: GitHub lists pull requests as issues
+    /// carrying a `pull_request` key.
+    pub pull_request: bool,
 }
 
 /// A pull request's `mergeable_state`: whether GitHub would merge it into
@@ -949,6 +961,31 @@ impl GitHubApi for RestClient {
             .map(|_| ())
     }
 
+    fn get_issue(&mut self, number: u64) -> Result<Option<IssueDetail>, ApiError> {
+        let path = format!("/issues/{number}");
+        let response = self.call(Method::Get, &path, None)?;
+        match response.status {
+            200 => {
+                let what = format!("GET {path}");
+                let issue: IssueJson = decode(&what, response.json(&what)?)?;
+                Ok(Some(IssueDetail {
+                    pull_request: issue.pull_request.is_some(),
+                }))
+            }
+            404 => Ok(None),
+            _ => Err(issue_failure(Method::Get, &path, &response)),
+        }
+    }
+
+    fn set_issue_body(&mut self, number: u64, body: &str) -> Result<(), ApiError> {
+        let path = format!("/issues/{number}");
+        let response = self.call(Method::Patch, &path, Some(&json!({ "body": body })))?;
+        match response.status {
+            200 => Ok(()),
+            _ => Err(issue_failure(Method::Patch, &path, &response)),
+        }
+    }
+
     fn label_exists(&mut self, label: &str) -> Result<bool, ApiError> {
         let path = format!("/labels/{}", encode(label));
         let response = self.call(Method::Get, &path, None)?;
@@ -1225,6 +1262,18 @@ fn failure(method: Method, path: &str, response: &HttpResponse) -> ApiError {
         return ApiError::Transient(message.into());
     }
     permanent(message)
+}
+
+/// [`failure`] for a call on one issue: a redirect there also means the
+/// issue was transferred to another repository.
+fn issue_failure(method: Method, path: &str, response: &HttpResponse) -> ApiError {
+    match failure(method, path, response) {
+        ApiError::Permanent(error) if (300..400).contains(&response.status) => permanent(format!(
+            "{error}; if the issue was transferred, set status_issue to an issue in this \
+             repository"
+        )),
+        error => error,
+    }
 }
 
 /// How long a rate limit that names no time pauses the queue.

@@ -363,7 +363,9 @@ What each line, or its absence, means:
   retried: each failed attempt writes `kept the comment for message to pr
   <n>: …; retrying` on stderr with GitHub's error, and after a hint `next
   tick in <n> s: retrying a comment post` says when the next attempt is. A
-  post GitHub refused for good is `dropped the comment for …` on stderr.
+  post GitHub answered with a rate-limit pause is kept the same way, but the
+  tick's effects wait for the pause (see *While it runs*). A post GitHub
+  refused for good is `dropped the comment for …` on stderr.
 
 ### The reverse proxy
 
@@ -435,6 +437,19 @@ them.
   likely cause of a failed batch, or that it and another queued pull request
   probably fail only together. The pull request stays queued. Rebasing and letting
   its own checks run again is the fastest way to settle it either way.
+- While a rate-limit pause GitHub announced is in force, the queue writes
+  nothing: no merge, branch update, comment or status edit. A comment post,
+  or with a status issue a status edit, answered with a pause is kept
+  (`kept the …` on stderr). When that tick's plan has an effect that
+  writes, it fails at its first write: after the tick line, stderr carries
+  `dorfq: transient forge error: rate limited until unix time <t>; nothing
+  is written before then; retrying`, and the tick's journal line carries
+  that error. A notice is kept instead, with `kept the comment for …` on
+  stderr, and posted when the pause ends. A hint that arrives during the
+  pause writes `next tick in <n> s: rate-limit pause`. The kept comment and
+  body go out at the first tick after the pause, and that tick plans again.
+  A landing interrupted by a pause is finished at the next tick, so a
+  stacked pull request it had moved onto trunk stays there until then.
 - A queue that stops with "batch <id>'s tip is its base" is tracking a batch
   that an earlier build published at its own base, because every member was
   already in trunk. Stop the queue, delete `refs/dorfq/batches/<id>` and the

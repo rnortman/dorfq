@@ -160,19 +160,39 @@
 //! [`GitHubForge::wait`] blocks until the earlier of the next deadline and
 //! the retry of a comment the last flush kept after a transient failure,
 //! which is retried under its own backoff of five seconds doubling to
-//! sixty, and resolves hints as they arrive; no hint shortens a rate-limit
-//! pause or a backoff. `observe` posts the comments it owes before it
-//! returns. When the receiver's channel disconnects, the next `observe` is
-//! [`ForgeError::Permanent`].
+//! sixty, and the retry of a status-issue body (below), and resolves hints
+//! as they arrive; no hint shortens a rate-limit pause or a backoff.
+//! `observe` posts the comments it owes before it returns. When the
+//! receiver's channel disconnects, the next `observe` is
+//! [`ForgeError::Permanent`]. Nothing is written inside a rate-limit pause:
+//! once any request has been answered with one, every write passes through
+//! one gate that, while the pause is in force at the clock's reading,
+//! answers it rate-limited without sending it. An effect fails at its first
+//! write with [`ForgeError::Transient`] (a read it makes before that write
+//! goes out); a comment or status body is kept until the pause ends, a
+//! notice waits in the outbox, and a landing interrupted by the pause
+//! leaves the moves it made for the `landing` record to put back. A pause
+//! one of `observe`'s own writes is answered with leaves the observation
+//! standing.
 //!
 //! Each resolved hint writes one stderr line per entity it made due, with
 //! the deadline it now holds (`due now`, or `due in <k> s` inside the
 //! floor), or one line saying it matched nothing. When a wait is still held
 //! after the hints that arrived, one line says how long the next tick is
-//! away and why: a rate-limit pause, a backoff, retrying a comment post, or
-//! nothing due sooner. A
+//! away and why: a rate-limit pause, a backoff, retrying a comment post,
+//! writing the status issue, or nothing due sooner. A
 //! pull request the cache did not hold whose read finds it not open and
 //! labelled writes one line saying it is not queued.
+//!
+//! **The status issue.** With `status_issue` set, [`GitHubForge::new`]
+//! checks that the issue exists and is not a pull request, and writes its
+//! starting body. [`GitHubForge::publish_status`] hands over a new body,
+//! which replaces any body not yet written. A body is written no sooner
+//! than thirty seconds after the last successful edit and never during a
+//! rate-limit pause; a body held back goes out at the first `observe` after
+//! that. A transient failure keeps the body and retries it under its own
+//! backoff of five seconds doubling to sixty; any other failure drops it.
+//! Either writes a line on stderr; a failed edit never stops the queue.
 //!
 //! - [`api`]: the REST calls, behind the [`api::GitHubApi`] trait.
 //! - [`app`]: the GitHub App credential: the private key, and the JWT it
@@ -237,6 +257,9 @@ pub struct Settings {
     pub ci: Option<Ci>,
     /// How often each cached entity is read unprompted.
     pub refresh: Refresh,
+    /// The number of an issue whose body the queue keeps as its status;
+    /// needs Issues: read/write.
+    pub status_issue: Option<u64>,
 }
 
 /// A CI system the queue can cancel a run on.
@@ -252,9 +275,10 @@ pub enum Ci {
 
 impl Settings {
     /// Rejects an empty `trunk` or `label`, no `checks` or `batch_checks`,
-    /// an empty check name, or an interval [`Refresh::validate`] rejects.
-    /// The message begins with the field's name (`trunk is empty`,
-    /// `checks[1] is empty`, `refresh.pr_secs is 0ns; …`).
+    /// an empty check name, a `status_issue` of 0, or an interval
+    /// [`Refresh::validate`] rejects. The message begins with the field's
+    /// name (`trunk is empty`, `checks[1] is empty`, `refresh.pr_secs is
+    /// 0ns; …`).
     pub fn validate(&self) -> Result<(), String> {
         if self.trunk.is_empty() {
             return Err("trunk is empty".to_owned());
@@ -276,6 +300,9 @@ impl Settings {
             if let Some(empty) = names.iter().position(String::is_empty) {
                 return Err(format!("{field}[{empty}] is empty"));
             }
+        }
+        if self.status_issue == Some(0) {
+            return Err("status_issue is 0".to_owned());
         }
         self.refresh
             .validate()
@@ -343,8 +370,24 @@ pub struct GitHubForge {
     /// The queue's branch-lock ruleset and the branches it locks, as last
     /// read from or written to GitHub; `None` when there is none.
     locked: Option<(RulesetId, BTreeSet<String>)>,
+    /// The status issue, with `status_issue` set.
+    status: Option<StatusIssue>,
     /// One line per message posted.
     sink: Box<dyn Write>,
+}
+
+/// The issue whose body the queue keeps as its status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusIssue {
+    number: u64,
+    /// The body not yet written: the newest handed to `publish_status`.
+    pending: Option<String>,
+    /// The hold before retrying a body a transient failure kept, in
+    /// seconds; `None` once a write succeeded or nothing is pending.
+    backoff: Option<u64>,
+    /// No edit before this time: the floor after the last successful edit,
+    /// or a transient failure's retry.
+    due: Timestamp,
 }
 
 /// What the forge keeps about a pull request it reported enqueued.
@@ -550,6 +593,9 @@ const RECORDS: &str = "refs/dorfq/batches/";
 /// A deadline every clock reading has passed: due at once.
 const AT_ONCE: Timestamp = Timestamp(0);
 
+/// The least time between two edits of the status issue, in seconds.
+const STATUS_FLOOR: u64 = 30;
+
 /// The hold after the first of a run of transient failures, in seconds.
 const BACKOFF_FIRST: u64 = 5;
 /// The longest hold after a transient failure, in seconds.
@@ -639,8 +685,11 @@ enum WaitHold {
     RateLimit,
     Backoff,
     /// The retry of a comment a transient failure kept is sooner than any
-    /// deadline.
+    /// deadline, and no later than a held status body's write.
     Outbox,
+    /// The write of a status body held back is sooner than any deadline and
+    /// than a kept comment's retry.
+    Status,
     /// No deadline is sooner: none of the hints made anything due yet, or
     /// what they made due waits for the five-second floor.
     Floor,
@@ -655,14 +704,18 @@ struct Holds {
     held: Timestamp,
     /// When a comment the last flush kept is retried; `None` when none is.
     outbox_due: Option<Timestamp>,
+    /// When a status body held back is written; `None` when none is.
+    status_due: Option<Timestamp>,
 }
 
 impl Holds {
-    /// The earlier of the schedule's `next_deadline` and the kept comment's
-    /// retry.
+    /// The earliest of the schedule's `next_deadline`, the kept comment's
+    /// retry and the held status body's write.
     fn earliest(self, next_deadline: Timestamp) -> Timestamp {
-        self.outbox_due
-            .map_or(next_deadline, |due| due.min(next_deadline))
+        [self.outbox_due, self.status_due]
+            .into_iter()
+            .flatten()
+            .fold(next_deadline, Timestamp::min)
     }
 
     /// When the wait is over, given the schedule's `next_deadline`.
@@ -671,17 +724,19 @@ impl Holds {
     }
 }
 
-/// Why a wait holding for `holds` is not over at the earlier of the
-/// schedule's `next_deadline` and a kept comment's retry, with a rate-limit
-/// pause ending at `paused_until`.
+/// Why a wait holding for `holds` is not over at the earliest of the
+/// schedule's `next_deadline`, a kept comment's retry and a held status
+/// body's write, with a rate-limit pause ending at `paused_until`.
 fn hold(next_deadline: Timestamp, paused_until: Option<Timestamp>, holds: Holds) -> WaitHold {
     let earliest = holds.earliest(next_deadline);
     if holds.held > holds.start && holds.held >= earliest {
         WaitHold::Backoff
     } else if paused_until.is_some_and(|until| until >= earliest) {
         WaitHold::RateLimit
-    } else if holds.outbox_due.is_some_and(|due| due < next_deadline) {
+    } else if earliest < next_deadline && holds.outbox_due == Some(earliest) {
         WaitHold::Outbox
+    } else if earliest < next_deadline && holds.status_due == Some(earliest) {
+        WaitHold::Status
     } else {
         WaitHold::Floor
     }
@@ -693,6 +748,7 @@ fn hold_line(seconds: u64, hold: WaitHold) -> String {
         WaitHold::RateLimit => "rate-limit pause",
         WaitHold::Backoff => "backing off after a transient failure",
         WaitHold::Outbox => "retrying a comment post",
+        WaitHold::Status => "writing the status issue",
         WaitHold::Floor => "nothing due sooner",
     };
     format!("dorfq: next tick in {seconds} s: {reason}")
@@ -778,7 +834,9 @@ impl GitHubForge {
     /// A forge over the repository `api` reaches, reading time from
     /// `clock`, and hints from `hints` when a webhook receiver runs. Checks
     /// that trunk and the label exist and, with `lock_heads` on, reads the
-    /// queue's branch-lock ruleset; writes nothing.
+    /// queue's branch-lock ruleset. With `status_issue`, checks that the
+    /// issue exists and is not a pull request and writes its starting body;
+    /// writes nothing else.
     pub fn new(
         mut api: Box<dyn GitHubApi>,
         settings: Settings,
@@ -809,6 +867,31 @@ impl GitHubForge {
         } else {
             None
         };
+        let status = match settings.status_issue {
+            Some(number) => {
+                match api.get_issue(number)? {
+                    None => {
+                        return Err(ApiError::Permanent(
+                            format!("status issue #{number} does not exist").into(),
+                        ));
+                    }
+                    Some(issue) if issue.pull_request => {
+                        return Err(ApiError::Permanent(
+                            format!("status issue #{number} is a pull request").into(),
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                api.set_issue_body(number, messages::STATUS_STARTING)?;
+                Some(StatusIssue {
+                    number,
+                    pending: None,
+                    backoff: None,
+                    due: AT_ONCE,
+                })
+            }
+            None => None,
+        };
         let schedule = Schedule::new(&settings.refresh);
         Ok(GitHubForge {
             api,
@@ -832,8 +915,71 @@ impl GitHubForge {
             outbox: VecDeque::new(),
             batched: BTreeMap::new(),
             locked,
+            status,
             sink,
         })
+    }
+
+    /// Hands over `body` as the status issue's new body, replacing any body
+    /// not yet written, and writes it now unless the floor after the last
+    /// edit, a transient failure's retry or a rate-limit pause holds it.
+    /// Does nothing without `status_issue`.
+    pub fn publish_status(&mut self, body: String) {
+        if let Some(status) = &mut self.status {
+            status.pending = Some(body);
+            self.send_status();
+        }
+    }
+
+    /// Moves the rate-limit pause the API client recorded into the schedule,
+    /// then writes the pending status body through [`Self::send`] if one is
+    /// due and no pause is in force; a clock that cannot be read counts it as
+    /// due, and `send` refuses it if a pause has been recorded. Success
+    /// holds the next edit for [`STATUS_FLOOR`]; a transient failure keeps
+    /// the body and holds its retry under its own backoff; any other drops
+    /// it. Each failure writes a line on stderr. The floor and the retry
+    /// are timed from a clock reading taken when the call returns.
+    fn send_status(&mut self) {
+        self.absorb_pause();
+        let Some(mut status) = self.status.take() else {
+            return;
+        };
+        self.write_status(&mut status);
+        self.status = Some(status);
+    }
+
+    /// `send_status`'s write of `status`, held out of `self.status` so that
+    /// `send` can borrow the forge.
+    fn write_status(&mut self, status: &mut StatusIssue) {
+        if status.pending.is_none()
+            || (self.clock)().is_ok_and(|now| now < self.schedule.after_pause(status.due))
+        {
+            return;
+        }
+        let Some(body) = status.pending.take() else {
+            return;
+        };
+        let number = status.number;
+        let written = self.send(|api| api.set_issue_body(number, &body));
+        let returned = (self.clock)().ok();
+        let after = |seconds: u64| returned.map_or(AT_ONCE, |now| Timestamp(now.0 + seconds));
+        match written {
+            Ok(()) => {
+                status.backoff = None;
+                status.due = after(STATUS_FLOOR);
+            }
+            Err(error @ ApiError::Transient(_)) => {
+                status.pending = Some(body);
+                let backoff = next_backoff(status.backoff);
+                status.backoff = Some(backoff);
+                status.due = after(backoff);
+                eprintln!("dorfq: kept the status body for issue #{number}: {error}; retrying");
+            }
+            Err(error) => {
+                status.backoff = None;
+                eprintln!("dorfq: dropped the status body for issue #{number}: {error}");
+            }
+        }
     }
 
     /// Blocks until the next observation has something to do: until the
@@ -850,9 +996,7 @@ impl GitHubForge {
     /// clock cannot be read, or when the webhook receiver's channel
     /// disconnects; the next observation reports either.
     pub fn wait(&mut self, transient: bool) {
-        if let Some(until) = self.api.rate_limit_pause() {
-            self.schedule.pause(timestamp_at(until));
-        }
+        self.absorb_pause();
         let Ok(start) = (self.clock)() else {
             return;
         };
@@ -865,16 +1009,19 @@ impl GitHubForge {
             start
         };
         self.outbox_backoff = (!self.outbox.is_empty()).then(|| next_backoff(self.outbox_backoff));
-        let outbox_due = self.outbox_backoff.map(|backoff| {
-            let retry = Timestamp(start.0 + backoff);
-            self.schedule
-                .paused_until()
-                .map_or(retry, |until| retry.max(until))
-        });
+        let outbox_due = self
+            .outbox_backoff
+            .map(|backoff| self.schedule.after_pause(Timestamp(start.0 + backoff)));
+        let status_due = self
+            .status
+            .as_ref()
+            .filter(|status| status.pending.is_some())
+            .map(|status| self.schedule.after_pause(status.due));
         let holds = Holds {
             start,
             held,
             outbox_due,
+            status_due,
         };
         loop {
             let Ok(now) = (self.clock)() else {
@@ -922,6 +1069,47 @@ impl GitHubForge {
             let why = hold(next_deadline, self.schedule.paused_until(), holds);
             hold_line(wake.0 - now.0, why)
         })
+    }
+
+    /// Moves the rate-limit pause the API client recorded, if any, into the
+    /// schedule.
+    fn absorb_pause(&mut self) {
+        if let Some(until) = self.api.rate_limit_pause() {
+            self.schedule.pause(timestamp_at(until));
+        }
+    }
+
+    /// Sends `request`, a write, unless a rate-limit pause GitHub announced
+    /// is in force: then nothing is sent and the answer is what GitHub would
+    /// give, `Transient("rate limited until unix time <t>; nothing is
+    /// written before then")`. Every write the forge makes goes through
+    /// here; `self.api` is called directly only to read.
+    // TODO(quality-write-gate-enforced-only-by-a-doc-comment): nothing in the
+    // types stops a write on `self.api` that skips this gate.
+    fn send<T>(
+        &mut self,
+        request: impl FnOnce(&mut dyn GitHubApi) -> Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        if let Some(until) = self.paused() {
+            return Err(ApiError::Transient(
+                format!(
+                    "rate limited until unix time {}; nothing is written before then",
+                    until.0
+                )
+                .into(),
+            ));
+        }
+        request(self.api.as_mut())
+    }
+
+    /// Moves the client's recorded pause into the schedule and returns its
+    /// end when it is in force at the clock's reading, or is recorded and
+    /// the clock cannot be read.
+    fn paused(&mut self) -> Option<Timestamp> {
+        self.absorb_pause();
+        self.schedule
+            .paused_until()
+            .filter(|&until| !(self.clock)().is_ok_and(|now| now >= until))
     }
 
     fn next_deadline(&self) -> Timestamp {
@@ -985,9 +1173,9 @@ impl GitHubForge {
     /// everything after it for the next flush, a permanent one drops the
     /// comment; either writes a line on stderr.
     fn flush(&mut self) -> Result<(), ForgeError> {
-        while let Some(message) = self.outbox.front() {
+        while let Some(message) = self.outbox.front().cloned() {
             let body = message.body(&self.settings.trunk, &self.settings.label);
-            match self.api.create_comment(message.pr, &body) {
+            match self.send(|api| api.create_comment(message.pr, &body)) {
                 Ok(()) => {
                     writeln!(self.sink, "{message}")
                         .map_err(|e| ForgeError::Permanent(Box::new(e)))?;
@@ -1273,6 +1461,7 @@ impl GitHubForge {
         // can bring a blocked pull request into the enqueued set but never
         // changes the class of one it leaves out: each is classified once.
         let mut blocked = BTreeMap::new();
+        let trunk_branch = self.settings.trunk.clone();
         let bases = loop {
             let bases = enqueued_bases(&self.facts, &self.settings, &landed);
             blocked.retain(|n, _| !bases.contains_key(n));
@@ -1308,7 +1497,8 @@ impl GitHubForge {
                     &trunk,
                 )?;
                 match class {
-                    Class::MergedBase => match self.api.set_base(number, &self.settings.trunk) {
+                    Class::MergedBase => match self.send(|api| api.set_base(number, &trunk_branch))
+                    {
                         Ok(()) => {
                             // GitHub recomputes mergeability after a change
                             // of base.
@@ -1521,12 +1711,12 @@ impl GitHubForge {
 
         let state = match record.state {
             RecordState::Started => {
-                self.api.delete_ref(&branch(&build_branch(id)))?;
-                self.api.delete_ref(&branch(&probe_branch(id)))?;
+                self.send(|api| api.delete_ref(&branch(&build_branch(id))))?;
+                self.send(|api| api.delete_ref(&branch(&probe_branch(id))))?;
                 if published.is_some() {
-                    self.api.delete_ref(&published_ref)?;
+                    self.send(|api| api.delete_ref(&published_ref))?;
                 }
-                self.api.delete_ref(&name)?;
+                self.send(|api| api.delete_ref(&name))?;
                 return Ok(None);
             }
             RecordState::Testing { tip } => {
@@ -1744,7 +1934,7 @@ impl GitHubForge {
 
     /// Points `name` at `sha` whatever it held.
     fn force_ref(&mut self, name: &str, sha: &Sha) -> Result<(), ForgeError> {
-        match self.api.update_ref(name, sha, true)? {
+        match self.send(|api| api.update_ref(name, sha, true))? {
             RefUpdate::Updated => Ok(()),
             RefUpdate::NotFastForward => Err(permanent(format!(
                 "a forced update of {name} to {sha} was refused as not a fast-forward"
@@ -1756,9 +1946,8 @@ impl GitHubForge {
     /// tree is `tree` (the base's) and whose parent is the base.
     fn write_record(&mut self, record: &Record, tree: &Sha) -> Result<(), ForgeError> {
         let text = record.render().map_err(|e| permanent(e.to_string()))?;
-        let sha = self
-            .api
-            .create_commit(&text, tree, std::slice::from_ref(&record.base))?;
+        let sha =
+            self.send(|api| api.create_commit(&text, tree, std::slice::from_ref(&record.base)))?;
         self.force_ref(&record_ref(record.id), &sha)
     }
 
@@ -1786,9 +1975,9 @@ impl GitHubForge {
             return Ok(ConflictWith::Trunk);
         }
         let probe = branch(&probe_branch(id));
-        self.api.create_ref(&probe, base)?;
+        self.send(|api| api.create_ref(&probe, base))?;
         let outcome = self.probe(id, base, members, k);
-        let deleted = self.api.delete_ref(&probe);
+        let deleted = self.send(|api| api.delete_ref(&probe));
         let with = outcome?;
         deleted?;
         Ok(with)
@@ -1808,16 +1997,18 @@ impl GitHubForge {
         let probe_ref = branch(&probe);
         let culprit = &members[k];
         let culprit_message = self.merge_message(id, culprit.pr);
-        if self.api.merge(&probe, &culprit.head, &culprit_message)? == Merge::Conflict {
+        if self.send(|api| api.merge(&probe, &culprit.head, &culprit_message))? == Merge::Conflict {
             return Ok(ConflictWith::Trunk);
         }
         for earlier in &members[..k] {
             self.force_ref(&probe_ref, base)?;
             let message = self.merge_message(id, earlier.pr);
-            if self.api.merge(&probe, &earlier.head, &message)? == Merge::Conflict {
+            if self.send(|api| api.merge(&probe, &earlier.head, &message))? == Merge::Conflict {
                 continue;
             }
-            if self.api.merge(&probe, &culprit.head, &culprit_message)? == Merge::Conflict {
+            if self.send(|api| api.merge(&probe, &culprit.head, &culprit_message))?
+                == Merge::Conflict
+            {
                 return Ok(ConflictWith::Pr(earlier.pr));
             }
         }
@@ -1900,9 +2091,11 @@ impl GitHubForge {
         // puts each moved member back on its base, here or, from the
         // `landing` record, at the next observation, so it is not reported on
         // trunk while its base is unlanded.
+        let trunk_branch = self.settings.trunk.clone();
+        let trunk_ref = branch(&trunk_branch);
         let mut moved = Vec::new();
         for m in stacked {
-            match self.api.set_base(m.pr, &self.settings.trunk) {
+            match self.send(|api| api.set_base(m.pr, &trunk_branch)) {
                 Ok(()) => moved.push(m),
                 Err(ApiError::Permanent(error)) => eprintln!(
                     "dorfq: could not retarget #{} onto {} before landing batch {}: {error}",
@@ -1918,8 +2111,7 @@ impl GitHubForge {
                 }
             }
         }
-        let trunk_ref = branch(&self.settings.trunk);
-        match self.api.update_ref(&trunk_ref, tip, false)? {
+        match self.send(|api| api.update_ref(&trunk_ref, tip, false))? {
             RefUpdate::Updated => Ok(None),
             RefUpdate::NotFastForward => {
                 // A member whose base landed in this plan has its base's
@@ -1937,11 +2129,11 @@ impl GitHubForge {
     }
 
     /// Puts each of `moved` back on its base branch, after its batch did not
-    /// land; every move is attempted, and the first error is returned.
+    /// land: every move is attempted and the first error is returned.
     fn move_back(&mut self, moved: &[&Moved]) -> Result<(), ApiError> {
         let mut first = Ok(());
         for m in moved {
-            if let Err(error) = self.api.set_base(m.pr, &m.branch)
+            if let Err(error) = self.send(|api| api.set_base(m.pr, &m.branch))
                 && first.is_ok()
             {
                 first = Err(error);
@@ -1964,7 +2156,7 @@ impl GitHubForge {
             return Ok(());
         }
         self.mark_due(Entity::Pr(m.pr));
-        self.api.set_base(m.pr, &m.branch)?;
+        self.send(|api| api.set_base(m.pr, &m.branch))?;
         if let Some(facts) = self.facts.get_mut(&m.pr) {
             facts.detail.base = m.branch.clone();
         }
@@ -2009,7 +2201,7 @@ impl GitHubForge {
             .collect();
         runs.sort();
         for id in runs {
-            self.api.cancel_run(id)?;
+            self.send(|api| api.cancel_run(id))?;
         }
         Ok(())
     }
@@ -2030,12 +2222,12 @@ impl GitHubForge {
                 self.locked = Some((id, want));
             }
             Some((id, _)) if want.is_empty() => {
-                self.api.delete_ruleset(id)?;
+                self.send(|api| api.delete_ruleset(id))?;
                 self.locked = None;
             }
             Some((_, have)) if have == want => {}
             Some((id, _)) => {
-                if self.api.update_ruleset(id, &want)? {
+                if self.send(|api| api.update_ruleset(id, &want))? {
                     self.locked = Some((id, want));
                 } else {
                     // Deleted outside the queue: made again.
@@ -2053,11 +2245,11 @@ impl GitHubForge {
     /// may have applied, and updated if found; otherwise one is created.
     fn lock_anew(&mut self, want: &BTreeSet<String>) -> Result<RulesetId, ForgeError> {
         if let Some((id, _)) = self.api.find_ruleset(LOCK_RULESET)?
-            && self.api.update_ruleset(id, want)?
+            && self.send(|api| api.update_ruleset(id, want))?
         {
             return Ok(id);
         }
-        Ok(self.api.create_ruleset(LOCK_RULESET, want)?)
+        Ok(self.send(|api| api.create_ruleset(LOCK_RULESET, want))?)
     }
 
     fn trunk(&mut self) -> Result<Sha, ForgeError> {
@@ -2076,7 +2268,8 @@ impl GitHubForge {
         tip: &Sha,
     ) -> Result<(), ForgeError> {
         self.mark_due(Entity::Pr(pr));
-        self.api.remove_label(pr, &self.settings.label)?;
+        let label = self.settings.label.clone();
+        self.send(|api| api.remove_label(pr, &label))?;
         self.completed.insert(pr, batch);
         self.outbox.push_back(Message {
             pr,
@@ -2151,10 +2344,17 @@ impl Forge for GitHubForge {
     /// has accepted it, tells authors the transitions since the previous
     /// observation that [`messages`] names (rule 9). Posts them, and anything
     /// an earlier flush kept, before returning; a failed observation still
-    /// posts what earlier ones kept.
+    /// posts what earlier ones kept. Then writes a status body held back, if
+    /// it is due. Every write passes through the pause gate, so inside a
+    /// rate-limit pause, one its own reads were answered with included, it
+    /// posts and writes nothing and keeps the comment and the body. A pause
+    /// one of those writes is answered with leaves the observation standing;
+    /// every write after it is refused unsent until it ends.
     fn observe(&mut self) -> Result<Observation, ForgeError> {
         let observed = self.observe_unposted();
-        self.flush()?;
+        let flushed = self.flush();
+        self.send_status();
+        flushed?;
         observed
     }
 
@@ -2189,19 +2389,18 @@ impl Forge for GitHubForge {
             state: RecordState::Started,
         };
         let text = record.render().map_err(|e| permanent(e.to_string()))?;
-        let started = self
-            .api
-            .create_commit(&text, &tree, std::slice::from_ref(&batch.base))?;
-        self.api.create_ref(&record_ref(id), &started)?;
+        let started =
+            self.send(|api| api.create_commit(&text, &tree, std::slice::from_ref(&batch.base)))?;
+        self.send(|api| api.create_ref(&record_ref(id), &started))?;
 
         let build = build_branch(id);
         let build_ref = branch(&build);
-        self.api.create_ref(&build_ref, &batch.base)?;
+        self.send(|api| api.create_ref(&build_ref, &batch.base))?;
         let mut tip = batch.base.clone();
         let mut conflict = None;
         for (k, member) in record.members.iter().enumerate() {
             let message = self.merge_message(id, member.pr);
-            match self.api.merge(&build, &member.head, &message)? {
+            match self.send(|api| api.merge(&build, &member.head, &message))? {
                 Merge::Merged(sha) => tip = sha,
                 Merge::NothingToMerge => {}
                 Merge::Conflict => {
@@ -2213,7 +2412,7 @@ impl Forge for GitHubForge {
 
         if let Some(k) = conflict {
             let with = self.attribute(id, &batch.base, &record.members, k)?;
-            self.api.delete_ref(&build_ref)?;
+            self.send(|api| api.delete_ref(&build_ref))?;
             record.state = RecordState::Conflict {
                 pr: record.members[k].pr,
                 with,
@@ -2233,12 +2432,12 @@ impl Forge for GitHubForge {
                 "batch"
             };
             let message = format!("dorfq {kind} {}", id.0);
-            tip = self
-                .api
-                .create_commit(&message, &tree, std::slice::from_ref(&batch.base))?;
+            tip = self.send(|api| {
+                api.create_commit(&message, &tree, std::slice::from_ref(&batch.base))
+            })?;
         }
-        self.api.create_ref(&branch(&batch_branch(id)), &tip)?;
-        self.api.delete_ref(&build_ref)?;
+        self.send(|api| api.create_ref(&branch(&batch_branch(id)), &tip))?;
+        self.send(|api| api.delete_ref(&build_ref))?;
         record.state = RecordState::Testing { tip: tip.clone() };
         self.write_record(&record, &tree)?;
         self.started(batch);
@@ -2332,8 +2531,8 @@ impl Forge for GitHubForge {
         }
         // The record goes first: a record whose batch branch is gone reads
         // back as `Permanent`, a batch branch with no record is never read.
-        self.api.delete_ref(&record_ref(batch))?;
-        self.api.delete_ref(&branch(&batch_branch(batch)))?;
+        self.send(|api| api.delete_ref(&record_ref(batch)))?;
+        self.send(|api| api.delete_ref(&branch(&batch_branch(batch))))?;
         self.ledger.retired(batch);
         if let (Some(Ci::Actions), Some(tip)) = (self.settings.ci, testing_tip) {
             self.cancel_runs(batch, &tip)?;
@@ -2354,7 +2553,8 @@ impl Forge for GitHubForge {
             .expect("check_eject accepts only enqueued pull requests")
             .base;
         self.ejecting.insert(pr, reason.clone());
-        self.api.remove_label(pr, &self.settings.label)?;
+        let label = self.settings.label.clone();
+        self.send(|api| api.remove_label(pr, &label))?;
         self.ejecting.remove(&pr);
         self.ledger.ejected(pr);
         self.outbox.push_back(Message {

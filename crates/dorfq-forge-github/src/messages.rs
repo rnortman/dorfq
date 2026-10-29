@@ -23,6 +23,9 @@
 //! every reading of the thread skips it. A pull request whose last
 //! transition marker is `queued`, `held` or `testing` was greeted already;
 //! any other, or none, means it is entering the queue.
+//!
+//! The status issue's body begins with `<!-- dorfq: status -->`; it is not
+//! a comment and no reading of a thread looks for it.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -93,6 +96,11 @@ pub enum Marker {
     Notice,
     Blocked,
 }
+
+/// The status issue's body until the queue's first observation replaces it.
+pub const STATUS_STARTING: &str = "<!-- dorfq: status -->\n\n\
+The queue has started and has not observed the repository yet. It rewrites \
+this body as it runs: edit the issue's title, not its body.\n";
 
 const MARKER_OPEN: &str = "<!-- dorfq: ";
 const MARKER_CLOSE: &str = " -->";

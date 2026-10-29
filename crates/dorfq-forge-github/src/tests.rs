@@ -17,6 +17,7 @@ use crate::refresh::{Entity, Refresh};
 use crate::{Ci, Clock, GitHubForge, Settings, branch};
 
 mod schedule;
+mod status;
 mod wait;
 
 /// A sink the test can read back.
@@ -57,6 +58,7 @@ fn settings() -> Settings {
             pr: Duration::from_secs(PR_SECS),
             batch: Duration::from_secs(BATCH_SECS),
         },
+        status_issue: None,
     }
 }
 
@@ -214,6 +216,8 @@ fn new_rejects_empty_settings_before_any_call() {
     empty_batch_check.batch_checks.insert(0, String::new());
     let mut comma_label = settings();
     comma_label.label = "merge,queue".to_owned();
+    let mut issue_zero = settings();
+    issue_zero.status_issue = Some(0);
     for (bad, problem) in [
         (no_trunk, "forge setting trunk is empty"),
         (no_label, "forge setting label is empty"),
@@ -225,6 +229,7 @@ fn new_rejects_empty_settings_before_any_call() {
             comma_label,
             "forge setting label \"merge,queue\" contains a comma",
         ),
+        (issue_zero, "forge setting status_issue is 0"),
     ] {
         let fake = FakeGitHub::new();
         let error = GitHubForge::new(
@@ -3171,7 +3176,9 @@ fn a_put_back_that_fails_in_land_is_returned_by_its_kind_and_the_landing_stays_r
 
         match kind {
             Failure::Permanent => assert!(matches!(error, ForgeError::Permanent(_)), "{error}"),
-            Failure::Transient => assert!(matches!(error, ForgeError::Transient(_)), "{error}"),
+            Failure::Transient | Failure::RateLimited(_) => {
+                assert!(matches!(error, ForgeError::Transient(_)), "{error}")
+            }
         }
         assert_eq!(
             record_of(&fake, 1).state,
@@ -3199,7 +3206,7 @@ fn a_put_back_lost_with_the_forward_move_replaces_the_error_only_when_permanent(
 
         match kind {
             Failure::Permanent => assert!(matches!(error, ForgeError::Permanent(_)), "{error}"),
-            Failure::Transient => assert!(
+            Failure::Transient | Failure::RateLimited(_) => assert!(
                 matches!(error, ForgeError::Transient(_))
                     && error.to_string().contains("response lost"),
                 "{error}"

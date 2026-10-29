@@ -14,8 +14,8 @@ use std::time::SystemTime;
 use dorfq_core::{PrNumber, Sha};
 
 use crate::api::{
-    ApiError, CheckResult, Commit, Compare, CompareStatus, GitHubApi, Merge, MergeState, OpenPr,
-    PrDetail, RefEntry, RefUpdate, RulesetId, RunId, WorkflowRun,
+    ApiError, CheckResult, Commit, Compare, CompareStatus, GitHubApi, IssueDetail, Merge,
+    MergeState, OpenPr, PrDetail, RefEntry, RefUpdate, RulesetId, RunId, WorkflowRun,
 };
 use crate::branch;
 
@@ -24,6 +24,9 @@ use crate::branch;
 pub enum Failure {
     Transient,
     Permanent,
+    /// A rate-limited answer: transient, recording a pause until this time
+    /// for the next [`GitHubApi::rate_limit_pause`].
+    RateLimited(SystemTime),
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +59,9 @@ pub struct State {
     /// Check results per commit, newest first.
     pub checks: BTreeMap<Sha, Vec<CheckResult>>,
     pub comments: BTreeMap<u64, Vec<String>>,
+    /// Plain issues by number, with their bodies; a body written to a pull
+    /// request's number is kept here too.
+    pub issues: BTreeMap<u64, String>,
     pub labels: BTreeSet<String>,
     /// Heads that conflict with trunk whatever they are merged onto.
     pub conflicts_with_trunk: BTreeSet<Sha>,
@@ -315,6 +321,7 @@ impl FakeGitHub {
             "merge",
             "remove_label",
             "create_comment",
+            "set_issue_body",
             "set_base",
             "create_ruleset",
             "update_ruleset",
@@ -338,6 +345,12 @@ impl FakeGitHub {
             }
             Some(Failure::Permanent) => {
                 Err(ApiError::Permanent(format!("{method}: injected").into()))
+            }
+            Some(Failure::RateLimited(until)) => {
+                state.rate_limit_pause = Some(until);
+                Err(ApiError::Transient(
+                    format!("{method}: injected (rate limited)").into(),
+                ))
             }
         }
     }
@@ -660,6 +673,30 @@ impl GitHubApi for FakeGitHub {
             .entry(number.0)
             .or_default()
             .push(body.to_owned());
+        Ok(())
+    }
+
+    fn get_issue(&mut self, number: u64) -> Result<Option<IssueDetail>, ApiError> {
+        self.enter("get_issue", number.to_string())?;
+        let state = self.state();
+        Ok(if state.prs.contains_key(&number) {
+            Some(IssueDetail { pull_request: true })
+        } else if state.issues.contains_key(&number) {
+            Some(IssueDetail {
+                pull_request: false,
+            })
+        } else {
+            None
+        })
+    }
+
+    fn set_issue_body(&mut self, number: u64, body: &str) -> Result<(), ApiError> {
+        self.enter("set_issue_body", number.to_string())?;
+        let mut state = self.state();
+        if !state.prs.contains_key(&number) && !state.issues.contains_key(&number) {
+            return Err(permanent(format!("set_issue_body {number}: no such issue")));
+        }
+        state.issues.insert(number, body.to_owned());
         Ok(())
     }
 

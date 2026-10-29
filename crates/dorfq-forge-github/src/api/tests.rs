@@ -705,6 +705,122 @@ fn set_base_maps_a_refusal() {
 }
 
 #[test]
+fn get_issue_tells_an_issue_from_a_pull_request_and_reads_404_as_none() {
+    let (mut api, _) = client(vec![
+        route(
+            "GET",
+            "/issues/12",
+            ok(json!({ "number": 12, "title": "status" })),
+        ),
+        route(
+            "GET",
+            "/issues/7",
+            ok(json!({ "number": 7, "pull_request": { "url": "x" } })),
+        ),
+        route(
+            "GET",
+            "/issues/99",
+            status(404, json!({ "message": "Not Found" })),
+        ),
+    ]);
+    assert_eq!(
+        api.get_issue(12).unwrap(),
+        Some(IssueDetail {
+            pull_request: false
+        })
+    );
+    assert_eq!(
+        api.get_issue(7).unwrap(),
+        Some(IssueDetail { pull_request: true })
+    );
+    assert_eq!(api.get_issue(99).unwrap(), None);
+}
+
+#[test]
+fn get_issue_maps_a_403_to_a_permanent_error_with_github_s_message() {
+    let (mut api, _) = client(vec![route(
+        "GET",
+        "/issues/12",
+        status(
+            403,
+            json!({ "message": "Resource not accessible by integration" }),
+        ),
+    )]);
+    let error = api.get_issue(12).unwrap_err();
+    assert!(!is_transient(&error), "{error}");
+    assert!(
+        error
+            .to_string()
+            .ends_with("GET /issues/12: HTTP 403: Resource not accessible by integration"),
+        "{error}"
+    );
+}
+
+#[test]
+fn set_issue_body_patches_the_issue_and_maps_a_refusal() {
+    let (mut api, seen) = client(vec![route(
+        "PATCH",
+        "/issues/12",
+        ok(json!({ "number": 12 })),
+    )]);
+    api.set_issue_body(12, "the body").unwrap();
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, Method::Patch);
+    assert_eq!(seen[0].2, Some(json!({ "body": "the body" })));
+    for (canned, transient) in [
+        (
+            status(
+                422,
+                json!({ "message": "Validation Failed", "errors": [{ "code": "too_long" }] }),
+            ),
+            false,
+        ),
+        (
+            status(410, json!({ "message": "Issues are disabled" })),
+            false,
+        ),
+        (status(502, Value::Null), true),
+    ] {
+        let code = canned.status;
+        let (mut api, _) = client(vec![route("PATCH", "/issues/12", canned)]);
+        let error = api.set_issue_body(12, "the body").unwrap_err();
+        assert_eq!(is_transient(&error), transient, "HTTP {code}: {error}");
+        let error = error.to_string();
+        assert!(error.contains("PATCH /issues/12"), "{error}");
+        assert!(error.contains(&format!("HTTP {code}")), "{error}");
+    }
+}
+
+#[test]
+fn a_redirect_on_either_issue_call_says_the_issue_may_have_been_transferred() {
+    let moved = || {
+        let mut c = status(301, json!({ "message": "Moved Permanently" }));
+        c.headers
+            .push(("location", format!("{BASE}/repositories/42/issues/7")));
+        c
+    };
+    let (mut api, _) = client(vec![route("GET", "/issues/12", moved())]);
+    let read = api.get_issue(12).unwrap_err();
+    let (mut api, _) = client(vec![route("PATCH", "/issues/12", moved())]);
+    let written = api.set_issue_body(12, "the body").unwrap_err();
+    for error in [read, written] {
+        assert!(!is_transient(&error), "{error}");
+        let text = error.to_string();
+        assert!(
+            text.contains(&format!("redirected to {BASE}/repositories/42/issues/7")),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "if the issue was transferred, set status_issue to an issue in this repository"
+            ),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn merged_pr_heads_asks_for_trunk_merges_of_the_branch_and_keeps_merged_ones() {
     let mut merged = pr_json(5, A, &[], "unknown");
     merged["state"] = json!("closed");

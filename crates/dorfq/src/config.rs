@@ -298,6 +298,7 @@ impl ForgeConfig {
                 pr: Duration::from_secs(refresh.pr_secs),
                 batch: Duration::from_secs(refresh.batch_secs),
             },
+            status_issue: None,
         })
     }
 }
