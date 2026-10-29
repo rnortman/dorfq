@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod driver;
+pub mod journal;
 pub mod providers;
 
 #[cfg(test)]

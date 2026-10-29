@@ -7,6 +7,10 @@
 # Creating and installing the app, the label, CI on batch branches, the
 # webhook and the token alternative are in docs/running-on-github.md.
 
+# The tick journal: every tick's observation and plan, one JSON line each,
+# relative to this file; absent, none. See docs/running-on-github.md.
+# journal = "dorfq.journal"
+
 [forge]
 kind = "github"
 api_base = "https://api.github.com"   # GitHub Enterprise: https://<host>/api/v3

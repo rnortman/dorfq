@@ -441,6 +441,89 @@ them.
   branch `dorfq/batch/<id>`, and start it again; the batch's members that are
   still labelled rejoin the queue.
 
+## The journal
+
+The repository forgets: a retired batch's record and branch are deleted, and
+nothing in it says when anything happened. The journal is the queue's own
+record. Set `journal = "<path>"` at the top of the configuration, above
+`[forge]`; a relative path is resolved against the configuration file's
+directory. With it set, `dorfq run` appends every tick to that file as one
+JSON line: the tick's observation and plan when either says something new, a
+short `same` line when the tick saw nothing new and planned nothing, and the
+error when a tick failed, including the fatal one the process exits on.
+Each line is flushed before the queue waits, so a crash loses at most the
+tick in progress. Without the key nothing is written.
+
+Nothing reads the journal at start. A restart builds the scheduler fresh, as
+it does without a journal, and appends to the file: each process begins its
+lines with a header naming the dorfq version, the forge and the
+`[scheduler]` settings it ran with. A last line cut off by a crash is cut
+back at the next start, with a line on stderr saying so. A file at the path
+that dorfq did not write stops the run at start, before any API call, and is
+left as it was; point `journal` elsewhere.
+
+The current file is one *segment*. A segment is closed and a fresh one
+opened at the same path when the queue goes idle after work — the tick that
+sees no pull requests and no batches left is the closed segment's last line,
+and the fresh segment holds only its header until the next tick — or when it
+passes 64 MiB. A closed segment is renamed `<path>.<opened>`, `<opened>`
+being the Unix time its first header was written; a name already taken gets
+`.1`, `.2` and so on, so a closed segment is never overwritten. A segment
+that began just after an idle tick and was closed at idle holds every pull
+request and batch it mentions from arrival to departure. Any other segment
+continues from, or into, its neighbours: read it with them.
+
+dorfq never deletes a closed segment: they are the record, and retention is
+yours. A cron job that deletes the oldest of `<path>.*`, or moves them out
+of the journal's directory to compress or archive them there, does it;
+leave `<path>` itself alone. `dorfq journal` reads only segments as dorfq
+wrote them, so keep compressed ones out of the glob below. A `logrotate`
+rule renames the files it rotates, and its names collide with dorfq's own
+`.1`, `.2` suffixes; do not point one at the journal.
+
+An upgrade that changes the journal's format closes a segment written in the
+old format as a rotation would, opens a fresh one, and says so on stderr;
+the run does not stop. The new build's `dorfq journal` still reads the old
+segment. A segment in a format newer than the build reading it is refused,
+naming the formats that build reads.
+
+The journal holds pull request numbers, commit shas, check names, batch ids,
+the reasons the queue gave and its scheduler settings: no titles, no logins,
+nothing from the credential.
+
+## Reading the journal
+
+`dorfq journal` reads segments, in the order given. For a queue that has
+rotated, that is the closed segments in name order and then the current one:
+
+```sh
+dorfq journal metrics queue.journal.* queue.journal
+```
+
+- `dorfq journal events <segment>...` prints what happened as one JSON object
+  per line: arrivals, pushes, holds, CI on pull requests and batches,
+  landings, ejections and their reasons, notices, trunk moves, restarts and
+  errors. Times are the forge's, in seconds; a pull request that leaves and
+  comes back under the same number is a new arrival.
+- `dorfq journal metrics [--json] <segment>...` prints a summary over the
+  whole input, one row per figure, or one JSON object with `--json`: counts
+  of arrivals, landings, ejections, withdrawals and the rest; batch runs and
+  their run time; how much of it went on batches that never landed; and
+  percentiles of the time from arrival to landing, from arrival to ejection,
+  of batch runs and of pull requests' own CI. A batch whose build conflicted
+  never ran CI and counts in no run figure. A batch's verdict is read at its
+  next refresh, so run times are as fine as `[forge.refresh]` makes them.
+- `dorfq journal report [--name <name>] <segment>...` prints a document the
+  simulation page opens through its file picker: the summary as the metric
+  table and the events as the replay. The page has no truth for a real
+  queue, so it says "truth unknown" where it would say whether a pull request
+  was broken or an ejection justified.
+
+A segment that is not a journal, or a line that does not read, stops the
+command with exit 1 and `dorfq: <path>:<line>: …` on stderr. The current
+segment's last line may be a tick still being written; it is skipped, with a
+line on stderr.
+
 ## Stacks
 
 A stack is a pull request whose base is another pull request's branch. Label

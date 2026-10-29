@@ -58,13 +58,15 @@ rust_test(
     compile_data = [
         "examples/github.toml",
         "examples/scenario.toml",
+        # The format-1 journal fixture, read with `include_str!`.
+        "testdata/journal-1.jsonl",
         # A GitHub App key, read with `include_str!`.
         "//crates/dorfq-forge-github:testdata/app-key.pkcs1.pem",
     ],
     crate = ":dorfq_lib",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     version = VERSION,
-    deps = all_crate_deps(normal_dev = True),
+    deps = all_crate_deps(normal_dev = True) + ["//crates/dorfq-sim:dorfq_sim"],
 )
 
 rust_test(

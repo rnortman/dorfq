@@ -24,7 +24,7 @@ const ROWS = [
   ["left_with_base", 1, "pull requests that left because their base left without landing; also counted under the base's exit"],
   ["unfinished", 1, "pull requests still open when the replication ended"],
   ["rebases", 1, null],
-  ["runs", 1, "batch runs started, cancelled ones included"],
+  ["runs", 1, "batch runs started, cancelled ones included; a batch whose build conflicted never ran"],
   ["cancelled_runs", 1, "batch runs stopped because their batch was retired"],
   ["mean_batch_size", 2, null],
   ["billed_pr_ci_runs", 1, "pull requests' own CI runs the queue caused by landing their base without them"],
@@ -343,15 +343,19 @@ function eventText(e) {
     case "trunk_repaired": return "trunk repaired";
     case "repush": return `repush ${e.pr}`;
     case "withdraw": return `withdraw ${e.pr}`;
+    case "merged": return `merged ${e.pr}`;
+    case "lost": return `lost ${e.pr}`;
     case "blocked": return `blocked ${e.pr} ${e.final ? "on" : "with"} ${e.on}${e.bad ? " bad" : ""}`;
     case "start": return `start ${e.batch} ${e.members.length === 0 ? "probe" : list(e.members)} on ${e.base === null ? "trunk" : e.base}`;
     case "run_end":
       return `ci ${e.batch} ${e.passed ? "passed" : "failed"}${e.broken ? " broken" : ""}${e.flake ? " flake" : ""}${e.outage ? " outage" : ""}`;
     case "land": return `land ${e.batch} ${list(e.members)}`;
     case "refused": return `refused ${e.batch}: ${e.reason}`;
+    // A journal event carries no `justified`; only a simulated one does.
     case "eject":
-      return `eject ${e.pr} ${e.justified ? "justified" : "unjustified"}: ${e.reason}${e.final ? "" : ", rebasing"}`;
-    case "notice": return `notice ${e.pr} ${e.justified ? "justified" : "unjustified"}: ${e.reason}`;
+      return `eject ${e.pr}${e.justified === true ? " justified" : e.justified === false ? " unjustified" : ""}: ${e.reason ?? "reason unknown"}${e.final ? "" : ", rebasing"}`;
+    case "notice":
+      return `notice ${e.pr}${e.justified === true ? " justified" : e.justified === false ? " unjustified" : ""}: ${e.reason}`;
     case "retire": return `retire ${e.batch}${e.cancelled ? " cancelled" : ""}`;
     case "pr_ci": return `pr-ci ${e.pr}${e.billed ? " billed" : ""}`;
     case "pr_ci_end": return `pr-ci ${e.pr} ${e.cancelled ? "cancelled" : e.failed ? "failed" : "passed"}`;
@@ -369,6 +373,9 @@ function eventText(e) {
       if (e.retire.length) s += ` | retire ${list(e.retire)}`;
       return s;
     }
+    // TODO(correctness-trace-pane-drops-real-only-event-detail): print the
+    // fields of a journal's error, restart, conflict, conflicting, held and
+    // trunk events.
     default: return e.kind;
   }
 }
@@ -384,14 +391,17 @@ const OUTSIDE = {
   waiting_for_base: { long: "waiting for base", short: "for base" },
 };
 
-// Ends `batch` with the verdict of `e`, a run_end or retire event.
+// Ends `batch` with the verdict of `e`, a run_end, retire or conflict event.
 function endBatch(batch, e) {
   batch.ended = e.t;
-  if (e.kind === "retire") {
+  if (e.kind === "conflict") {
+    batch.verdict = "conflict";
+  } else if (e.kind === "retire") {
     batch.verdict = "cancelled";
   } else {
     batch.verdict = e.passed ? "passed" : e.flake ? "flake" : "failed";
     batch.broken = e.broken;
+    batch.checks = e.checks;
   }
 }
 
@@ -417,8 +427,8 @@ class World {
     this.departed = [];
     this.unresolved = [];
     this.count = {
-      landed: 0, ejected_bad: 0, ejected_good: 0, withdrawn: 0, left_with_base: 0, runs: 0,
-      billed_pr_ci_runs: 0,
+      landed: 0, ejected: 0, ejected_bad: 0, ejected_good: 0, withdrawn: 0, left_with_base: 0,
+      merged: 0, runs: 0, billed_pr_ci_runs: 0,
     };
   }
 
@@ -438,6 +448,14 @@ class World {
     return base ? base.state : null;
   }
 
+  // Counts an ejection under its truth: bad when `bad` is true, good when it
+  // is false, neither when it is null (a journal carries no truth).
+  countEjected(bad) {
+    this.count.ejected += 1;
+    if (bad === true) this.count.ejected_bad += 1;
+    else if (bad === false) this.count.ejected_good += 1;
+  }
+
   // Counts each final block under its root departure, with its own truth,
   // once that root has departed: a base the same plan ejects after its
   // child's block departs later in the trace.
@@ -445,8 +463,7 @@ class World {
     this.unresolved = this.unresolved.filter(({ on, bad }) => {
       const root = this.rootDeparture(on);
       if (root === "ejected") {
-        if (bad) this.count.ejected_bad += 1;
-        else this.count.ejected_good += 1;
+        this.countEjected(bad);
       } else if (root === "withdrawn") {
         this.count.withdrawn += 1;
       } else {
@@ -539,7 +556,7 @@ class World {
       case "arrive":
         this.prs.set(e.pr, {
           pr: e.pr, base: e.base, atomic: e.atomic, arrived: e.t, state: "queued", left: null,
-          bad: false, conflicts: Boolean(e.conflicts),
+          bad: false, conflicts: e.conflicts ?? null,
           batches: new Set(), repushed: null, ci: null, place: null, rebases: 0, fixing: false,
           rerunning: false,
         });
@@ -620,11 +637,19 @@ class World {
         this.depart(e.pr, "withdrawn", e.t, {});
         this.resolveBlocked();
         break;
+      case "merged":
+        this.count.merged += 1;
+        this.depart(e.pr, "merged", e.t, {});
+        break;
+      case "lost":
+        this.depart(e.pr, "lost", e.t, {});
+        break;
       case "blocked":
         if (e.final) {
           this.count.left_with_base += 1;
-          this.depart(e.pr, "blocked", e.t, { on: e.on, bad: e.bad });
-          this.unresolved.push({ on: e.on, bad: e.bad });
+          const bad = e.bad ?? null;
+          this.depart(e.pr, "blocked", e.t, { on: e.on, bad });
+          this.unresolved.push({ on: e.on, bad });
           this.resolveBlocked();
         } else {
           const pr = this.prs.get(e.pr);
@@ -656,6 +681,15 @@ class World {
         this.freeSlot(batch);
         break;
       }
+      // A batch whose build conflicted never ran CI, so it is not a run.
+      case "conflict": {
+        const batch = this.batches.get(e.batch);
+        if (!batch || batch.ended !== null) break;
+        endBatch(batch, e);
+        this.freeSlot(batch);
+        this.count.runs -= 1;
+        break;
+      }
       case "land": {
         const batch = this.batches.get(e.batch);
         if (batch) batch.landed = true;
@@ -681,9 +715,9 @@ class World {
           this.queued.delete(e.pr);
           break;
         }
-        if (e.justified) this.count.ejected_bad += 1;
-        else this.count.ejected_good += 1;
-        this.depart(e.pr, "ejected", e.t, { reason: e.reason, justified: e.justified });
+        const justified = e.justified ?? null;
+        this.countEjected(justified);
+        this.depart(e.pr, "ejected", e.t, { reason: e.reason, justified });
         this.resolveBlocked();
         break;
       }
@@ -715,8 +749,14 @@ const COLOURS = {
   cancel: "#5c6578", chip: "#2b3242",
 };
 
-const VERDICT = { passed: COLOURS.good, failed: COLOURS.bad, flake: COLOURS.flake, cancelled: COLOURS.cancel };
-const DEPARTURE = { landed: COLOURS.good, ejected: COLOURS.bad, withdrawn: COLOURS.cancel, blocked: COLOURS.warn };
+const VERDICT = {
+  passed: COLOURS.good, failed: COLOURS.bad, flake: COLOURS.flake, cancelled: COLOURS.cancel,
+  conflict: COLOURS.warn,
+};
+const DEPARTURE = {
+  landed: COLOURS.good, ejected: COLOURS.bad, withdrawn: COLOURS.cancel, blocked: COLOURS.warn,
+  merged: COLOURS.good, lost: COLOURS.cancel,
+};
 
 const WINDOW = 6 * 3600;
 const LEFT = 92;
@@ -913,7 +953,7 @@ function drawChip(ctx, world, pr, x, y, now, faded, look) {
     ctx.setLineDash([]);
     ctx.lineWidth = 1;
   }
-  if (pr.state === "ejected" && !pr.justified) {
+  if (pr.state === "ejected" && pr.justified === false) {
     ctx.strokeStyle = COLOURS.text;
     ctx.lineWidth = 2;
     ctx.stroke();
@@ -1098,6 +1138,7 @@ function batchText(world, b) {
   if (b.verdict) lines.push(b.verdict + (b.broken ? " (tree broken)" : ""));
   if (b.landed) lines.push("landed");
   if (b.refused) lines.push(`refused: ${b.refused}`);
+  if (b.checks && b.checks.length) lines.push(`failed: ${b.checks.join(", ")}`);
   return lines.join("\n");
 }
 
@@ -1120,11 +1161,19 @@ function prText(world, pr) {
     }
   }
   if (pr.rebases) lines.push(`rebased ${pr.rebases} time${pr.rebases === 1 ? "" : "s"}`);
-  const truth = [world.bad(pr) && "broken against trunk", pr.conflicts && "conflicts with trunk"].filter(Boolean);
-  lines.push(`truth: ${truth.length ? truth.join(", ") : "good"}`);
+  // A journal's arrival carries no `conflicts`, and its document no truth.
+  if (pr.conflicts === null) {
+    lines.push("truth: unknown");
+  } else {
+    const truth = [world.bad(pr) && "broken against trunk", pr.conflicts && "conflicts with trunk"].filter(Boolean);
+    lines.push(`truth: ${truth.length ? truth.join(", ") : "good"}`);
+  }
   if (pr.state !== "queued") {
     let how = `${pr.state} at ${clockText(pr.left)}`;
-    if (pr.state === "ejected") how += ` (${pr.justified ? "justified" : "innocent"}): ${pr.reason}`;
+    if (pr.state === "ejected") {
+      const truth = pr.justified === null ? "truth unknown" : pr.justified ? "justified" : "innocent";
+      how += ` (${truth}): ${pr.reason ?? "reason unknown"}`;
+    }
     if (pr.state === "blocked") how += ` on #${pr.on}`;
     lines.push(how);
   }
@@ -1236,8 +1285,8 @@ const replay = {
       ["queued", world.queued.size], ["held", world.heldCount()],
       ["outside", world.outside().length], ["running", `${running}/${world.slots.length}`],
       ["runs", c.runs], ["PR CI billed", c.billed_pr_ci_runs], ["landed", c.landed],
-      ["ejected bad", c.ejected_bad], ["ejected good", c.ejected_good],
-      ["withdrawn", c.withdrawn], ["left with base", c.left_with_base],
+      ["ejected", c.ejected], ["ejected bad", c.ejected_bad], ["ejected good", c.ejected_good],
+      ["withdrawn", c.withdrawn], ["left with base", c.left_with_base], ["merged outside", c.merged],
     ];
     $("counters").replaceChildren(...items.map(([k, v]) => {
       const span = document.createElement("span");

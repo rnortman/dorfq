@@ -22,6 +22,8 @@ rust-project.json
 *.log
 *.jsonl
 logs/
+# The journal format fixtures are test input, checked in.
+!/crates/dorfq/testdata/journal-*.jsonl
 
 # Simulator reports copied beside the site for local viewing; the published
 # ones are built by Bazel.

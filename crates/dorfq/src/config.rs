@@ -1,4 +1,5 @@
-//! The configuration file: which forge and which scheduler.
+//! The configuration file: which forge, which scheduler, and where the
+//! journal goes.
 
 use std::error::Error;
 use std::fmt;
@@ -17,6 +18,13 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// The tick journal's path; absent, no journal is written. Relative
+    /// paths are resolved against the configuration file's directory at
+    /// load.
+    // TODO(telemetry-export): the event stream written live beside the
+    // journal, and the summary and events pushed over OTLP/HTTP.
+    #[serde(default)]
+    pub journal: Option<PathBuf>,
     pub forge: ForgeConfig,
     pub scheduler: SchedulerConfig,
 }
@@ -184,6 +192,9 @@ impl Config {
             .scheduler
             .validate()
             .map_err(|e| format!("scheduler: {e}"))?;
+        if let Some(journal) = &mut config.journal {
+            *journal = dir.join(journal.as_path());
+        }
         match &mut config.forge {
             ForgeConfig::Mock { scenario } => {
                 let resolved = dir.join(scenario.as_path());
@@ -240,6 +251,14 @@ impl Config {
 }
 
 impl ForgeConfig {
+    /// The forge's kind as the configuration names it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ForgeConfig::Mock { .. } => "mock",
+            ForgeConfig::GitHub { .. } => "github",
+        }
+    }
+
     /// The GitHub forge's settings, `None` for any other forge:
     /// `batch_checks` absent is `checks`.
     pub fn github_settings(&self) -> Option<Settings> {
@@ -291,11 +310,39 @@ kind = "all-at-once"
         assert_eq!(
             config,
             Config {
+                journal: None,
                 forge: ForgeConfig::Mock {
                     scenario: PathBuf::from("conf/scenario.toml"),
                 },
                 scheduler: SchedulerConfig::AllAtOnce {},
             }
+        );
+    }
+
+    #[test]
+    fn a_relative_journal_path_is_resolved_and_an_absolute_one_kept() {
+        let journal = |path: &str| {
+            Config::parse(&format!("journal = {path:?}\n{VALID}"), Path::new("conf"))
+                .unwrap()
+                .journal
+        };
+        assert_eq!(
+            journal("dorfq.journal"),
+            Some(PathBuf::from("conf/dorfq.journal"))
+        );
+        assert_eq!(
+            journal("/var/lib/q.journal"),
+            Some(PathBuf::from("/var/lib/q.journal"))
+        );
+    }
+
+    #[test]
+    fn the_forge_kind_is_the_configured_name() {
+        let mock = Config::parse(VALID, Path::new("")).unwrap();
+        assert_eq!(mock.forge.kind(), "mock");
+        assert_eq!(
+            Config::parse(GITHUB, Path::new("")).unwrap().forge.kind(),
+            "github"
         );
     }
 

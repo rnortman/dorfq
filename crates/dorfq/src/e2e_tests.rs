@@ -1,7 +1,9 @@
 //! The driver running a scheduler against `MockForge`, scenario to its end.
 
 use std::cell::RefCell;
+use std::fs;
 use std::io;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use dorfq_core::{
@@ -11,6 +13,8 @@ use dorfq_forge_mock::{Event, Message, MockForge, Scenario};
 use dorfq_scheduler::{AllAtOnce, SchedulerConfig};
 
 use crate::driver::{Driver, TickReport};
+use crate::journal::events::{Kind, derive};
+use crate::journal::{self, Entry, Header, LineKind, Writer};
 use crate::providers::Shared;
 
 /// The mock's synthetic commit `n`.
@@ -77,14 +81,19 @@ impl Run {
     }
 }
 
-/// [`run_with`] under `AllAtOnce`.
+/// [`run_with`] under `AllAtOnce`, unjournaled.
 fn run(scenario: &str) -> Run {
-    run_with(scenario, &mut AllAtOnce::new())
+    run_with(scenario, &mut AllAtOnce::new(), None)
 }
 
 /// Ticks `scheduler` until a tick is idle and every scenario pull request
-/// has arrived; any forge error fails the test.
-fn run_with(scenario: &str, scheduler: &mut dyn Scheduler) -> Run {
+/// has arrived, recording each tick in `journal` at host time equal to its
+/// tick; any forge error fails the test.
+fn run_with(
+    scenario: &str,
+    scheduler: &mut dyn Scheduler,
+    mut journal: Option<&mut Writer>,
+) -> Run {
     let scenario = Scenario::from_toml(scenario).unwrap();
     let mock = Rc::new(RefCell::new(MockForge::new(scenario, Box::new(io::sink()))));
     let mut forge = Shared(Rc::clone(&mock));
@@ -92,7 +101,12 @@ fn run_with(scenario: &str, scheduler: &mut dyn Scheduler) -> Run {
     {
         let mut driver = Driver::new(&mut forge, scheduler);
         loop {
-            let report = driver.tick().unwrap();
+            let outcome = driver.tick();
+            if let Some(writer) = journal.as_deref_mut() {
+                let tick = driver.ticks() - 1;
+                writer.record(tick, tick, &outcome).unwrap();
+            }
+            let report = outcome.unwrap();
             let idle = report.idle;
             reports.push(report);
             if idle && !mock.borrow().awaiting_arrivals() {
@@ -332,6 +346,7 @@ fn shipped_scenario_runs_to_idle_under_bayes() {
     let run = run_with(
         include_str!("../examples/scenario.toml"),
         scheduler.as_mut(),
+        None,
     );
     assert_eq!(run.starts()[0], (0, 1, vec![1, 2, 3]));
     assert_eq!(run.landed(), [1, 2, 3]);
@@ -408,5 +423,55 @@ fn a_base_dequeued_while_waiting_leaves_its_child_blocked_and_told() {
     assert_eq!(
         to_three,
         [&Event::Queued, &Event::Blocked { on: PrNumber(2) }]
+    );
+}
+
+#[test]
+fn a_journaled_run_records_what_the_driver_returned() {
+    let dir = PathBuf::from(std::env::var("TEST_TMPDIR").expect("TEST_TMPDIR under bazel test"))
+        .join("e2e-journal");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("q.journal");
+    let header = Header::start("mock", &SchedulerConfig::AllAtOnce {}, 1000);
+    let (mut writer, _) = Writer::open(&path, header).unwrap();
+    let run = run_with(
+        include_str!("../examples/scenario.toml"),
+        &mut AllAtOnce::new(),
+        Some(&mut writer),
+    );
+    drop(writer);
+    // The final idle tick closed the segment the run began.
+    let segments = [dir.join("q.journal.1000"), path];
+    let read = journal::read(&segments).unwrap();
+    let mut ticks = Vec::new();
+    for entry in &read.entries {
+        let Entry::Tick(line) = entry else { continue };
+        let returned = &run.reports[line.tick as usize];
+        match &line.kind {
+            LineKind::Report { report, failure } => {
+                assert_eq!(**report, *returned);
+                assert_eq!(*failure, None);
+            }
+            LineKind::Same { now } => assert_eq!(*now, returned.observation.now),
+            LineKind::Error(failure) => panic!("tick {}: {failure:?}", line.tick),
+        }
+        ticks.push(line.tick);
+    }
+    let every: Vec<u64> = (0..run.reports.len() as u64).collect();
+    assert_eq!(ticks, every);
+    let events = derive(&read.entries);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(&e.kind, Kind::Land { batch: 1, .. })),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            Kind::Eject { pr: 5, reason: Some(reason), .. } if reason == "batch 2 failed"
+        )),
+        "{events:?}"
     );
 }
