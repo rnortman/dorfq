@@ -1,5 +1,5 @@
-//! The configuration file: which forge, which scheduler, and where the
-//! journal goes.
+//! The configuration file: which forge, which scheduler, where the journal
+//! goes, and where telemetry goes.
 
 use std::error::Error;
 use std::fmt;
@@ -12,6 +12,7 @@ use dorfq_forge_github::refresh::Refresh;
 use dorfq_forge_github::{Ci, Settings};
 use dorfq_scheduler::SchedulerConfig;
 use serde::Deserialize;
+use ureq::http::Uri;
 
 /// A loaded configuration, with every path resolved and the scheduler's
 /// parameters validated.
@@ -30,8 +31,87 @@ pub struct Config {
     // over OTLP/HTTP.
     #[serde(default)]
     pub events: Option<PathBuf>,
+    /// Where the queue pushes its gauges and events; absent, nothing is
+    /// pushed. Needs `journal`.
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
     pub forge: ForgeConfig,
     pub scheduler: SchedulerConfig,
+}
+
+/// Where the queue pushes its telemetry over OTLP/HTTP.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// The collector's OTLP/HTTP base URL, `http://` or `https://`;
+    /// `/v1/metrics` and `/v1/logs` are appended. A trailing `/` is
+    /// dropped at load.
+    pub otlp_endpoint: String,
+    /// Seconds between exports; 1 to [`MAX_INTERVAL_SECS`].
+    pub interval_secs: u64,
+    /// The environment variable holding the `Authorization` header's
+    /// value, whole (`Basic …`, `Bearer …`); absent, no header is sent.
+    /// Never the value.
+    #[serde(default)]
+    pub authorization_env: Option<String>,
+}
+
+/// The longest `interval_secs`, a day. The exporter's clock is an
+/// `Instant`, which panics on an interval it cannot add.
+pub const MAX_INTERVAL_SECS: u64 = 86_400;
+
+impl TelemetryConfig {
+    /// Checks the table and trims the endpoint's trailing `/`.
+    fn validate(&mut self) -> Result<(), String> {
+        let endpoint = &self.otlp_endpoint;
+        // Credentials or a token may sit after an `@`, a `?` or a `#`, so
+        // such an endpoint is never written into the message.
+        let shown = if endpoint.contains(['@', '?', '#']) {
+            String::new()
+        } else {
+            format!(" {endpoint:?}")
+        };
+        let problem = |reason: &str| format!("telemetry.otlp_endpoint{shown} {reason}");
+        let uri: Uri = endpoint
+            .parse()
+            .map_err(|error| problem(&format!("is not a URL: {error}")))?;
+        if !matches!(uri.scheme_str(), Some("http" | "https")) {
+            return Err(problem("is not an http:// or https:// URL"));
+        }
+        let (Some(authority), Some(host)) = (uri.authority(), uri.host()) else {
+            return Err(problem("has no host"));
+        };
+        if host.is_empty() {
+            return Err(problem("has no host"));
+        }
+        if authority.as_str().contains('@') {
+            return Err(problem("carries credentials; use authorization_env"));
+        }
+        // Without credentials the authority is the host and, when it is
+        // longer, a `:` and the port.
+        if authority.as_str().len() > host.len() && uri.port_u16().is_none() {
+            return Err(problem("has an invalid port"));
+        }
+        // `Uri` keeps a query but discards a fragment, so both are read off
+        // the text.
+        if endpoint.contains(['?', '#']) {
+            return Err(problem("has a query or fragment"));
+        }
+        let trimmed = endpoint.trim_end_matches('/').len();
+        self.otlp_endpoint.truncate(trimmed);
+        if self.interval_secs == 0 {
+            return Err("telemetry.interval_secs is 0".to_owned());
+        }
+        if self.interval_secs > MAX_INTERVAL_SECS {
+            return Err(format!(
+                "telemetry.interval_secs is above {MAX_INTERVAL_SECS}"
+            ));
+        }
+        if self.authorization_env.as_deref() == Some("") {
+            return Err("telemetry.authorization_env is empty".to_owned());
+        }
+        Ok(())
+    }
 }
 
 /// The forge to build.
@@ -212,6 +292,12 @@ impl Config {
         {
             return Err("forge.status_issue needs journal".to_owned());
         }
+        if let Some(telemetry) = &mut config.telemetry {
+            if config.journal.is_none() {
+                return Err("telemetry needs journal".to_owned());
+            }
+            telemetry.validate()?;
+        }
         for path in [&mut config.journal, &mut config.events]
             .into_iter()
             .flatten()
@@ -337,6 +423,7 @@ kind = "all-at-once"
             Config {
                 journal: None,
                 events: None,
+                telemetry: None,
                 forge: ForgeConfig::Mock {
                     scenario: PathBuf::from("conf/scenario.toml"),
                 },
@@ -387,6 +474,148 @@ kind = "all-at-once"
         )
         .unwrap_err();
         assert_eq!(error, "events needs journal");
+    }
+
+    /// [`VALID`] with a journal and a `[telemetry]` table holding `body`.
+    fn with_telemetry(base: &str, body: &str) -> String {
+        format!("journal = \"q.journal\"\n{base}\n[telemetry]\n{body}")
+    }
+
+    fn telemetry_of(text: &str) -> TelemetryConfig {
+        Config::parse(text, Path::new("conf"))
+            .unwrap()
+            .telemetry
+            .unwrap()
+    }
+
+    #[test]
+    fn telemetry_parses_under_either_forge_and_is_absent_unless_set() {
+        assert_eq!(Config::parse(VALID, Path::new("")).unwrap().telemetry, None);
+        let body = "otlp_endpoint = \"http://127.0.0.1:4318\"\ninterval_secs = 60\n";
+        let expected = TelemetryConfig {
+            otlp_endpoint: "http://127.0.0.1:4318".to_owned(),
+            interval_secs: 60,
+            authorization_env: None,
+        };
+        assert_eq!(telemetry_of(&with_telemetry(VALID, body)), expected);
+        assert_eq!(telemetry_of(&with_telemetry(GITHUB, body)), expected);
+        let authorised = with_telemetry(
+            GITHUB,
+            &format!("{body}authorization_env = \"DORFQ_OTLP_AUTHORIZATION\"\n"),
+        );
+        assert_eq!(
+            telemetry_of(&authorised).authorization_env.as_deref(),
+            Some("DORFQ_OTLP_AUTHORIZATION")
+        );
+    }
+
+    #[test]
+    fn telemetry_endpoint_keeps_its_path_and_loses_a_trailing_slash() {
+        for (given, kept) in [
+            ("https://otlp.example/otlp/", "https://otlp.example/otlp"),
+            ("http://collector:4318//", "http://collector:4318"),
+            ("http://collector/", "http://collector"),
+            ("http://[::1]:4318", "http://[::1]:4318"),
+        ] {
+            let text = with_telemetry(
+                VALID,
+                &format!("otlp_endpoint = {given:?}\ninterval_secs = 1\n"),
+            );
+            assert_eq!(telemetry_of(&text).otlp_endpoint, kept, "{given}");
+        }
+    }
+
+    #[test]
+    fn telemetry_without_a_journal_is_rejected_naming_both() {
+        let text =
+            format!("{VALID}\n[telemetry]\notlp_endpoint = \"http://host\"\ninterval_secs = 60\n");
+        assert_eq!(rejected(&text), "telemetry needs journal");
+    }
+
+    #[test]
+    fn telemetry_endpoint_that_is_no_usable_url_is_rejected_saying_why() {
+        for (endpoint, reason) in [
+            ("http://ho st", "is not a URL: "),
+            ("ftp://host", "is not an http:// or https:// URL"),
+            ("host:4318", "is not an http:// or https:// URL"),
+            ("http://:4318", "has no host"),
+            ("http://host:99999", "has an invalid port"),
+            ("http://host:", "has an invalid port"),
+        ] {
+            let message = rejected(&with_telemetry(
+                VALID,
+                &format!("otlp_endpoint = {endpoint:?}\ninterval_secs = 60\n"),
+            ));
+            let prefix = format!("telemetry.otlp_endpoint {endpoint:?} {reason}");
+            assert!(message.starts_with(&prefix), "{endpoint}: {message}");
+        }
+    }
+
+    #[test]
+    fn telemetry_endpoint_that_may_carry_a_secret_is_rejected_without_echoing_it() {
+        for (endpoint, reason) in [
+            (
+                "http://u:secret@host",
+                "carries credentials; use authorization_env",
+            ),
+            ("ftp://u:secret@host", "is not an http:// or https:// URL"),
+            ("http://u:sec ret@host", "is not a URL: "),
+            ("http://host/?api-key=secret", "has a query or fragment"),
+            ("http://host/#secret", "has a query or fragment"),
+        ] {
+            let message = rejected(&with_telemetry(
+                VALID,
+                &format!("otlp_endpoint = {endpoint:?}\ninterval_secs = 60\n"),
+            ));
+            let prefix = format!("telemetry.otlp_endpoint {reason}");
+            assert!(message.starts_with(&prefix), "{endpoint}: {message}");
+            assert!(!message.contains("secret"), "{endpoint}: {message}");
+        }
+    }
+
+    #[test]
+    fn telemetry_interval_out_of_range_and_empty_variable_are_rejected() {
+        let endpoint = "otlp_endpoint = \"http://host\"\n";
+        assert_eq!(
+            rejected(&with_telemetry(
+                VALID,
+                &format!("{endpoint}interval_secs = 0\n")
+            )),
+            "telemetry.interval_secs is 0"
+        );
+        for interval in [MAX_INTERVAL_SECS + 1, i64::MAX as u64] {
+            assert_eq!(
+                rejected(&with_telemetry(
+                    VALID,
+                    &format!("{endpoint}interval_secs = {interval}\n")
+                )),
+                "telemetry.interval_secs is above 86400"
+            );
+        }
+        let at_most = format!("{endpoint}interval_secs = {MAX_INTERVAL_SECS}\n");
+        let config = Config::parse(&with_telemetry(VALID, &at_most), Path::new("")).unwrap();
+        assert_eq!(
+            config.telemetry.map(|t| t.interval_secs),
+            Some(MAX_INTERVAL_SECS)
+        );
+        assert_eq!(
+            rejected(&with_telemetry(
+                VALID,
+                &format!("{endpoint}interval_secs = 1\nauthorization_env = \"\"\n")
+            )),
+            "telemetry.authorization_env is empty"
+        );
+    }
+
+    #[test]
+    fn telemetry_unknown_or_missing_field_is_rejected_naming_it() {
+        let message = rejected(&with_telemetry(
+            VALID,
+            "otlp_endpoint = \"http://host\"\ninterval_sec = 60\n",
+        ));
+        assert!(message.contains("interval_sec"), "{message}");
+        let message = rejected(&with_telemetry(VALID, "interval_secs = 60\n"));
+        assert!(message.contains("otlp_endpoint"), "{message}");
     }
 
     #[test]

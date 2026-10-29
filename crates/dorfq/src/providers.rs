@@ -202,8 +202,7 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
         } => {
             let secret = webhook.as_ref().map(webhook_secret).transpose()?;
             let auth = github_auth(auth)?;
-            let user_agent = format!("dorfq/{}", crate::version());
-            let client = RestClient::new(api_base, owner, repo, auth, &user_agent);
+            let client = RestClient::new(api_base, owner, repo, auth, &crate::user_agent());
             let settings = config
                 .github_settings()
                 .expect("a GitHub forge configuration has GitHub settings");
@@ -266,7 +265,7 @@ fn webhook_secret(webhook: &WebhookConfig) -> Result<String, ProviderError> {
 
 /// The value of environment variable `var`; `None` when it is unset, empty
 /// or not UTF-8.
-fn env_secret(var: &str) -> Option<String> {
+pub(crate) fn env_secret(var: &str) -> Option<String> {
     env::var(var).ok().filter(|value| !value.is_empty())
 }
 

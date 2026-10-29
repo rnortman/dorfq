@@ -1,5 +1,5 @@
 {
-  "checksum": "b907d761c3daa7f9681b5e30bb00eca04712a9d01357e185c391d80e876b62d2",
+  "checksum": "f67755b0f99fa35aa69862b920f4b378a724e31b0f16c00cdc3326640ea2075c",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -869,6 +869,10 @@
           {
             "id": "toml 1.1.8+spec-1.1.0",
             "target": "toml"
+          },
+          {
+            "id": "ureq 3.5.0",
+            "target": "ureq"
           }
         ],
         "edition": "2024"

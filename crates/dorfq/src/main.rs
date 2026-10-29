@@ -3,13 +3,13 @@
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use dorfq::config::Config;
 use dorfq::driver::{Driver, DriverError, TickReport};
 use dorfq::journal::{self, Header, status};
 use dorfq::providers::{self, Outcome};
+use dorfq::unix_now;
 use dorfq_core::Observation;
 
 #[derive(Parser)]
@@ -258,12 +258,4 @@ fn print_report(report: &TickReport, printed: &mut Option<Observation>) {
         println!("{report}");
         *printed = Some(report.observation.clone());
     }
-}
-
-/// The host clock, Unix seconds.
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the host clock is after 1970")
-        .as_secs()
 }
