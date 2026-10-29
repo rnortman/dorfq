@@ -100,6 +100,8 @@ pub struct State {
     /// The pause the next [`GitHubApi::rate_limit_pause`] reports, as a
     /// rate-limited response would have recorded it; taken by that call.
     pub rate_limit_pause: Option<SystemTime>,
+    /// What [`GitHubApi::rate_limit_remaining`] reports.
+    pub rate_limit_remaining: Option<u64>,
     /// Every call, as `"<method> <arguments>"`.
     pub calls: Vec<String>,
     /// Failures to inject: method, a substring of the call's arguments,
@@ -794,6 +796,10 @@ impl GitHubApi for FakeGitHub {
     fn rate_limit_pause(&mut self) -> Option<SystemTime> {
         self.state().rate_limit_pause.take()
     }
+
+    fn rate_limit_remaining(&self) -> Option<u64> {
+        self.state().rate_limit_remaining
+    }
 }
 
 mod tests {
@@ -813,5 +819,13 @@ mod tests {
         assert_eq!(fake.compare(&trunk_now, &ahead).unwrap().merge_base, fork);
         assert_eq!(fake.compare(&trunk, &trunk_now).unwrap().merge_base, trunk);
         assert_eq!(fake.compare(&head, &ahead).unwrap().merge_base, head);
+    }
+
+    #[test]
+    fn rate_limit_remaining_is_what_the_state_holds() {
+        let fake = FakeGitHub::new();
+        assert_eq!(fake.rate_limit_remaining(), None);
+        fake.state().rate_limit_remaining = Some(12);
+        assert_eq!(fake.rate_limit_remaining(), Some(12));
     }
 }

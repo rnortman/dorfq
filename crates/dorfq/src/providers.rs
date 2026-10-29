@@ -15,7 +15,7 @@ use dorfq_core::{
     BatchId, BatchStart, EjectReason, Forge, ForgeError, NoticeReason, Observation, PrNumber,
     Scheduler,
 };
-use dorfq_forge_github::api::{ApiError, Auth, RestClient};
+use dorfq_forge_github::api::{ApiError, Auth, GitHubApi, RestClient};
 use dorfq_forge_github::app::AppKey;
 use dorfq_forge_github::webhook::{Hint, Listener};
 use dorfq_forge_github::{GitHubForge, Settings, system_clock};
@@ -114,6 +114,18 @@ pub struct BuiltForge {
     /// Hands the forge a new status body to write to the status issue:
     /// `Some` for the GitHub forge with `status_issue` set, `None` otherwise.
     pub status: Option<Box<dyn FnMut(String)>>,
+    /// Reads what the forge knows that no observation carries: `Some` for
+    /// the GitHub forge, `None` otherwise.
+    pub gauges: Option<Box<dyn FnMut() -> ForgeGauges>>,
+}
+
+/// What the GitHub forge knows that no observation carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForgeGauges {
+    /// Labelled but not enqueued at the latest observation.
+    pub blocked_prs: u64,
+    /// The last `x-ratelimit-remaining` GitHub reported; `None` when unknown.
+    pub rate_limit_remaining: Option<u64>,
 }
 
 /// How a tick ended, for [`BuiltForge::wait`].
@@ -177,6 +189,7 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
                 has_scheduled_events: Box::new(move || mock.borrow().awaiting_arrivals()),
                 wait: Box::new(|_| {}),
                 status: None,
+                gauges: None,
             })
         }
         ForgeConfig::GitHub {
@@ -201,32 +214,47 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
                 }
                 None => None,
             };
-            let status_issue = settings.status_issue;
-            let forge = GitHubForge::new(
-                Box::new(client),
-                settings,
-                Box::new(system_clock),
-                Box::new(io::stdout()),
-                hints,
-            )
-            .map_err(ProviderError::GitHub)?;
-            let forge = Rc::new(RefCell::new(forge));
-            let waiting = Rc::clone(&forge);
-            let status = status_issue.map(|_| {
-                let publishing = Rc::clone(&forge);
-                Box::new(move |body| publishing.borrow_mut().publish_status(body))
-                    as Box<dyn FnMut(String)>
-            });
-            Ok(BuiltForge {
-                forge: Box::new(Shared(forge)),
-                has_scheduled_events: Box::new(|| false),
-                wait: Box::new(move |outcome| {
-                    waiting.borrow_mut().wait(outcome == Outcome::Transient)
-                }),
-                status,
-            })
+            github(Box::new(client), settings, hints)
         }
     }
+}
+
+/// Builds the GitHub forge over `api` and the handles on it.
+fn github(
+    api: Box<dyn GitHubApi>,
+    settings: Settings,
+    hints: Option<Receiver<Hint>>,
+) -> Result<BuiltForge, ProviderError> {
+    let status_issue = settings.status_issue;
+    let forge = GitHubForge::new(
+        api,
+        settings,
+        Box::new(system_clock),
+        Box::new(io::stdout()),
+        hints,
+    )
+    .map_err(ProviderError::GitHub)?;
+    let forge = Rc::new(RefCell::new(forge));
+    let waiting = Rc::clone(&forge);
+    let reading = Rc::clone(&forge);
+    let gauges = Box::new(move || {
+        let forge = reading.borrow();
+        ForgeGauges {
+            blocked_prs: forge.blocked_prs() as u64,
+            rate_limit_remaining: forge.rate_limit_remaining(),
+        }
+    }) as Box<dyn FnMut() -> ForgeGauges>;
+    let status = status_issue.map(|_| {
+        let publishing = Rc::clone(&forge);
+        Box::new(move |body| publishing.borrow_mut().publish_status(body)) as Box<dyn FnMut(String)>
+    });
+    Ok(BuiltForge {
+        forge: Box::new(Shared(forge)),
+        has_scheduled_events: Box::new(|| false),
+        wait: Box::new(move |outcome| waiting.borrow_mut().wait(outcome == Outcome::Transient)),
+        status,
+        gauges: Some(gauges),
+    })
 }
 
 /// The webhook secret from the environment variable `webhook` names.
@@ -296,6 +324,15 @@ pub fn scheduler(config: &SchedulerConfig) -> Box<dyn Scheduler> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::time::SystemTime;
+
+    use dorfq_core::Sha;
+    use dorfq_forge_github::api::{
+        CheckResult, Commit, Compare, IssueDetail, Merge, OpenPr, PrDetail, RefEntry, RefUpdate,
+        RulesetId, RunId, WorkflowRun,
+    };
+
     use super::*;
     use crate::config::RefreshConfig;
 
@@ -478,11 +515,136 @@ mod tests {
         .unwrap();
         let mut built = forge(&ForgeConfig::Mock { scenario }).unwrap();
         assert!(built.status.is_none());
+        assert!(built.gauges.is_none());
         assert!((built.has_scheduled_events)());
         built.forge.observe().unwrap();
         assert!((built.has_scheduled_events)());
         built.forge.observe().unwrap();
         assert!(!(built.has_scheduled_events)());
+    }
+
+    /// A repository whose trunk and label exist and that answers nothing
+    /// else: enough for the forge to start.
+    struct StartableRepo {
+        remaining: Option<u64>,
+    }
+
+    const NOT_AT_STARTUP: &str = "the forge asks only for the trunk and the label at startup";
+
+    impl GitHubApi for StartableRepo {
+        fn get_ref(&mut self, _: &str) -> Result<Option<Sha>, ApiError> {
+            Ok(Some(Sha::parse(&"a".repeat(40)).unwrap()))
+        }
+        fn list_refs(&mut self, _: &str) -> Result<Vec<RefEntry>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn create_ref(&mut self, _: &str, _: &Sha) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn update_ref(&mut self, _: &str, _: &Sha, _: bool) -> Result<RefUpdate, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn delete_ref(&mut self, _: &str) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn get_commit(&mut self, _: &Sha) -> Result<Commit, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn create_commit(&mut self, _: &str, _: &Sha, _: &[Sha]) -> Result<Sha, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn merge(&mut self, _: &str, _: &Sha, _: &str) -> Result<Merge, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn is_ancestor(&mut self, _: &Sha, _: &Sha) -> Result<bool, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn compare(&mut self, _: &Sha, _: &Sha) -> Result<Compare, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn list_labelled(&mut self, _: &str) -> Result<Vec<PrNumber>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn open_pr_with_head(&mut self, _: &str) -> Result<Option<OpenPr>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn get_pr(&mut self, _: PrNumber) -> Result<PrDetail, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn set_base(&mut self, _: PrNumber, _: &str) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn merged_pr_heads(&mut self, _: &str, _: &str) -> Result<Vec<Sha>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn checks(&mut self, _: &Sha) -> Result<Vec<CheckResult>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn remove_label(&mut self, _: PrNumber, _: &str) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn list_comments(&mut self, _: PrNumber) -> Result<Vec<String>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn create_comment(&mut self, _: PrNumber, _: &str) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn get_issue(&mut self, _: u64) -> Result<Option<IssueDetail>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn set_issue_body(&mut self, _: u64, _: &str) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn label_exists(&mut self, _: &str) -> Result<bool, ApiError> {
+            Ok(true)
+        }
+        fn find_ruleset(
+            &mut self,
+            _: &str,
+        ) -> Result<Option<(RulesetId, BTreeSet<String>)>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn create_ruleset(&mut self, _: &str, _: &BTreeSet<String>) -> Result<RulesetId, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn update_ruleset(&mut self, _: RulesetId, _: &BTreeSet<String>) -> Result<bool, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn delete_ruleset(&mut self, _: RulesetId) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn list_runs(&mut self, _: &Sha) -> Result<Vec<WorkflowRun>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn cancel_run(&mut self, _: RunId) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn rate_limit_pause(&mut self) -> Option<SystemTime> {
+            None
+        }
+        fn rate_limit_remaining(&self) -> Option<u64> {
+            self.remaining
+        }
+    }
+
+    #[test]
+    fn github_gauges_read_the_forge() {
+        let settings = github_app(PathBuf::from("unused.pem"))
+            .github_settings()
+            .unwrap();
+        let api = StartableRepo {
+            remaining: Some(4321),
+        };
+        let built = github(Box::new(api), settings, None).unwrap();
+        assert!(built.status.is_none());
+        let mut gauges = built.gauges.expect("the GitHub forge has gauges");
+        assert_eq!(
+            gauges(),
+            ForgeGauges {
+                blocked_prs: 0,
+                rate_limit_remaining: Some(4321),
+            }
+        );
     }
 
     #[test]

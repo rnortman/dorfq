@@ -93,6 +93,10 @@ pub trait GitHubApi {
     /// latest rate-limited response since the last call said; cleared by
     /// the call. Not a request.
     fn rate_limit_pause(&mut self) -> Option<SystemTime>;
+    /// `x-ratelimit-remaining` of the latest response to a repository
+    /// request; `None` before one, or when it carried none readable. Not a
+    /// request.
+    fn rate_limit_remaining(&self) -> Option<u64>;
 }
 
 /// A repository ruleset's id.
@@ -342,6 +346,12 @@ impl HttpResponse {
             .map(|(_, v)| v.as_str())
     }
 
+    /// The header read as a whole number, surrounding whitespace ignored;
+    /// `None` when absent or not a whole number.
+    fn header_u64(&self, name: &str) -> Option<u64> {
+        self.header(name).and_then(|v| v.trim().parse().ok())
+    }
+
     fn json(&self, what: &str) -> Result<Value, ApiError> {
         if self.body.is_empty() {
             return Ok(Value::Null);
@@ -427,6 +437,9 @@ pub struct RestClient {
     /// The end of the latest rate-limit pause a response asked for, until
     /// [`GitHubApi::rate_limit_pause`] takes it.
     paused_until: Option<SystemTime>,
+    /// `x-ratelimit-remaining` of the latest response to a repository
+    /// request, when it carried a whole number.
+    remaining: Option<u64>,
 }
 
 const PER_PAGE: &str = "per_page=100";
@@ -489,6 +502,7 @@ impl RestClient {
             transport,
             now,
             paused_until: None,
+            remaining: None,
         }
     }
 
@@ -509,6 +523,7 @@ impl RestClient {
             transport,
             now: clock,
             paused_until,
+            remaining: _,
         } = self;
         let (key, repo, installation, token) = match credential {
             Credential::Token(bearer) => return Ok(bearer.clone()),
@@ -632,6 +647,7 @@ impl RestClient {
             &authorization,
             body,
         )?;
+        self.remaining = response.header_u64("x-ratelimit-remaining");
         if response.status == 401 && matches!(self.credential, Credential::App { .. }) {
             return Err(permanent(format!(
                 "{method} {path}: HTTP 401: {} ({INSTALLATION_TOKEN_REJECTED})",
@@ -1106,6 +1122,10 @@ impl GitHubApi for RestClient {
     fn rate_limit_pause(&mut self) -> Option<SystemTime> {
         self.paused_until.take()
     }
+
+    fn rate_limit_remaining(&self) -> Option<u64> {
+        self.remaining
+    }
 }
 
 /// The body of the queue's ruleset, less its name: an active branch
@@ -1312,7 +1332,7 @@ fn rate_limit(response: &HttpResponse) -> Option<RateLimit> {
     // what it is.
     let rate_limited = status == 429
         || status == 403
-            && (response.header("x-ratelimit-remaining") == Some("0")
+            && (response.header_u64("x-ratelimit-remaining") == Some(0)
                 || response.header("retry-after").is_some()
                 || github_message(response)
                     .to_ascii_lowercase()
@@ -1320,16 +1340,14 @@ fn rate_limit(response: &HttpResponse) -> Option<RateLimit> {
     if !rate_limited {
         return None;
     }
-    let seconds = |name| {
-        response
-            .header(name)
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    };
     // Every response carries `x-ratelimit-reset`, the primary window's end;
     // it says when requests may resume only once that window is exhausted.
-    let exhausted = response.header("x-ratelimit-remaining") == Some("0");
+    let exhausted = response.header_u64("x-ratelimit-remaining") == Some(0);
     Some(
-        match (seconds("retry-after"), seconds("x-ratelimit-reset")) {
+        match (
+            response.header_u64("retry-after"),
+            response.header_u64("x-ratelimit-reset"),
+        ) {
             (Some(after), _) => RateLimit::After(after),
             (None, Some(reset)) if exhausted => RateLimit::ResetAt(reset),
             (None, _) => RateLimit::Unstated,

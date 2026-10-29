@@ -931,6 +931,17 @@ impl GitHubForge {
         }
     }
 
+    /// The pull requests labelled but not enqueued at the latest successful
+    /// observation: the ones told they are blocked. 0 before the first.
+    pub fn blocked_prs(&self) -> usize {
+        self.told.len()
+    }
+
+    /// See [`GitHubApi::rate_limit_remaining`].
+    pub fn rate_limit_remaining(&self) -> Option<u64> {
+        self.api.rate_limit_remaining()
+    }
+
     /// Moves the rate-limit pause the API client recorded into the schedule,
     /// then writes the pending status body through [`Self::send`] if one is
     /// due and no pause is in force; a clock that cannot be read counts it as

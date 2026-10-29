@@ -5351,3 +5351,35 @@ fn without_ci_retire_makes_no_actions_call() {
     assert!(fake.calls_to(&["list_runs", "cancel_run"]).is_empty());
     assert!(!fake.run_completed(run));
 }
+
+#[test]
+fn blocked_prs_counts_the_latest_successful_observations_blocked_set() {
+    let fake = FakeGitHub::new();
+    ready_pr(&fake, 1);
+    ready_pr(&fake, 2);
+    ready_pr(&fake, 3);
+    fake.pr(2).base = "release".to_owned();
+    fake.pr(3).base = "release".to_owned();
+    let (mut forge, _) = forge(&fake);
+    assert_eq!(forge.blocked_prs(), 0, "before the first observation");
+
+    forge.observe().unwrap();
+    assert_eq!(forge.blocked_prs(), 2);
+
+    fake.pr(3).base = "main".to_owned();
+    fake.fail("get_ref", Failure::Transient);
+    assert!(matches!(forge.observe(), Err(ForgeError::Transient(_))));
+    assert_eq!(forge.blocked_prs(), 2, "a failed observation keeps it");
+
+    forge.observe().unwrap();
+    assert_eq!(forge.blocked_prs(), 1);
+}
+
+#[test]
+fn rate_limit_remaining_reads_the_api_clients() {
+    let fake = FakeGitHub::new();
+    let (forge, _) = forge(&fake);
+    assert_eq!(forge.rate_limit_remaining(), None);
+    fake.state().rate_limit_remaining = Some(4321);
+    assert_eq!(forge.rate_limit_remaining(), Some(4321));
+}

@@ -985,6 +985,18 @@ fn a_rate_limited_response_records_when_requests_may_resume() {
             ),
             paused_at(1_792_000_000),
         ),
+        // A padded `x-ratelimit-remaining` still counts as exhausted.
+        (
+            limited(
+                403,
+                "Forbidden",
+                &[
+                    ("x-ratelimit-remaining", " 0 "),
+                    ("x-ratelimit-reset", "1792000000"),
+                ],
+            ),
+            paused_at(1_792_000_000),
+        ),
         // Both: `retry-after` wins.
         (
             limited(
@@ -1906,4 +1918,98 @@ fn a_refused_actions_call_names_the_permission_unless_rate_limited() {
     assert!(named(&error), "{error}");
     let error = api.list_runs(&sha(A)).unwrap_err();
     assert!(is_transient(&error), "{error}");
+}
+
+/// A `GET /labels/queue` answer carrying `x-ratelimit-remaining: remaining`.
+fn label_remaining(remaining: &str) -> Canned {
+    let mut c = ok(json!({ "name": "queue" }));
+    c.headers
+        .push(("x-ratelimit-remaining", remaining.to_owned()));
+    c
+}
+
+#[test]
+fn the_latest_repository_response_says_how_many_requests_remain() {
+    let mut api = labels_client(
+        0,
+        vec![
+            label_remaining("4999"),
+            ok(json!({ "name": "queue" })),
+            label_remaining("abc"),
+            label_remaining(" 17 "),
+        ],
+    );
+    assert_eq!(api.rate_limit_remaining(), None, "before any request");
+    api.label_exists("queue").unwrap();
+    assert_eq!(api.rate_limit_remaining(), Some(4999));
+    api.label_exists("queue").unwrap();
+    assert_eq!(api.rate_limit_remaining(), None, "no header");
+    api.label_exists("queue").unwrap();
+    assert_eq!(api.rate_limit_remaining(), None, "not a whole number");
+    api.label_exists("queue").unwrap();
+    assert_eq!(api.rate_limit_remaining(), Some(17));
+}
+
+#[test]
+fn a_transport_failure_leaves_the_remaining_requests_as_they_were() {
+    let mut answered = false;
+    let transport: Transport = Box::new(move |_: &HttpRequest<'_>| {
+        if answered {
+            return Err(TransportError {
+                transient: true,
+                message: "connection reset".to_owned(),
+            });
+        }
+        answered = true;
+        Ok(HttpResponse {
+            status: 200,
+            headers: vec![("x-ratelimit-remaining".to_owned(), "4999".to_owned())],
+            body: json!({ "name": "queue" }).to_string(),
+        })
+    });
+    let mut api = RestClient::with_transport(
+        BASE,
+        "acme",
+        "widgets",
+        Auth::Token(TOKEN.to_owned()),
+        transport,
+        Box::new(SystemTime::now),
+    );
+    api.label_exists("queue").unwrap();
+    api.label_exists("queue").unwrap_err();
+    assert_eq!(api.rate_limit_remaining(), Some(4999));
+}
+
+#[test]
+fn the_app_credential_requests_do_not_set_the_remaining_requests() {
+    let with_remaining = |(key, mut canned): (String, Canned), remaining: &str| {
+        canned
+            .headers
+            .push(("x-ratelimit-remaining", remaining.to_owned()));
+        (key, canned)
+    };
+    // A mint that fails: only the app's own requests were answered.
+    let failed_mint = (
+        MINT.to_owned(),
+        limited(500, "boom", &[("x-ratelimit-remaining", "4000")]),
+    );
+    let (mut api, _) = client_with(
+        app(),
+        vec![with_remaining(installation(), "4001"), failed_mint],
+        Rc::new(Cell::new(at(1_800_000_000))),
+    );
+    api.label_exists("queue").unwrap_err();
+    assert_eq!(api.rate_limit_remaining(), None);
+
+    let (mut api, _) = client_with(
+        app(),
+        vec![
+            with_remaining(installation(), "4001"),
+            with_remaining(minted("installation-token-1"), "4000"),
+            route("GET", "/labels/queue", label_remaining("12")),
+        ],
+        Rc::new(Cell::new(at(1_800_000_000))),
+    );
+    api.label_exists("queue").unwrap();
+    assert_eq!(api.rate_limit_remaining(), Some(12));
 }
