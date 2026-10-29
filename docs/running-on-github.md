@@ -30,7 +30,7 @@ Either credential needs these repository permissions:
 
 - Contents: read/write
 - Pull requests: read/write
-- Issues: read
+- Issues: read/write — only with `status_issue`; read otherwise
 - Checks: read
 - Metadata: read
 - Workflows: read/write
@@ -43,6 +43,12 @@ the queue makes both for every queued pull request that touches CI; without
 it the first such batch stops the queue. Checks is what GitHub's permission
 reference names for listing a commit's check runs, which the queue does each
 time it reads a pull request or a testing batch.
+
+With `status_issue` set the queue edits one issue's body with Issues: write
+(see *The status issue* below). It writes that body once at start, so a
+credential without the permission stops the queue at start with GitHub's
+answer: `cannot start the GitHub forge: permanent GitHub error: PATCH
+/issues/<n>: HTTP 403: …`.
 
 With `lock_heads = true` the queue owns a repository ruleset,
 `dorfq/locked-heads`, that locks the head branch of every pull request in a
@@ -324,7 +330,7 @@ captures both under the shipped units). In order, a delivery leaves:
   `due now` or `due in <n> s` when it was read less than five seconds ago,
   or that a commit matched nothing the queue holds;
 - when a rate-limit pause, a backoff after a failure, the retry of a
-  comment post that failed, or the five-second floor holds the next tick
+  comment post or status edit that failed, or the five-second floor holds the next tick
   past the hints, `next tick in <n> s` and why;
 - when a hinted pull request the queue did not hold is read and found not
   open or not labelled, `read; not open and labelled "<label>"; not queued`;
@@ -470,8 +476,8 @@ Each line is flushed before the queue waits, so a crash loses at most the
 tick in progress. Without the key nothing is written.
 
 At start the queue reads the current segment once, line by line, so that
-the event stream it derives as it runs continues from what the segment
-recorded. The scheduler is still built fresh, as it is without a journal:
+the event stream it derives as it runs, and the status issue, continue from
+what the segment recorded. The scheduler is still built fresh, as it is without a journal:
 nothing it decided is recovered. A restart appends to the file: each
 process begins its lines with a header naming the dorfq version, the forge
 and the `[scheduler]` settings it ran with. A last line cut off by a crash is
@@ -592,6 +598,94 @@ A segment that is not a journal, or a line that does not read, stops the
 command with exit 1 and `dorfq: <path>:<line>: …` on stderr. The current
 segment's last line may be a tick still being written; it is skipped, with a
 line on stderr.
+
+## The status issue
+
+The queue can keep one issue's body as its status, for anyone who can read
+the repository's issues. Create an issue — any title; the title is yours —
+and set its number under `[forge]`:
+
+```toml
+journal = "dorfq.journal"
+
+[forge]
+# ...
+status_issue = 12
+```
+
+`status_issue` needs `journal`: the body is drawn from the event stream the
+queue derives as it journals. It is refused at load without `journal`, as 0,
+and under the mock forge. The credential needs Issues: read/write. At start
+the queue reads the issue and stops, naming it, if there is no such issue or
+the number is a pull request's; it then writes a starting body saying the
+queue has started and has not observed the repository yet. A failure of
+either stops the queue at start with GitHub's answer, before the first tick.
+
+The body begins with the marker line `<!-- dorfq: status -->` and shows:
+
+- one line: the dorfq version, when this process started, when the body last
+  changed, and how many pull requests are queued and batches in flight;
+- **Queue**: each queued pull request, oldest arrival first, linked by
+  number, the pull request it is stacked on, its status as the tick line
+  words it (`ready`, `waiting:<holds>`, `conflicting:<with>`), how long it
+  has been in that status, how long it has been queued and the batch
+  holding it;
+- **Batches in flight**: each batch, what it was built on, its members, its
+  state and how long it has run;
+- **Last 24 hours**: landings, ejections, refusals and runs passed, failed
+  and cancelled; the median and 95th percentile of batch run time and of the
+  time from arrival to landing; and the events a reader cares about, newest
+  first — landings, ejections and their reasons, failed runs, refused
+  landings, notices, pull requests merged outside the queue, withdrawn, left
+  or lost, batches that could not be built or were cancelled, trunk moved by
+  another hand, restarts and errors. A figure counts what ended in the last
+  24 hours of the forge's clock.
+
+Times are UTC, the date left out on the day of the last change. No titles,
+no logins and nothing from the credential are written: GitHub shows a
+linked pull request's title on hover.
+
+The body is rewritten only when what it shows changes — an arrival, a push,
+a status change, a batch starting, a verdict, a landing, an ejection, a
+notice, an error, an event leaving the 24-hour window — and at most once in
+30 seconds: a change inside that interval is written at the first tick after
+it, and only the newest body is written. Nothing is written during a
+rate-limit pause GitHub announced; the newest body goes out at the first
+tick after the pause ends. The queue owns the body: an edit by hand is
+overwritten at the next change. Edit the title instead.
+
+A failed edit never stops the queue. A transient failure keeps the body and
+retries it with the comment outbox's backoff, 5 seconds doubling to a
+minute, a newer body taking its place: `dorfq: kept the status body for
+issue #<n>: <error>; retrying` on stderr; the queue wakes for the retry,
+and a hint arriving before it writes `next tick in <n> s: writing the status
+issue`. Any other failure —
+the issue deleted or transferred, issues disabled, the body refused — drops
+the body: `dorfq: dropped the status body for issue #<n>: <error>`; the next
+change tries again.
+
+The body says when it last changed, not whether the queue is running: a
+queue that stopped leaves its last body in place. A fatal error is not
+written to it — the error is in the journal and on stderr, and the next
+process's body shows it — and a change held by the 30-second limit when the
+queue stops is never written. A quiet queue changes
+nothing, so a body hours old is not by itself a sign the queue has stopped.
+
+After a restart the body continues from what the current journal segment
+recorded: each queued pull request keeps its arrival and the time it entered
+its status, each batch its start, and the window the events since the
+segment began. The segment begins at the last time the queue went idle, or
+at the last 64 MiB rotation, so a restart forgets what happened before
+that; while that is inside the window the body says `the record begins
+<time>; earlier events are in the closed journal segments`, and `dorfq
+journal` over the closed segments has the rest. After a 64 MiB rotation a
+pull request queued across it reads as queued from the rotation.
+
+GitHub accepts a body of at most 65,536 characters, and the queue keeps its
+own under 60,000. A body over that loses, in order, the oldest rows of the
+event table, then the event table itself (the figure lines stay), then the
+queue table's newest rows, replaced by `… and N more`. The batches table is
+never cut.
 
 ## Stacks
 

@@ -24,6 +24,7 @@ use events::{Event, Fold};
 
 pub mod events;
 pub mod report;
+pub mod status;
 pub mod summary;
 
 /// The format number this build writes.
@@ -569,11 +570,7 @@ impl Writer {
             message: error.to_string(),
             fatal: error.is_fatal(),
         });
-        let report = match outcome {
-            Ok(report) => Some(report),
-            Err(DriverError::Effect { report, .. }) => Some(&**report),
-            Err(_) => None,
-        };
+        let report = outcome.as_ref().map_or_else(DriverError::report, Some);
         let idle_after_busy = report.is_some_and(|r| r.idle) && self.busy;
         match (report, &failure) {
             (Some(report), None) if self.last.as_ref().is_some_and(|last| report.repeats(last)) => {

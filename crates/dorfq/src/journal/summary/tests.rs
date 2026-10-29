@@ -96,7 +96,7 @@ fn step(t: u64) -> Event {
 }
 
 /// Every name of the summary, from one hand-built stream over three hours.
-fn stream() -> Vec<Event> {
+pub(in crate::journal) fn stream() -> Vec<Event> {
     vec![
         arrive(0, 1),
         arrive(0, 2),

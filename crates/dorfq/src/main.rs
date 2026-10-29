@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand};
 use dorfq::config::Config;
 use dorfq::driver::{Driver, DriverError, TickReport};
-use dorfq::journal::{self, Header};
+use dorfq::journal::{self, Header, status};
 use dorfq::providers::{self, Outcome};
 use dorfq_core::Observation;
 
@@ -143,7 +143,9 @@ fn read_journal(verb: Verb) -> ExitCode {
 /// plans something, or observes something other than the last one printed
 /// did, the time aside; a tick whose plan an effect error cut short is
 /// printed by the same rule, before the error. With a journal configured,
-/// every tick is journaled, a fatal one before the exit.
+/// every tick is journaled, a fatal one before the exit; with a status
+/// issue as well, each tick that changes the status document hands the
+/// forge its new body.
 fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
     let config = match Config::load(config) {
         Ok(config) => config,
@@ -152,11 +154,24 @@ fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let started = unix_now();
+    // The status structure exists before the forge, so the journal's seed
+    // can feed it; the configuration refuses `status_issue` without
+    // `journal` and under the mock.
+    let mut live = config
+        .forge
+        .github_settings()
+        .and_then(|settings| settings.status_issue)
+        .map(|_| status::Live::new());
     let mut journal = match &config.journal {
         None => None,
         Some(path) => {
-            let header = Header::start(config.forge.kind(), &config.scheduler, unix_now());
-            match journal::Writer::open(path, header, config.events.as_deref(), &mut |_, _| {}) {
+            let header = Header::start(config.forge.kind(), &config.scheduler, started);
+            let seed: journal::Sink<'_> = match &mut live {
+                Some(live) => &mut |observation, events| live.seed(observation, events),
+                None => &mut |_, _| {},
+            };
+            match journal::Writer::open(path, header, config.events.as_deref(), seed) {
                 Ok((writer, notes)) => {
                     for note in notes {
                         eprintln!("dorfq: {note}");
@@ -177,6 +192,13 @@ fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let mut live = live.map(|live| {
+        let publish = built
+            .status
+            .take()
+            .expect("a GitHub forge with status_issue hands over a status handle");
+        (live, publish)
+    });
     // TODO(journal-recovery): replay the current segment's observations
     // through this scheduler before the first live tick.
     let mut scheduler = providers::scheduler(&config.scheduler);
@@ -189,24 +211,34 @@ fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
         let ticked = driver.tick();
         // The outcome is printed before it is journaled, so a journal that
         // cannot be written loses nothing from stdout and stderr.
-        match &ticked {
-            Ok(report) => print_report(report, &mut printed),
-            Err(error) => {
-                if let DriverError::Effect { report, .. } = error {
-                    print_report(report, &mut printed);
-                }
-                if error.is_fatal() {
-                    eprintln!("dorfq: {error}");
-                } else {
-                    eprintln!("dorfq: {error}; retrying");
-                }
+        let report = ticked.as_ref().map_or_else(DriverError::report, Some);
+        if let Some(report) = report {
+            print_report(report, &mut printed);
+        }
+        if let Err(error) = &ticked {
+            if error.is_fatal() {
+                eprintln!("dorfq: {error}");
+            } else {
+                eprintln!("dorfq: {error}; retrying");
             }
         }
-        if let Some(writer) = &mut journal
-            && let Err(error) = writer.record(driver.ticks() - 1, unix_now(), &ticked)
-        {
-            eprintln!("dorfq: {error}");
-            return ExitCode::FAILURE;
+        if let Some(writer) = &mut journal {
+            let events = match writer.record(driver.ticks() - 1, unix_now(), &ticked) {
+                Ok(events) => events,
+                Err(error) => {
+                    eprintln!("dorfq: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            // A fatal tick exits without a status write: the body stays as
+            // last written, saying when it last changed.
+            let fatal = ticked.as_ref().is_err_and(DriverError::is_fatal);
+            if let Some((live, publish)) = live.as_mut().filter(|_| !fatal) {
+                live.tick(report.map(|r| &r.observation), &events);
+                if let Some(body) = live.changed(dorfq::version(), started) {
+                    publish(body);
+                }
+            }
         }
         match ticked {
             Ok(report) => {

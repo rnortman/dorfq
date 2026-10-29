@@ -81,6 +81,10 @@ pub enum ForgeConfig {
         /// intervals are the only clock.
         #[serde(default)]
         webhook: Option<WebhookConfig>,
+        /// The number of an issue whose body the queue keeps as its status;
+        /// absent, no issue is edited. Needs `journal`.
+        #[serde(default)]
+        status_issue: Option<u64>,
         /// The credential the forge runs under.
         auth: AuthConfig,
     },
@@ -200,6 +204,14 @@ impl Config {
         if config.events.is_some() && config.journal.is_none() {
             return Err("events needs journal".to_owned());
         }
+        if let ForgeConfig::GitHub {
+            status_issue: Some(_),
+            ..
+        } = config.forge
+            && config.journal.is_none()
+        {
+            return Err("forge.status_issue needs journal".to_owned());
+        }
         for path in [&mut config.journal, &mut config.events]
             .into_iter()
             .flatten()
@@ -281,6 +293,7 @@ impl ForgeConfig {
             lock_heads,
             ci,
             refresh,
+            status_issue,
             ..
         } = self
         else {
@@ -298,7 +311,7 @@ impl ForgeConfig {
                 pr: Duration::from_secs(refresh.pr_secs),
                 batch: Duration::from_secs(refresh.batch_secs),
             },
-            status_issue: None,
+            status_issue: *status_issue,
         })
     }
 }
@@ -494,11 +507,69 @@ kind = "all-at-once"
                     batch_secs: 30,
                 },
                 webhook: None,
+                status_issue: None,
                 auth: AuthConfig::Token {
                     env: "DORFQ_GITHUB_TOKEN".to_owned(),
                 },
             }
         );
+    }
+
+    /// [`GITHUB`] with `status_issue = {number}` under `[forge]`, and a
+    /// journal when `journal` is set.
+    fn github_with_status_issue(number: &str, journal: bool) -> String {
+        let text = GITHUB.replace(
+            "checks = [\"check\"]\n",
+            &format!("checks = [\"check\"]\nstatus_issue = {number}\n"),
+        );
+        if journal {
+            format!("journal = \"q.journal\"\n{text}")
+        } else {
+            text
+        }
+    }
+
+    #[test]
+    fn github_status_issue_is_absent_unless_set_and_passed_through() {
+        let status_issue = |text: &str| {
+            Config::parse(text, Path::new("conf"))
+                .unwrap()
+                .forge
+                .github_settings()
+                .unwrap()
+                .status_issue
+        };
+        assert_eq!(status_issue(GITHUB), None);
+        assert_eq!(
+            status_issue(&github_with_status_issue("12", true)),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn github_status_issue_without_a_journal_is_rejected_naming_both() {
+        assert_eq!(
+            rejected(&github_with_status_issue("12", false)),
+            "forge.status_issue needs journal"
+        );
+    }
+
+    #[test]
+    fn github_status_issue_zero_is_rejected() {
+        assert_eq!(
+            rejected(&github_with_status_issue("0", true)),
+            "forge.status_issue is 0"
+        );
+    }
+
+    #[test]
+    fn a_status_issue_under_the_mock_is_rejected_naming_it() {
+        let text = VALID.replace(
+            "scenario = \"scenario.toml\"\n",
+            "scenario = \"scenario.toml\"\nstatus_issue = 12\n",
+        );
+        let message = rejected(&format!("journal = \"q.journal\"\n{text}"));
+        assert!(message.contains("status_issue"), "{message}");
     }
 
     /// [`GITHUB`] with a `[forge.webhook]` table holding `body`.

@@ -10,6 +10,9 @@
 # The tick journal: every tick's observation and plan, one JSON line each,
 # relative to this file; absent, none. See docs/running-on-github.md.
 # journal = "dorfq.journal"
+# The events file: the journal's event stream, one JSON line per event,
+# rotated with it; needs journal. See docs/running-on-github.md.
+# events = "dorfq.events"
 
 [forge]
 kind = "github"
@@ -22,6 +25,7 @@ checks = ["check"]                    # required check names on pull request hea
 # batch_checks = ["check"]            # required check names on batch tips; absent, the same as checks
 # lock_heads = true                   # lock each batched pull request's branch with a ruleset while it is batched; needs Administration: read/write
 # ci = "actions"                      # cancel a retired batch's workflow runs; needs Actions: read/write
+# status_issue = 12                   # keep this issue's body as the queue's status; needs journal and Issues: read/write; see docs/running-on-github.md
 
 # How often each entity is read unprompted, in seconds. With webhooks, as
 # here, a change reaches the queue when GitHub delivers it, and these bound

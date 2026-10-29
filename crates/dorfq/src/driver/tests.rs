@@ -335,6 +335,25 @@ fn permanent_is_returned() {
 }
 
 #[test]
+fn only_an_effect_error_carries_the_report() {
+    let report = TickReport {
+        tick: 3,
+        observation: busy_observation(),
+        plan: full_plan(),
+        idle: false,
+    };
+    let effect = DriverError::Effect {
+        report: Box::new(report.clone()),
+        error: ForgeError::Transient("flaked".into()),
+    };
+    assert_eq!(effect.report(), Some(&report));
+    let observe = DriverError::Observe(ForgeError::Transient("flaked".into()));
+    assert_eq!(observe.report(), None);
+    let scheduler = DriverError::Scheduler(SchedulerError::new("posterior underflow"));
+    assert_eq!(scheduler.report(), None);
+}
+
+#[test]
 fn a_permanent_observe_error_is_fatal() {
     let mut forge = FakeForge::new(busy_observation());
     forge.fail = Some(("observe", Kind::Permanent));

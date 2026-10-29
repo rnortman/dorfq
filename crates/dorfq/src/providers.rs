@@ -111,6 +111,9 @@ pub struct BuiltForge {
     pub has_scheduled_events: Box<dyn Fn() -> bool>,
     /// Blocks until the next tick is due, given how the last one ended.
     pub wait: Box<dyn FnMut(Outcome)>,
+    /// Hands the forge a new status body to write to the status issue:
+    /// `Some` for the GitHub forge with `status_issue` set, `None` otherwise.
+    pub status: Option<Box<dyn FnMut(String)>>,
 }
 
 /// How a tick ended, for [`BuiltForge::wait`].
@@ -173,6 +176,7 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
                 forge: Box::new(forge),
                 has_scheduled_events: Box::new(move || mock.borrow().awaiting_arrivals()),
                 wait: Box::new(|_| {}),
+                status: None,
             })
         }
         ForgeConfig::GitHub {
@@ -197,6 +201,7 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
                 }
                 None => None,
             };
+            let status_issue = settings.status_issue;
             let forge = GitHubForge::new(
                 Box::new(client),
                 settings,
@@ -207,12 +212,18 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
             .map_err(ProviderError::GitHub)?;
             let forge = Rc::new(RefCell::new(forge));
             let waiting = Rc::clone(&forge);
+            let status = status_issue.map(|_| {
+                let publishing = Rc::clone(&forge);
+                Box::new(move |body| publishing.borrow_mut().publish_status(body))
+                    as Box<dyn FnMut(String)>
+            });
             Ok(BuiltForge {
                 forge: Box::new(Shared(forge)),
                 has_scheduled_events: Box::new(|| false),
                 wait: Box::new(move |outcome| {
                     waiting.borrow_mut().wait(outcome == Outcome::Transient)
                 }),
+                status,
             })
         }
     }
@@ -323,6 +334,7 @@ mod tests {
                 batch_secs: 30,
             },
             webhook: None,
+            status_issue: None,
             auth: AuthConfig::Token {
                 env: var.to_owned(),
             },
@@ -401,6 +413,7 @@ mod tests {
                 batch_secs: 30,
             },
             webhook: None,
+            status_issue: None,
             auth: AuthConfig::App {
                 client_id: "Iv23liTEST".to_owned(),
                 private_key_file,
@@ -464,6 +477,7 @@ mod tests {
         )
         .unwrap();
         let mut built = forge(&ForgeConfig::Mock { scenario }).unwrap();
+        assert!(built.status.is_none());
         assert!((built.has_scheduled_events)());
         built.forge.observe().unwrap();
         assert!((built.has_scheduled_events)());

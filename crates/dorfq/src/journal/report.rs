@@ -47,8 +47,6 @@ struct SchedulerTable<'a> {
     scheduler: &'a Map<String, Value>,
 }
 
-// TODO(status-document): the pool now and a window of events as one
-// document, rendered to an issue and published for the page's live mode.
 /// The document for the journal `segments`, named `name`, whose first
 /// header is `header`: one policy, `name`, running the header's scheduler,
 /// with `summary` as its one replication and `events` as its trace, each
