@@ -361,7 +361,7 @@ impl Status {
 }
 
 /// A batch's state as the document words it.
-fn state(state: &BatchState) -> String {
+pub(crate) fn state(state: &BatchState) -> String {
     match state {
         BatchState::Testing {
             ci: CiStatus::Pending,

@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use super::events::{Event, Kind};
 
-pub(super) const HOUR: f64 = 3600.0;
+pub(crate) const HOUR: f64 = 3600.0;
 
 /// What a journal's events add up to; `None` where the set it summarises is
 /// empty.

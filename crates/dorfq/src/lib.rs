@@ -8,6 +8,7 @@ pub mod config;
 pub mod driver;
 pub mod journal;
 pub mod providers;
+pub mod telemetry;
 
 #[cfg(test)]
 mod e2e_tests;
