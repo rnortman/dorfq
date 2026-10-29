@@ -11,7 +11,7 @@ use dorfq_forge_mock::{Event, Message, MockForge, Scenario};
 use dorfq_scheduler::{AllAtOnce, SchedulerConfig};
 
 use crate::driver::{Driver, TickReport};
-use crate::providers::SharedMock;
+use crate::providers::Shared;
 
 /// The mock's synthetic commit `n`.
 fn sha(n: u64) -> Sha {
@@ -87,7 +87,7 @@ fn run(scenario: &str) -> Run {
 fn run_with(scenario: &str, scheduler: &mut dyn Scheduler) -> Run {
     let scenario = Scenario::from_toml(scenario).unwrap();
     let mock = Rc::new(RefCell::new(MockForge::new(scenario, Box::new(io::sink()))));
-    let mut forge = SharedMock(Rc::clone(&mock));
+    let mut forge = Shared(Rc::clone(&mock));
     let mut reports = Vec::new();
     {
         let mut driver = Driver::new(&mut forge, scheduler);

@@ -2,11 +2,14 @@
 # Install as ~/.config/systemd/user/dorfq.service, with
 #   ~/.local/bin/dorfq                  the binary from `make optimised`
 #   ~/.config/dorfq/dorfq.toml          the configuration (see ../../github.toml)
-#   ~/.config/dorfq/token.env           DORFQ_GITHUB_TOKEN=<token>, mode 0600
+#   ~/.config/dorfq/token.env           DORFQ_GITHUB_TOKEN=<token>, and with
+#                                       [forge.webhook] DORFQ_WEBHOOK_SECRET=<secret>,
+#                                       mode 0600
 # then `systemctl --user enable --now dorfq`. To keep it running while logged
 # out: `loginctl enable-linger`.
 #
-# As a GitHub App instead of a token: drop the EnvironmentFile= line, keep
+# As a GitHub App instead of a token: drop the EnvironmentFile= line unless
+# the file holds the webhook secret, keep
 #   ~/.config/dorfq/app-key.pem         the app's private key, mode 0600
 # and set in the configuration
 #   [forge.auth]

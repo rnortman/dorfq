@@ -81,8 +81,7 @@ fn unknown_kind_exits_one_naming_it() {
     let config = dir.join("unknown-kind.toml");
     fs::write(
         &config,
-        "[forge]\nkind = \"gitlab\"\n\n[scheduler]\nkind = \"all-at-once\"\n\n\
-         [driver]\ntick_millis = 0\n",
+        "[forge]\nkind = \"gitlab\"\n\n[scheduler]\nkind = \"all-at-once\"\n",
     )
     .expect("write config");
     let output = Command::new(env!("DORFQ_BIN"))
@@ -130,8 +129,7 @@ fn exit_when_idle_waits_for_a_later_arrival() {
     fs::write(
         &config,
         format!(
-            "[forge]\nkind = \"mock\"\nscenario = {:?}\n\n[scheduler]\nkind = \"all-at-once\"\n\n\
-             [driver]\ntick_millis = 0\n",
+            "[forge]\nkind = \"mock\"\nscenario = {:?}\n\n[scheduler]\nkind = \"all-at-once\"\n",
             scenario.display().to_string()
         ),
     )
@@ -147,6 +145,33 @@ fn exit_when_idle_waits_for_a_later_arrival() {
     assert!(stdout.contains("message to pr 2: landed as"), "{stdout}");
     let last = stdout.lines().last().expect("a trace");
     assert!(last.ends_with("| idle"), "last line {last:?}");
+    // Each tick line, by its number and what it shows past the time, and
+    // whether a plan follows it.
+    let lines: Vec<&str> = stdout.lines().collect();
+    let ticks: Vec<(u64, &str, bool)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let rest = line.strip_prefix("tick ")?;
+            let (number, rest) = rest.split_once(" now ")?;
+            let (_, shown) = rest.split_once(" trunk ")?;
+            let planned = lines.get(i + 1).is_some_and(|next| next.starts_with("  "));
+            Some((number.parse().expect("a tick number"), shown, planned))
+        })
+        .collect();
+    for pair in ticks.windows(2) {
+        let ((_, earlier, planned), (_, later, _)) = (pair[0], pair[1]);
+        assert!(
+            planned || earlier != later,
+            "a repeated observation was printed: {later:?} in {stdout}"
+        );
+    }
+    // The idle stretch before the arrival repeats; its ticks ran unprinted.
+    let (final_tick, _, _) = *ticks.last().expect("a tick line");
+    assert!(
+        final_tick + 1 > ticks.len() as u64,
+        "every tick was printed: {stdout}"
+    );
 }
 
 #[test]
@@ -176,8 +201,10 @@ fn github_config(file: &str, auth: &str) -> PathBuf {
         format!(
             "[forge]\nkind = \"github\"\napi_base = \"https://127.0.0.1:1\"\n\
              owner = \"alice\"\nrepo = \"widgets\"\ntrunk = \"main\"\nlabel = \"queue\"\n\
-             checks = [\"check\"]\n\n[forge.auth]\n{auth}\n\
-             [scheduler]\nkind = \"all-at-once\"\n\n[driver]\ntick_millis = 0\n"
+             checks = [\"check\"]\n\n\
+             [forge.refresh]\nlisting_secs = 60\npr_secs = 120\nbatch_secs = 30\n\n\
+             [forge.auth]\n{auth}\n\
+             [scheduler]\nkind = \"all-at-once\"\n"
         ),
     )
     .expect("write config");

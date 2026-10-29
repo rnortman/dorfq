@@ -412,3 +412,22 @@ fn report_renders_one_line_per_tick_and_per_effect() {
         format!("tick 0 now 7 trunk {} | idle", sha(1))
     );
 }
+
+#[test]
+fn a_tick_repeats_one_whose_observation_differs_only_in_its_time() {
+    let report = |observation: Observation, plan: Plan| TickReport {
+        tick: 3,
+        observation,
+        plan,
+        idle: false,
+    };
+    let earlier = busy_observation();
+    let mut later = busy_observation();
+    later.now = Timestamp(later.now.0 + 60);
+    assert!(report(later.clone(), Plan::default()).repeats(&earlier));
+    assert!(!report(later.clone(), full_plan()).repeats(&earlier));
+    let mut moved = later;
+    moved.trunk_position += 1;
+    assert!(!report(moved, Plan::default()).repeats(&earlier));
+    assert!(!report(empty_observation(), Plan::default()).repeats(&earlier));
+}

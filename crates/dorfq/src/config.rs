@@ -1,11 +1,13 @@
-//! The configuration file: which forge, which scheduler, and how the driver
-//! paces its ticks.
+//! The configuration file: which forge and which scheduler.
 
 use std::error::Error;
 use std::fmt;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use dorfq_forge_github::refresh::Refresh;
 use dorfq_forge_github::{Ci, Settings};
 use dorfq_scheduler::SchedulerConfig;
 use serde::Deserialize;
@@ -17,10 +19,13 @@ use serde::Deserialize;
 pub struct Config {
     pub forge: ForgeConfig,
     pub scheduler: SchedulerConfig,
-    pub driver: DriverConfig,
 }
 
 /// The forge to build.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one value per process, read once at startup"
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ForgeConfig {
@@ -57,9 +62,51 @@ pub enum ForgeConfig {
         /// nothing.
         #[serde(default)]
         ci: Option<Ci>,
+        /// How often each entity the forge caches is read unprompted.
+        refresh: RefreshConfig,
+        /// The webhook receiver; absent, nothing listens and the refresh
+        /// intervals are the only clock.
+        #[serde(default)]
+        webhook: Option<WebhookConfig>,
         /// The credential the forge runs under.
         auth: AuthConfig,
     },
+}
+
+/// How often the GitHub forge reads each entity it caches unprompted, in
+/// seconds; each at least 1. No defaults: the right values differ by an
+/// order of magnitude between a queue receiving webhooks and one polling.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshConfig {
+    /// The labelled pull requests and the batch records.
+    pub listing_secs: u64,
+    /// Each queued pull request.
+    pub pr_secs: u64,
+    /// Each testing batch's checks, and trunk.
+    pub batch_secs: u64,
+}
+
+/// Where the GitHub forge receives webhook deliveries.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookConfig {
+    /// The address the receiver binds: an IP address and a port.
+    #[serde(deserialize_with = "socket_address")]
+    pub listen: SocketAddr,
+    /// The environment variable holding the webhook secret; never the
+    /// secret.
+    pub secret_env: String,
+}
+
+/// A [`SocketAddr`] from its text, the error naming `listen`.
+fn socket_address<'de, D: serde::Deserializer<'de>>(d: D) -> Result<SocketAddr, D::Error> {
+    let text = String::deserialize(d)?;
+    text.parse().map_err(|e| {
+        serde::de::Error::custom(format!(
+            "forge.webhook.listen {text:?} is not an IP address and port: {e}"
+        ))
+    })
 }
 
 /// The credential the GitHub forge runs under.
@@ -79,14 +126,6 @@ pub enum AuthConfig {
         /// the configuration file's directory at load.
         private_key_file: PathBuf,
     },
-}
-
-/// How the driver loop runs.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DriverConfig {
-    /// Milliseconds to sleep between ticks.
-    pub tick_millis: u64,
 }
 
 /// A configuration that could not be loaded.
@@ -155,6 +194,7 @@ impl Config {
                 owner,
                 repo,
                 auth,
+                webhook,
                 ..
             } => {
                 if !api_base.starts_with("https://") {
@@ -173,11 +213,17 @@ impl Config {
                         ("auth.client_id", client_id.as_str())
                     }
                 };
+                let secret_env = webhook
+                    .as_ref()
+                    .map(|w| ("webhook.secret_env", w.secret_env.as_str()));
                 for (field, value) in [
                     ("owner", owner.as_str()),
                     ("repo", repo.as_str()),
                     credential,
-                ] {
+                ]
+                .into_iter()
+                .chain(secret_env)
+                {
                     if value.is_empty() {
                         return Err(format!("forge.{field} is empty"));
                     }
@@ -204,6 +250,7 @@ impl ForgeConfig {
             batch_checks,
             lock_heads,
             ci,
+            refresh,
             ..
         } = self
         else {
@@ -216,6 +263,11 @@ impl ForgeConfig {
             batch_checks: batch_checks.as_ref().unwrap_or(checks).clone(),
             lock_heads: *lock_heads,
             ci: *ci,
+            refresh: Refresh {
+                listing: Duration::from_secs(refresh.listing_secs),
+                pr: Duration::from_secs(refresh.pr_secs),
+                batch: Duration::from_secs(refresh.batch_secs),
+            },
         })
     }
 }
@@ -231,9 +283,6 @@ scenario = "scenario.toml"
 
 [scheduler]
 kind = "all-at-once"
-
-[driver]
-tick_millis = 0
 "#;
 
     #[test]
@@ -246,7 +295,6 @@ tick_millis = 0
                     scenario: PathBuf::from("conf/scenario.toml"),
                 },
                 scheduler: SchedulerConfig::AllAtOnce {},
-                driver: DriverConfig { tick_millis: 0 },
             }
         );
     }
@@ -281,9 +329,6 @@ tick_millis = 0
         );
         let message = rejected(&text);
         assert!(message.contains("speed"), "{message}");
-        let text = VALID.replace("tick_millis = 0", "tick_millis = 0\nburst = 2");
-        let message = rejected(&text);
-        assert!(message.contains("burst"), "{message}");
     }
 
     #[test]
@@ -298,12 +343,24 @@ tick_millis = 0
     fn missing_field_is_rejected() {
         let message = rejected(&VALID.replace("scenario = \"scenario.toml\"", ""));
         assert!(message.contains("scenario"), "{message}");
-        let message = rejected(&VALID.replace("tick_millis = 0", ""));
-        assert!(message.contains("tick_millis"), "{message}");
         let message = rejected(&VALID.replace("kind = \"mock\"", ""));
         assert!(message.contains("kind"), "{message}");
-        let message = rejected(&VALID.replace("[driver]\ntick_millis = 0", ""));
+    }
+
+    #[test]
+    fn the_driver_table_is_rejected_naming_it() {
+        let message = rejected(&format!("{VALID}\n[driver]\ntick_millis = 0\n"));
         assert!(message.contains("driver"), "{message}");
+    }
+
+    #[test]
+    fn a_webhook_table_under_the_mock_is_rejected_naming_it() {
+        let text = VALID.replace(
+            "scenario = \"scenario.toml\"\n",
+            "scenario = \"scenario.toml\"\n\n[forge.webhook]\nlisten = \"127.0.0.1:8787\"\nsecret_env = \"S\"\n",
+        );
+        let message = rejected(&text);
+        assert!(message.contains("webhook"), "{message}");
     }
 
     const GITHUB: &str = r#"
@@ -316,15 +373,17 @@ trunk = "main"
 label = "queue"
 checks = ["check"]
 
+[forge.refresh]
+listing_secs = 60
+pr_secs = 120
+batch_secs = 30
+
 [forge.auth]
 kind = "token"
 env = "DORFQ_GITHUB_TOKEN"
 
 [scheduler]
 kind = "all-at-once"
-
-[driver]
-tick_millis = 60000
 "#;
 
     #[test]
@@ -342,12 +401,74 @@ tick_millis = 60000
                 batch_checks: None,
                 lock_heads: false,
                 ci: None,
+                refresh: RefreshConfig {
+                    listing_secs: 60,
+                    pr_secs: 120,
+                    batch_secs: 30,
+                },
+                webhook: None,
                 auth: AuthConfig::Token {
                     env: "DORFQ_GITHUB_TOKEN".to_owned(),
                 },
             }
         );
-        assert_eq!(config.driver, DriverConfig { tick_millis: 60000 });
+    }
+
+    /// [`GITHUB`] with a `[forge.webhook]` table holding `body`.
+    fn github_with_webhook(body: &str) -> String {
+        GITHUB.replace(
+            "\n[forge.auth]\n",
+            &format!("\n[forge.webhook]\n{body}\n[forge.auth]\n"),
+        )
+    }
+
+    fn webhook_of(config: Config) -> Option<WebhookConfig> {
+        match config.forge {
+            ForgeConfig::GitHub { webhook, .. } => webhook,
+            other => panic!("not a github forge: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn github_webhook_parses_its_address_and_variable() {
+        let text = github_with_webhook(
+            "listen = \"127.0.0.1:8787\"\nsecret_env = \"DORFQ_WEBHOOK_SECRET\"\n",
+        );
+        let config = Config::parse(&text, Path::new("conf")).unwrap();
+        assert_eq!(
+            webhook_of(config),
+            Some(WebhookConfig {
+                listen: "127.0.0.1:8787".parse().unwrap(),
+                secret_env: "DORFQ_WEBHOOK_SECRET".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn github_webhook_listen_that_is_not_a_socket_address_is_rejected() {
+        for listen in ["localhost:8787", "127.0.0.1", "8787"] {
+            let text = github_with_webhook(&format!(
+                "listen = \"{listen}\"\nsecret_env = \"DORFQ_WEBHOOK_SECRET\"\n"
+            ));
+            let message = rejected(&text);
+            assert!(message.contains("listen"), "{listen}: {message}");
+        }
+    }
+
+    #[test]
+    fn github_webhook_missing_or_empty_field_is_rejected_naming_it() {
+        let message = rejected(&github_with_webhook("listen = \"127.0.0.1:8787\"\n"));
+        assert!(message.contains("secret_env"), "{message}");
+        let message = rejected(&github_with_webhook("secret_env = \"S\"\n"));
+        assert!(message.contains("listen"), "{message}");
+        let message = rejected(&github_with_webhook(
+            "listen = \"127.0.0.1:8787\"\nsecret_env = \"\"\n",
+        ));
+        assert_eq!(message, "forge.webhook.secret_env is empty");
+        let message = rejected(&github_with_webhook(
+            "listen = \"127.0.0.1:8787\"\nsecret_env = \"S\"\nsecret = \"x\"\n",
+        ));
+        assert!(message.contains("secret"), "{message}");
     }
 
     #[test]
@@ -377,6 +498,50 @@ tick_millis = 60000
             "checks = [\"check\"]\nbatch_checks = [\"\"]\n",
         );
         assert_eq!(rejected(&blank), "forge.batch_checks[0] is empty");
+    }
+
+    #[test]
+    fn github_refresh_intervals_are_passed_through() {
+        let settings = Config::parse(GITHUB, Path::new("conf"))
+            .unwrap()
+            .forge
+            .github_settings()
+            .unwrap();
+        assert_eq!(
+            settings.refresh,
+            Refresh {
+                listing: Duration::from_secs(60),
+                pr: Duration::from_secs(120),
+                batch: Duration::from_secs(30),
+            }
+        );
+    }
+
+    #[test]
+    fn github_missing_refresh_or_interval_is_rejected_naming_it() {
+        let message = rejected(&GITHUB.replace(
+            "[forge.refresh]\nlisting_secs = 60\npr_secs = 120\nbatch_secs = 30\n",
+            "",
+        ));
+        assert!(message.contains("refresh"), "{message}");
+        for field in ["listing_secs", "pr_secs", "batch_secs"] {
+            let text: String = GITHUB
+                .lines()
+                .filter(|line| !line.starts_with(&format!("{field} =")))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            let message = rejected(&text);
+            assert!(message.contains(field), "{field}: {message}");
+        }
+    }
+
+    #[test]
+    fn github_zero_interval_is_rejected_naming_it() {
+        let message = rejected(&GITHUB.replace("pr_secs = 120", "pr_secs = 0"));
+        assert!(
+            message.starts_with("forge.refresh.pr_secs is 0ns"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -525,6 +690,7 @@ tick_millis = 60000
             config.forge,
             ForgeConfig::GitHub {
                 auth: AuthConfig::App { .. },
+                webhook: Some(_),
                 ..
             }
         ));

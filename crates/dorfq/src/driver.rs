@@ -107,6 +107,17 @@ impl<'a> Driver<'a> {
     }
 }
 
+impl TickReport {
+    /// Whether this tick is worth no line after one that printed
+    /// `previous`: its plan is empty and its observation equals `previous`
+    /// in everything but [`Observation::now`].
+    pub fn repeats(&self, previous: &Observation) -> bool {
+        let mut previous = previous.clone();
+        previous.now = self.observation.now;
+        self.plan.is_empty() && previous == self.observation
+    }
+}
+
 fn status(s: &PrStatus) -> String {
     match s {
         PrStatus::Ready => "ready".to_owned(),

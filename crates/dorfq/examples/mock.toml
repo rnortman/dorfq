@@ -8,6 +8,3 @@ scenario = "scenario.toml"
 
 [scheduler]
 kind = "all-at-once"
-
-[driver]
-tick_millis = 0

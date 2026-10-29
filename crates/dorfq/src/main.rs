@@ -2,14 +2,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::thread;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use dorfq::config::Config;
 use dorfq::driver::{Driver, DriverError};
-use dorfq::providers;
-use dorfq_core::ForgeError;
+use dorfq::providers::{self, Outcome};
+use dorfq_core::{ForgeError, Observation};
 
 #[derive(Parser)]
 #[command(name = "dorfq", version = dorfq::version())]
@@ -41,6 +39,10 @@ fn main() -> ExitCode {
     }
 }
 
+/// Waits for the forge, then ticks, until a fatal error or, with
+/// `exit_when_idle`, an idle tick. A tick is printed when it is the first,
+/// plans something, or observes something other than the last one printed
+/// did, the time aside.
 fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
     let config = match Config::load(config) {
         Ok(config) => config,
@@ -58,17 +60,24 @@ fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
     };
     let mut scheduler = providers::scheduler(&config.scheduler);
     let mut driver = Driver::new(built.forge.as_mut(), scheduler.as_mut());
-    let pause = Duration::from_millis(config.driver.tick_millis);
+    let mut printed: Option<Observation> = None;
+    let mut outcome = Outcome::Done;
     loop {
+        (built.wait)(outcome);
+        outcome = Outcome::Done;
         match driver.tick() {
             Ok(report) => {
-                println!("{report}");
+                if !printed.as_ref().is_some_and(|last| report.repeats(last)) {
+                    println!("{report}");
+                    printed = Some(report.observation.clone());
+                }
                 if exit_when_idle && report.idle && !(built.has_scheduled_events)() {
                     return ExitCode::SUCCESS;
                 }
             }
             Err(DriverError::Forge(error @ ForgeError::Transient(_))) => {
-                eprintln!("dorfq: {error}; retrying")
+                eprintln!("dorfq: {error}; retrying");
+                outcome = Outcome::Transient;
             }
             Err(
                 error @ (DriverError::Forge(ForgeError::Permanent(_)) | DriverError::Scheduler(_)),
@@ -77,6 +86,5 @@ fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-        thread::sleep(pause);
     }
 }
