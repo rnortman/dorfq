@@ -53,6 +53,7 @@ with `sed`); there is no target that runs `cargo`, and the gate never will.
 | `make sweep ARGS=...` | Build the simulator optimised and run `dorfq-sim sweep`: a grid of simulations, printed as a table with a summary against a baseline policy |
 | `make sim-report` | Run every simulator example to JSON for the report site, under `bazel-bin/site/reports/`, and build the browser simulator, `bazel-bin/site/dorfq_sim_wasm.wasm` |
 | `make optimised` | Build the `dorfq` binary optimised |
+| `make musl` | Build the portable binary and print its path, `bazel-out/k8-opt/bin/crates/dorfq/dorfq-musl`: optimised, statically linked against musl, for any x86_64 Linux host |
 | `make release VERSION=X.Y.Z` | Cut a release: gather the changelog and TODO fragments, bump the crate version, repin |
 | `make todo-gather` | Fold `todo.d/` fragments into `TODO.md`, outside a release |
 | `make changes ARGS=...` | Run allthechanges: `ARGS="query"`, `ARGS="todo query"`, `ARGS="gather --version X.Y.Z --dry-run"` |
@@ -91,7 +92,7 @@ bypassed gate is not recoverable once it has been pushed.
 ## Code standards
 
 - Rust edition 2024, the pinned stable toolchain. The edition is set once
-  for Bazel, on the toolchain in `MODULE.bazel`; BUILD targets do not
+  for Bazel, as `RUST_EDITION` in `MODULE.bazel`; BUILD targets do not
   restate it.
 - `make check` must pass: clippy with warnings denied, rustfmt, buildifier,
   every test.

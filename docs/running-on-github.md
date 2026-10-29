@@ -215,7 +215,10 @@ make run ARGS="run --config $PWD/crates/dorfq/examples/github.toml"
 To keep it running, `crates/dorfq/examples/systemd/` has a user unit and a
 system unit; each says where it expects the binary, the configuration and
 the token or the app's key. `make local-deploy` installs the binary where the
-user unit expects it and restarts the unit if it is running.
+user unit expects it and restarts the unit if it is running. For a server
+whose glibc the optimised build does not match, or a container image with no
+libc, `make musl` builds a statically linked binary that runs on any x86_64
+Linux host and prints its path, `bazel-out/k8-opt/bin/crates/dorfq/dorfq-musl`.
 
 ## Webhooks
 
