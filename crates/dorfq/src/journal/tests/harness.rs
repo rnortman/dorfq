@@ -139,6 +139,7 @@ fn run(
         &path,
         Header::start("sim", scheduler, EPOCH),
         Some(&dir.join("q.events")),
+        None,
         &mut |_, _| {},
     )
     .unwrap();

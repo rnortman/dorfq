@@ -62,7 +62,7 @@ fn arrive(t: u64, pr: u64) -> Event {
             pr,
             base: None,
             atomic: false,
-            head: sha(pr).to_string(),
+            head: sha(pr),
         },
     )
 }
@@ -395,7 +395,7 @@ fn the_window_keeps_the_shown_kinds_and_evicts_after_24_hours() {
             DAY,
             Kind::Repush {
                 pr: 1,
-                head: sha(2).to_string(),
+                head: sha(2),
             },
         ),
         event(
@@ -605,7 +605,7 @@ fn a_seeded_status_has_the_times_of_one_fed_every_tick_live() {
     ];
 
     let mut live = Status::default();
-    let (mut writer, _) = Writer::open(&path, header(DAY), None, &mut |_, _| {}).unwrap();
+    let (mut writer, _) = Writer::open(&path, header(DAY), None, None, &mut |_, _| {}).unwrap();
     for (tick, o) in ticks.iter().take(3).enumerate() {
         let outcome = report(tick as u64, o.clone());
         let events = writer.record(tick as u64, DAY, &outcome).unwrap();
@@ -614,7 +614,7 @@ fn a_seeded_status_has_the_times_of_one_fed_every_tick_live() {
     drop(writer);
 
     let mut seeded = Status::default();
-    let (mut writer, _) = Writer::open(&path, header(DAY + 150), None, &mut |o, events| {
+    let (mut writer, _) = Writer::open(&path, header(DAY + 150), None, None, &mut |o, events| {
         seeded.tick(o, events)
     })
     .unwrap();

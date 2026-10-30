@@ -1,4 +1,4 @@
-use dorfq_core::Withdrawal;
+use dorfq_core::{Sha, Withdrawal};
 use serde_json::Value;
 
 use super::*;
@@ -14,7 +14,7 @@ fn arrive(t: u64, pr: u64) -> Event {
             pr,
             base: None,
             atomic: false,
-            head: format!("{pr:040x}"),
+            head: Sha::parse(&format!("{pr:040x}")).unwrap(),
         },
     )
 }
@@ -120,7 +120,7 @@ pub(in crate::journal) fn stream() -> Vec<Event> {
             1800,
             Kind::Repush {
                 pr: 8,
-                head: format!("{:040x}", 80),
+                head: Sha::parse(&format!("{:040x}", 80)).unwrap(),
             },
         ),
         at(

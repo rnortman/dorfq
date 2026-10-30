@@ -211,7 +211,7 @@ fn a_pull_request_arrives_and_is_admitted_with_its_base_stack_and_head() {
                     pr: 1,
                     base: None,
                     atomic: false,
-                    head: sha(1).to_string(),
+                    head: sha(1),
                 }
             ),
             (10, Kind::Admit { pr: 1, base: None }),
@@ -221,7 +221,7 @@ fn a_pull_request_arrives_and_is_admitted_with_its_base_stack_and_head() {
                     pr: 2,
                     base: Some(1),
                     atomic: true,
-                    head: sha(2).to_string(),
+                    head: sha(2),
                 }
             ),
             (
@@ -298,7 +298,7 @@ fn a_head_change_is_a_repush() {
         last(&entries),
         [Kind::Repush {
             pr: 1,
-            head: sha(77).to_string(),
+            head: sha(77),
         }]
     );
 }
@@ -381,7 +381,7 @@ fn a_push_while_own_ci_runs_cancels_that_run_and_starts_another() {
         [
             Kind::Repush {
                 pr: 1,
-                head: sha(9).to_string(),
+                head: sha(9),
             },
             Kind::PrCiEnd {
                 pr: 1,
@@ -1213,12 +1213,12 @@ fn shared_real_events() -> Vec<Kind> {
             pr: 1,
             base: None,
             atomic: false,
-            head: String::new(),
+            head: sha(1),
         },
         Kind::Admit { pr: 1, base: None },
         Kind::Repush {
             pr: 1,
-            head: String::new(),
+            head: sha(1),
         },
         Kind::Withdraw {
             pr: 1,

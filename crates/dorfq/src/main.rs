@@ -188,7 +188,13 @@ fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
                 Some(live) => &mut |observation, events| live.seed(observation, events),
                 None => &mut |_, _| {},
             };
-            match journal::Writer::open(path, header, config.events.as_deref(), seed) {
+            match journal::Writer::open(
+                path,
+                header,
+                config.events.as_deref(),
+                config.capture.as_deref(),
+                seed,
+            ) {
                 Ok((writer, notes)) => {
                     for note in notes {
                         eprintln!("dorfq: {note}");

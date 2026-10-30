@@ -36,12 +36,12 @@ pub enum Kind {
         pr: u64,
         base: Option<u64>,
         atomic: bool,
-        head: String,
+        head: Sha,
     },
     /// The queue sees the pull request from now; with every `arrive`.
     Admit { pr: u64, base: Option<u64> },
     /// Its head changed.
-    Repush { pr: u64, head: String },
+    Repush { pr: u64, head: Sha },
     /// It stopped merging into its base: `"trunk"` or a pull request's
     /// number.
     Conflicting { pr: u64, with: Value },
@@ -494,7 +494,7 @@ impl Fold {
                         pr,
                         base,
                         atomic: now.stack == dorfq_core::StackPolicy::Atomic,
-                        head: now.head.to_string(),
+                        head: now.head.clone(),
                     },
                 );
                 self.push(t, Kind::Admit { pr, base });
@@ -503,7 +503,7 @@ impl Fold {
                 t,
                 Kind::Repush {
                     pr,
-                    head: now.head.to_string(),
+                    head: now.head.clone(),
                 },
             ),
             Some(_) => {}

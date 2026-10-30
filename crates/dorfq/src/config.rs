@@ -29,6 +29,12 @@ pub struct Config {
     /// are resolved as `journal`'s.
     #[serde(default)]
     pub events: Option<PathBuf>,
+    /// The capture file's path, beside the journal and rotated with it: each
+    /// pull request head's changed files, read from the forge at first
+    /// sight; absent, nothing is captured. Needs `journal`. Relative paths
+    /// are resolved as `journal`'s.
+    #[serde(default)]
+    pub capture: Option<PathBuf>,
     /// Where the queue pushes its gauges and events; absent, nothing is
     /// pushed. Needs `journal`.
     #[serde(default)]
@@ -282,6 +288,9 @@ impl Config {
         if config.events.is_some() && config.journal.is_none() {
             return Err("events needs journal".to_owned());
         }
+        if config.capture.is_some() && config.journal.is_none() {
+            return Err("capture needs journal".to_owned());
+        }
         if let ForgeConfig::GitHub {
             status_issue: Some(_),
             ..
@@ -296,7 +305,7 @@ impl Config {
             }
             telemetry.validate()?;
         }
-        for path in [&mut config.journal, &mut config.events]
+        for path in [&mut config.journal, &mut config.events, &mut config.capture]
             .into_iter()
             .flatten()
         {
@@ -421,6 +430,7 @@ kind = "all-at-once"
             Config {
                 journal: None,
                 events: None,
+                capture: None,
                 telemetry: None,
                 forge: ForgeConfig::Mock {
                     scenario: PathBuf::from("conf/scenario.toml"),
@@ -472,6 +482,33 @@ kind = "all-at-once"
         )
         .unwrap_err();
         assert_eq!(error, "events needs journal");
+    }
+
+    #[test]
+    fn a_relative_capture_path_is_resolved_and_an_absolute_one_kept() {
+        let capture = |path: &str| {
+            Config::parse(
+                &format!("journal = \"q.journal\"\ncapture = {path:?}\n{VALID}"),
+                Path::new("conf"),
+            )
+            .unwrap()
+            .capture
+        };
+        assert_eq!(capture("q.capture"), Some(PathBuf::from("conf/q.capture")));
+        assert_eq!(
+            capture("/var/lib/q.capture"),
+            Some(PathBuf::from("/var/lib/q.capture"))
+        );
+    }
+
+    #[test]
+    fn capture_without_a_journal_is_rejected_naming_both() {
+        let error = Config::parse(
+            &format!("capture = \"q.capture\"\n{VALID}"),
+            Path::new("conf"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "capture needs journal");
     }
 
     /// [`VALID`] with a journal and a `[telemetry]` table holding `body`.

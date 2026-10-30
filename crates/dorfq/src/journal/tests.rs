@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,10 +10,11 @@ use dorfq_scheduler::SchedulerConfig;
 use serde_json::Value;
 
 use super::*;
+use capture::tests::{Script, records};
 use events::Event;
 
 /// A fresh directory for one test.
-fn dir(name: &str) -> PathBuf {
+pub(super) fn dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(std::env::var("TEST_TMPDIR").expect("TEST_TMPDIR under bazel test"))
         .join(name);
     let _ = fs::remove_dir_all(&dir);
@@ -20,7 +22,7 @@ fn dir(name: &str) -> PathBuf {
     dir
 }
 
-fn sha(n: u64) -> Sha {
+pub(super) fn sha(n: u64) -> Sha {
     Sha::parse(&format!("{n:040x}")).unwrap()
 }
 
@@ -62,7 +64,7 @@ fn header(started: u64) -> Header {
 }
 
 fn open(path: &Path, started: u64) -> (Writer, Vec<String>) {
-    Writer::open(path, header(started), None, &mut |_, _| {}).unwrap()
+    Writer::open(path, header(started), None, None, &mut |_, _| {}).unwrap()
 }
 
 /// Every line of the file at `path`, as JSON.
@@ -355,7 +357,7 @@ fn a_file_that_is_not_a_journal_is_refused_and_left_unchanged() {
         let dir = dir(&format!("foreign-{name}"));
         let path = dir.join("q.journal");
         fs::write(&path, text).unwrap();
-        let Err(error) = Writer::open(&path, header(1000), None, &mut |_, _| {}) else {
+        let Err(error) = Writer::open(&path, header(1000), None, None, &mut |_, _| {}) else {
             panic!("{name}: opened");
         };
         let message = error.to_string();
@@ -386,7 +388,7 @@ fn a_first_line_of_the_header_cap_is_read_and_a_longer_one_is_refused_unchanged(
         let dir = dir(&format!("header-cap-{name}"));
         let path = dir.join("q.journal");
         fs::write(&path, &text).unwrap();
-        let Err(error) = Writer::open(&path, header(2000), None, &mut |_, _| {}) else {
+        let Err(error) = Writer::open(&path, header(2000), None, None, &mut |_, _| {}) else {
             panic!("{name}: opened");
         };
         let message = error.to_string();
@@ -634,7 +636,7 @@ fn event_lines(events: &[Event]) -> Vec<String> {
 }
 
 /// The lines of the text file at `path`.
-fn text_lines(path: &Path) -> Vec<String> {
+pub(super) fn text_lines(path: &Path) -> Vec<String> {
     fs::read_to_string(path)
         .unwrap()
         .lines()
@@ -667,7 +669,7 @@ fn opening_a_segment_seeds_entry_by_entry_and_the_first_live_tick_continues_it()
     let before = derive_at(&path);
     let mut calls = Vec::new();
     let mut seeded = Vec::new();
-    let (mut writer, _) = Writer::open(&path, header(2000), None, &mut |o, events| {
+    let (mut writer, _) = Writer::open(&path, header(2000), None, None, &mut |o, events| {
         calls.push(o.map(|o| o.now.0));
         seeded.extend_from_slice(events);
     })
@@ -695,12 +697,13 @@ fn an_error_before_any_observation_is_written_once_when_the_next_process_observe
     let dir = dir("seed-waiting");
     let path = dir.join("q.journal");
     let events = dir.join("q.events");
-    let (mut writer, _) = Writer::open(&path, header(1000), Some(&events), &mut |_, _| {}).unwrap();
+    let (mut writer, _) =
+        Writer::open(&path, header(1000), Some(&events), None, &mut |_, _| {}).unwrap();
     let fatal = Err(DriverError::Scheduler(SchedulerError::new("stumped")));
     assert!(writer.record(0, 1001, &fatal).unwrap().is_empty());
     drop(writer);
     let mut seeded = Vec::new();
-    let (mut writer, _) = Writer::open(&path, header(2000), Some(&events), &mut |_, e| {
+    let (mut writer, _) = Writer::open(&path, header(2000), Some(&events), None, &mut |_, e| {
         seeded.extend_from_slice(e)
     })
     .unwrap();
@@ -734,7 +737,7 @@ fn a_restart_on_a_segment_begun_at_an_idle_rotation_continues_the_events_file() 
         let path = dir.join("q.journal");
         let events = dir.join("q.events");
         let (mut writer, _) =
-            Writer::open(&path, header(1000), Some(&events), &mut |_, _| {}).unwrap();
+            Writer::open(&path, header(1000), Some(&events), None, &mut |_, _| {}).unwrap();
         writer.record(0, 1001, &busy(0, 5)).unwrap();
         writer.record(1, 1002, &idle(1, 6)).unwrap();
         if let Some(last) = &last {
@@ -742,7 +745,7 @@ fn a_restart_on_a_segment_begun_at_an_idle_rotation_continues_the_events_file() 
         }
         drop(writer);
         let (mut writer, _) =
-            Writer::open(&path, header(2000), Some(&events), &mut |_, _| {}).unwrap();
+            Writer::open(&path, header(2000), Some(&events), None, &mut |_, _| {}).unwrap();
         writer.record(0, 2001, &busy(0, 7)).unwrap();
         let mut written = text_lines(&dir.join("q.events.1000"));
         written.extend(text_lines(&events));
@@ -766,7 +769,8 @@ fn a_segment_of_another_format_is_closed_with_its_events_file() {
     let events = dir.join("q.events");
     fs::write(&path, "{\"journal\":2,\"opened\":900,\"shape\":\"new\"}\n").unwrap();
     fs::write(&events, "{\"t\":1,\"kind\":\"old\"}\n").unwrap();
-    let (mut writer, _) = Writer::open(&path, header(1000), Some(&events), &mut |_, _| {}).unwrap();
+    let (mut writer, _) =
+        Writer::open(&path, header(1000), Some(&events), None, &mut |_, _| {}).unwrap();
     assert_eq!(
         names(&dir),
         ["q.events", "q.events.900", "q.journal", "q.journal.900"]
@@ -796,7 +800,8 @@ fn an_events_path_naming_the_journal_s_own_file_is_refused() {
             .join("q.journal"),
         dir.join("linked"),
     ] {
-        let Err(error) = Writer::open(&path, header(2000), Some(&events), &mut |_, _| {}) else {
+        let Err(error) = Writer::open(&path, header(2000), Some(&events), None, &mut |_, _| {})
+        else {
             panic!("{}: opened", events.display());
         };
         let message = error.to_string();
@@ -821,7 +826,8 @@ fn the_events_file_rotates_with_the_journal_under_the_same_name() {
     let dir = dir("events-rotate");
     let path = dir.join("q.journal");
     let events = dir.join("q.events");
-    let (mut writer, _) = Writer::open(&path, header(1000), Some(&events), &mut |_, _| {}).unwrap();
+    let (mut writer, _) =
+        Writer::open(&path, header(1000), Some(&events), None, &mut |_, _| {}).unwrap();
     let mut written = writer.record(0, 1001, &busy(0, 5)).unwrap();
     written.extend(writer.record(1, 1002, &idle(1, 6)).unwrap());
     written.extend(writer.record(2, 1003, &busy(2, 7)).unwrap());
@@ -837,18 +843,18 @@ fn the_events_file_rotates_with_the_journal_under_the_same_name() {
 }
 
 #[test]
-fn a_name_taken_on_either_side_moves_both_closed_names_to_one_free_suffix() {
+fn a_name_taken_on_any_side_moves_every_closed_name_to_one_free_suffix() {
     let dir = dir("events-collide");
-    let path = dir.join("q.journal");
-    let events = dir.join("q.events");
     fs::write(dir.join("q.journal.1000"), "").unwrap();
     fs::write(dir.join("q.events.1000.1"), "").unwrap();
-    let (mut writer, _) = Writer::open(&path, header(1000), Some(&events), &mut |_, _| {}).unwrap();
+    let (mut writer, _) = open_all(&dir, 1000);
     writer.record(0, 1001, &busy(0, 5)).unwrap();
     writer.record(1, 1002, &idle(1, 6)).unwrap();
     assert_eq!(
         names(&dir),
         [
+            "q.capture",
+            "q.capture.1000.2",
             "q.events",
             "q.events.1000.1",
             "q.events.1000.2",
@@ -867,13 +873,14 @@ fn an_unterminated_last_events_line_is_cut_off_with_a_note() {
     let dir = dir("events-cut");
     let path = dir.join("q.journal");
     let events = dir.join("q.events");
-    let (mut writer, _) = Writer::open(&path, header(1000), Some(&events), &mut |_, _| {}).unwrap();
+    let (mut writer, _) =
+        Writer::open(&path, header(1000), Some(&events), None, &mut |_, _| {}).unwrap();
     writer.record(0, 1001, &busy(0, 5)).unwrap();
     drop(writer);
     let whole = fs::read_to_string(&events).unwrap();
     fs::write(&events, whole.clone() + "{\"t\":5,").unwrap();
     let (_writer, notes) =
-        Writer::open(&path, header(2000), Some(&events), &mut |_, _| {}).unwrap();
+        Writer::open(&path, header(2000), Some(&events), None, &mut |_, _| {}).unwrap();
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(notes[0].contains("q.events"), "{}", notes[0]);
     assert!(
@@ -889,7 +896,7 @@ fn a_segment_with_a_line_that_does_not_read_is_refused_before_the_header() {
     let path = dir("seed-corrupt").join("q.journal");
     let text = format!("{}\nnot json\n", header_line());
     fs::write(&path, &text).unwrap();
-    let Err(error) = Writer::open(&path, header(2000), None, &mut |_, _| {}) else {
+    let Err(error) = Writer::open(&path, header(2000), None, None, &mut |_, _| {}) else {
         panic!("opened");
     };
     let message = error.to_string();
@@ -910,6 +917,265 @@ fn entries_yield_what_read_collects_and_note_an_unterminated_last_line() {
     assert_eq!(collected, read.entries);
     assert_eq!(entries.notes, read.notes);
     assert_eq!(entries.notes.len(), 1);
+}
+
+/// A writer on `q.journal`, `q.events` and `q.capture` in `dir`.
+fn open_all(dir: &Path, started: u64) -> (Writer, Vec<String>) {
+    Writer::open(
+        &dir.join("q.journal"),
+        header(started),
+        Some(&dir.join("q.events")),
+        Some(&dir.join("q.capture")),
+        &mut |_, _| {},
+    )
+    .unwrap()
+}
+
+/// An observation at `now` of each `(pr, head)` in `prs`, heads as [`sha`].
+fn headed(now: u64, prs: &[(u64, u64)]) -> Observation {
+    let prs = prs
+        .iter()
+        .map(|&(n, head)| {
+            PrSnapshot::new(PrNumber(n), sha(head), PrBase::Trunk, PrStatus::Ready, 0)
+        })
+        .collect();
+    Observation::new(Timestamp(now), sha(100), 0, prs, Vec::new(), Vec::new())
+}
+
+/// Records tick `tick` of `observation` with an empty plan at host time `at`.
+fn record_headed(writer: &mut Writer, tick: u64, at: u64, observation: Observation) {
+    writer
+        .record(tick, at, &Ok(report(tick, observation, Plan::default())))
+        .unwrap();
+}
+
+/// Fetches the writer's pending heads through `script` at host time `at`.
+fn capture_with(writer: &mut Writer, at: u64, script: &mut Script) -> Vec<String> {
+    writer
+        .capture(at, &mut |pr, head| script.read(pr, head))
+        .unwrap()
+}
+
+/// The `(pr, head)` of every record in the capture file at `path`, in order.
+fn captured(path: &Path) -> Vec<(u64, Sha)> {
+    records(path)
+        .iter()
+        .map(|r| {
+            (
+                r["pr"].as_u64().unwrap(),
+                Sha::parse(r["head"].as_str().unwrap()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn the_capture_file_pairs_with_the_journal_and_the_events_file() {
+    let dir = dir("capture-rotate");
+    let (mut writer, notes) = open_all(&dir, 1000);
+    assert!(notes.is_empty(), "{notes:?}");
+    let mut script = Script::default();
+    writer.record(0, 1001, &busy(0, 5)).unwrap();
+    capture_with(&mut writer, 1001, &mut script);
+    writer.record(1, 1002, &idle(1, 6)).unwrap();
+    capture_with(&mut writer, 1002, &mut script);
+    assert_eq!(
+        names(&dir),
+        [
+            "q.capture",
+            "q.capture.1000",
+            "q.events",
+            "q.events.1000",
+            "q.journal",
+            "q.journal.1000"
+        ]
+    );
+    assert_eq!(captured(&dir.join("q.capture.1000")), [(1, sha(1))]);
+    assert_eq!(fs::read_to_string(dir.join("q.capture")).unwrap(), "");
+}
+
+#[test]
+fn a_capture_path_naming_the_journal_or_the_events_file_is_refused() {
+    let dir = dir("capture-same-file");
+    let path = dir.join("q.journal");
+    let events = dir.join("q.events");
+    drop(open_all(&dir, 1000));
+    fs::remove_file(dir.join("q.capture")).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    fs::hard_link(&path, dir.join("linked")).unwrap();
+    for (capture, what) in [
+        (path.clone(), "the journal's own file"),
+        (dir.join("linked"), "the journal's own file"),
+        (dir.join(".").join("q.events"), "the events file"),
+    ] {
+        let Err(error) = Writer::open(
+            &path,
+            header(2000),
+            Some(&events),
+            Some(&capture),
+            &mut |_, _| {},
+        ) else {
+            panic!("{}: opened", capture.display());
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("capture names {what}")),
+            "{message}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+    assert_eq!(names(&dir), ["linked", "q.events", "q.journal"]);
+    // Without an events file the journal is still refused.
+    for capture in [path.clone(), dir.join("linked")] {
+        let Err(error) = Writer::open(&path, header(2000), None, Some(&capture), &mut |_, _| {})
+        else {
+            panic!("{}: opened", capture.display());
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("capture names the journal's own file"),
+            "{message}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+}
+
+#[test]
+fn the_capture_file_works_without_an_events_file() {
+    let dir = dir("capture-no-events");
+    let path = dir.join("q.journal");
+    let capture = dir.join("q.capture");
+    let (mut writer, notes) =
+        Writer::open(&path, header(1000), None, Some(&capture), &mut |_, _| {}).unwrap();
+    assert!(notes.is_empty(), "{notes:?}");
+    let mut script = Script::default();
+    record_headed(&mut writer, 0, 1001, headed(5, &[(1, 1)]));
+    assert!(capture_with(&mut writer, 1001, &mut script).is_empty());
+    assert_eq!(script.calls, [(1, sha(1))]);
+    assert_eq!(captured(&capture), [(1, sha(1))]);
+    assert_eq!(names(&dir), ["q.capture", "q.journal"]);
+}
+
+#[test]
+fn a_format_mismatch_closes_the_capture_file_with_the_other_two() {
+    let dir = dir("capture-other-format");
+    let path = dir.join("q.journal");
+    let capture = dir.join("q.capture");
+    fs::write(&path, "{\"journal\":2,\"opened\":900,\"shape\":\"new\"}\n").unwrap();
+    let old = format!(
+        "{{\"capture\":1,\"pr\":1,\"head\":\"{}\",\"t\":1,\"at\":2,\"error\":\"x\"}}\n",
+        sha(1)
+    );
+    fs::write(&capture, &old).unwrap();
+    let (mut writer, _) = open_all(&dir, 1000);
+    assert_eq!(
+        names(&dir),
+        [
+            "q.capture",
+            "q.capture.900",
+            "q.events",
+            "q.events.900",
+            "q.journal",
+            "q.journal.900"
+        ]
+    );
+    assert_eq!(fs::read_to_string(dir.join("q.capture.900")).unwrap(), old);
+    assert_eq!(fs::read_to_string(&capture).unwrap(), "");
+    let mut script = Script::default();
+    writer.record(0, 1001, &busy(0, 5)).unwrap();
+    capture_with(&mut writer, 1001, &mut script);
+    assert_eq!(script.calls, [(1, sha(1))]);
+    assert_eq!(captured(&capture), [(1, sha(1))]);
+}
+
+#[test]
+fn every_arrive_and_repush_head_gets_exactly_one_record() {
+    let dir = dir("capture-once");
+    let (mut writer, _) = open_all(&dir, 1000);
+    let mut script = Script::default();
+    let ticks = [
+        headed(5, &[(1, 1), (2, 2)]),
+        // A push to pull request 1.
+        headed(6, &[(1, 11), (2, 2)]),
+        // Pull request 2 leaves, then comes back with the same head.
+        headed(7, &[(1, 11)]),
+        headed(8, &[(1, 11), (2, 2)]),
+        // Pull request 1 is pushed back to its first head.
+        headed(9, &[(1, 1), (2, 2)]),
+    ];
+    for (tick, observation) in ticks.into_iter().enumerate() {
+        let at = 1001 + tick as u64;
+        record_headed(&mut writer, tick as u64, at, observation);
+        assert!(capture_with(&mut writer, at, &mut script).is_empty());
+    }
+    let mut sightings = Vec::new();
+    for event in derive_at(&dir.join("q.journal")) {
+        if let events::Kind::Arrive { pr, head, .. } | events::Kind::Repush { pr, head } =
+            event.kind
+        {
+            sightings.push((pr, head));
+        }
+    }
+    // Two sightings of each head but pull request 1's second.
+    assert_eq!(sightings.len(), 5, "{sightings:?}");
+    let keys: BTreeSet<(u64, Sha)> = sightings.into_iter().collect();
+    let recorded = captured(&dir.join("q.capture"));
+    assert_eq!(recorded.iter().cloned().collect::<BTreeSet<_>>(), keys);
+    assert_eq!(recorded.len(), keys.len());
+    assert_eq!(script.calls.len(), keys.len());
+    let all = records(&dir.join("q.capture"));
+    let moved = all.iter().find(|r| r["head"] == sha(11).as_str()).unwrap();
+    assert_eq!((&moved["t"], &moved["at"]), (&6.into(), &1002.into()));
+}
+
+#[test]
+fn a_seeded_head_without_a_record_is_fetched_at_the_first_live_tick() {
+    let dir = dir("capture-seeded");
+    let capture = dir.join("q.capture");
+    let (mut writer, _) = open_all(&dir, 1000);
+    record_headed(&mut writer, 0, 1001, headed(5, &[(1, 1)]));
+    drop(writer);
+    let mut script = Script::default();
+    let (mut writer, _) = open_all(&dir, 2000);
+    capture_with(&mut writer, 2001, &mut script);
+    assert_eq!(script.calls, [(1, sha(1))]);
+    let all = records(&capture);
+    assert_eq!(all.len(), 1);
+    assert_eq!((&all[0]["t"], &all[0]["at"]), (&5.into(), &2001.into()));
+    drop(writer);
+    let (mut writer, _) = open_all(&dir, 3000);
+    capture_with(&mut writer, 3001, &mut script);
+    assert_eq!(script.calls.len(), 1, "{:?}", script.calls);
+    assert_eq!(captured(&capture).len(), 1);
+}
+
+#[test]
+fn a_restart_onto_a_rotated_segment_fetches_the_still_queued_heads_again() {
+    let dir = dir("capture-rotated-restart");
+    let capture = dir.join("q.capture");
+    let (mut writer, _) = open_all(&dir, 1000);
+    let mut script = Script::default();
+    record_headed(&mut writer, 0, 1001, headed(5, &[(1, 1)]));
+    capture_with(&mut writer, 1001, &mut script);
+    // Pull request 2 arrives in the tick that rotates for size.
+    writer.limit = 1;
+    record_headed(&mut writer, 1, 1002, headed(6, &[(1, 1), (2, 2)]));
+    writer.limit = SEGMENT_BYTES;
+    assert!(names(&dir).contains(&"q.capture.1000".to_owned()));
+    capture_with(&mut writer, 1002, &mut script);
+    record_headed(&mut writer, 2, 1003, headed(7, &[(1, 1), (2, 2)]));
+    capture_with(&mut writer, 1003, &mut script);
+    // The rotation alone fetches nothing; the pending head lands in the
+    // fresh file.
+    assert_eq!(script.calls, [(1, sha(1)), (2, sha(2))]);
+    assert_eq!(captured(&dir.join("q.capture.1000")), [(1, sha(1))]);
+    assert_eq!(captured(&capture), [(2, sha(2))]);
+    drop(writer);
+    let (mut writer, _) = open_all(&dir, 2000);
+    capture_with(&mut writer, 2001, &mut script);
+    assert_eq!(script.calls, [(1, sha(1)), (2, sha(2)), (1, sha(1))]);
+    assert_eq!(captured(&capture), [(2, sha(2)), (1, sha(1))]);
+    assert_eq!(captured(&dir.join("q.capture.1000")), [(1, sha(1))]);
 }
 
 /// One configuration of every scheduler kind, `bayes` under both

@@ -595,7 +595,7 @@ fn values_past_the_wire_range_saturate() {
             pr: u64::MAX,
             base: None,
             atomic: false,
-            head: "ab".to_owned(),
+            head: Sha::parse(&"ab".repeat(20)).unwrap(),
         },
     };
     let record = record(&event, u64::MAX);
@@ -615,7 +615,7 @@ fn record_carries_the_event_line_and_its_numbers() {
                 pr: 4,
                 base: None,
                 atomic: false,
-                head: "ab".to_owned(),
+                head: Sha::parse(&"ab".repeat(20)).unwrap(),
             },
             vec![s("kind", "arrive"), ("pr".to_owned(), Attr::Int(4))],
             (9, "INFO"),

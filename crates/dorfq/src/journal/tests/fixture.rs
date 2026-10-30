@@ -187,6 +187,7 @@ fn write_the_format_1_fixture() {
         &path,
         Header::start("mock", &scheduler, start),
         None,
+        None,
         &mut |_, _| {},
     )
     .unwrap();
@@ -224,6 +225,7 @@ fn write_the_format_1_fixture() {
     let (mut writer, _) = Writer::open(
         &path,
         Header::start("mock", &scheduler, restart),
+        None,
         None,
         &mut |_, _| {},
     )

@@ -20,8 +20,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::driver::{DriverError, TickReport};
+use capture::{Capture, Reader};
 use events::{Event, Fold};
 
+pub mod capture;
 pub mod events;
 pub mod report;
 pub mod status;
@@ -263,7 +265,8 @@ pub type Sink<'a> = &'a mut dyn FnMut(Option<&Observation>, &[Event]);
 // paths, with additions and deletions, recorded once beside the journal.
 /// Appends a running process's ticks to the journal at one path, rotating
 /// closed segments aside, and folds them into the event stream, appended to
-/// the events file when there is one.
+/// the events file when there is one and sighting heads for the capture
+/// file when there is one.
 pub struct Writer {
     path: PathBuf,
     file: File,
@@ -284,6 +287,8 @@ pub struct Writer {
     fold: Fold,
     /// The events file, rotated with the journal.
     events: Option<EventsFile>,
+    /// The capture file, rotated with the journal.
+    capture: Option<Capture>,
 }
 
 /// The file the events of each tick are appended to.
@@ -293,20 +298,15 @@ struct EventsFile {
 }
 
 impl EventsFile {
-    /// Opens the events file at `path`, creating it, and cuts off an
-    /// unterminated last line with a note.
-    fn open(path: &Path, notes: &mut Vec<String>) -> Result<EventsFile, JournalError> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(path)
-            .map_err(io_error(path))?;
-        let found = survey(&mut file).map_err(io_error(path))?;
-        cut_unterminated(&file, path, &found, "events", notes)?;
+    /// Opens the events file at `path` as [`open_beside`] does.
+    fn open(
+        path: &Path,
+        others: &[(&str, &Path, &File)],
+        notes: &mut Vec<String>,
+    ) -> Result<EventsFile, JournalError> {
         Ok(EventsFile {
             path: path.to_owned(),
-            file,
+            file: open_beside(path, "events", others, notes)?,
         })
     }
 
@@ -315,6 +315,38 @@ impl EventsFile {
         let text: String = events.iter().map(events::line).collect();
         append(&mut self.file, &self.path, text.as_bytes())
     }
+}
+
+/// Opens the file at `path` that sits beside the journal as `what`,
+/// creating it. A path naming one of the open files in `others`, each with
+/// what it is and its path, is refused before the file is read or cut; then
+/// an unterminated last line is cut off with a note.
+fn open_beside(
+    path: &Path,
+    what: &str,
+    others: &[(&str, &Path, &File)],
+    notes: &mut Vec<String>,
+) -> Result<File, JournalError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(io_error(path))?;
+    for (other_what, other, other_file) in others {
+        if same_file(other_file, other, &file, path)? {
+            return Err(JournalError::Io {
+                path: path.to_owned(),
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{what} names {other_what}, {}", other.display()),
+                ),
+            });
+        }
+    }
+    let found = survey(&mut file).map_err(io_error(path))?;
+    cut_unterminated(&file, path, &found, what, notes)?;
+    Ok(file)
 }
 
 /// Cuts `file` at `path` back to its last complete line when `found` has an
@@ -454,21 +486,25 @@ fn header_stamp(line: &[u8]) -> Option<(u64, u64)> {
 impl Writer {
     /// Opens the journal at `path` for a process starting with `header`
     /// (`cause` `start`): creates the file or appends to it, opens the
-    /// events file at `events` when given, replays the current segment
-    /// into the fold and `seed` entry by entry, then writes the header.
-    /// Returns the writer and what the operator should be told.
+    /// events file at `events` and the capture file at `capture` when
+    /// given, replays the current segment into the fold, the capture's
+    /// sightings and `seed` entry by entry, then writes the header. Returns
+    /// the writer and what the operator should be told.
     ///
     /// An unterminated last line, which a crash mid-write leaves, is cut
-    /// off, in the journal and in the events file. A segment of a format
-    /// this build does not write is closed, with the events file, as a
-    /// rotation closes them, and both opened fresh. A file whose first line
-    /// is not a journal header is refused and left as it is, an events path
-    /// naming the journal's own file is refused, and a segment with a line
-    /// that does not read is refused naming the line.
+    /// off, in the journal, the events file and the capture file. A segment
+    /// of a format this build does not write is closed, with the events and
+    /// capture files, as a rotation closes them, and all opened fresh. A
+    /// file whose first line is not a journal header is refused and left as
+    /// it is, an events or capture path naming the journal's own file or
+    /// the events file is refused, a capture line without its key is
+    /// refused naming the line, and a segment with a line that does not
+    /// read is refused naming the line.
     pub fn open(
         path: &Path,
         header: Header,
         events: Option<&Path>,
+        capture: Option<&Path>,
         seed: Sink<'_>,
     ) -> Result<(Writer, Vec<String>), JournalError> {
         let mut notes = Vec::new();
@@ -512,20 +548,23 @@ impl Writer {
             busy: false,
             fold: Fold::default(),
             events: None,
+            capture: None,
         };
         writer.events = events
-            .map(|events| EventsFile::open(events, &mut notes))
+            .map(|events| {
+                EventsFile::open(
+                    events,
+                    &[("the journal's own file", path, &writer.file)],
+                    &mut notes,
+                )
+            })
             .transpose()?;
-        if let Some(events) = &writer.events
-            && same_file(&writer.file, path, &events.file, &events.path)?
-        {
-            return Err(JournalError::Io {
-                path: events.path.clone(),
-                error: io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("events names the journal's own file, {}", path.display()),
-                ),
-            });
+        if let Some(capture) = capture {
+            let mut others = vec![("the journal's own file", path, &writer.file)];
+            if let Some(events) = &writer.events {
+                others.push(("the events file", events.path.as_path(), &events.file));
+            }
+            writer.capture = Some(Capture::open(capture, &others, &mut notes)?);
         }
         match stamp {
             Some((FORMAT, opened)) => writer.first_opened = opened,
@@ -550,16 +589,20 @@ impl Writer {
                 }) => Some(&report.observation),
                 Entry::Tick(_) | Entry::Header(_) => None,
             };
-            seed(observation, &writer.fold.take());
+            let events = writer.fold.take();
+            if let Some(capture) = &mut writer.capture {
+                capture.sight(&events);
+            }
+            seed(observation, &events);
         }
         writer.write_header(Cause::Start, writer.header.opened)?;
         Ok((writer, notes))
     }
 
     /// Writes tick `tick`'s line, ending at host time `at`, folds it and
-    /// appends its events to the events file, then rotates when the tick is
-    /// idle after a busy stretch or the segment is full. Returns the tick's
-    /// events.
+    /// appends its events to the events file and sights their heads for the
+    /// capture file, then rotates when the tick is idle after a busy stretch
+    /// or the segment is full. Returns the tick's events.
     pub fn record(
         &mut self,
         tick: u64,
@@ -604,6 +647,9 @@ impl Writer {
         if let Some(file) = &mut self.events {
             file.append(&events)?;
         }
+        if let Some(capture) = &mut self.capture {
+            capture.sight(&events);
+        }
         // The idle tick ends the closed segment, so the departures it
         // reports stay with the lifetimes they end.
         if idle_after_busy || self.bytes > self.limit {
@@ -613,18 +659,35 @@ impl Writer {
         Ok(events)
     }
 
-    /// Closes the journal segment and the events file together under the
-    /// segment's name, then opens both fresh and empty. Returns the closed
-    /// segment's name.
+    /// Reads up to a bounded number of heads sighted and not yet recorded
+    /// through `read`, and records them in the capture file at host time
+    /// `at`; returns what the operator should be told. Does nothing without
+    /// a capture file.
+    pub fn capture(&mut self, at: u64, read: &mut Reader<'_>) -> Result<Vec<String>, JournalError> {
+        match &mut self.capture {
+            Some(capture) => capture.fetch(at, read),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Closes the journal segment, the events file and the capture file
+    /// together under the segment's name, then opens each fresh and empty.
+    /// Returns the closed segment's name.
     fn rotate_files(&mut self) -> Result<PathBuf, JournalError> {
         let mut paths = vec![self.path.as_path()];
         if let Some(file) = &self.events {
             paths.push(&file.path);
         }
+        if let Some(capture) = &self.capture {
+            paths.push(capture.path());
+        }
         let name = close(&paths, self.first_opened)?.remove(0);
         self.reopen()?;
         if let Some(file) = &mut self.events {
             file.file = create_fresh(&file.path)?;
+        }
+        if let Some(capture) = &mut self.capture {
+            capture.fresh()?;
         }
         Ok(name)
     }
