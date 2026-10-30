@@ -14,8 +14,8 @@ use std::time::SystemTime;
 use dorfq_core::{PrNumber, Sha};
 
 use crate::api::{
-    ApiError, CheckResult, Commit, Compare, CompareStatus, GitHubApi, IssueDetail, Merge,
-    MergeState, OpenPr, PrDetail, RefEntry, RefUpdate, RulesetId, RunId, WorkflowRun,
+    ApiError, ChangedFile, CheckResult, Commit, Compare, CompareStatus, GitHubApi, IssueDetail,
+    Merge, MergeState, OpenPr, PrDetail, RefEntry, RefUpdate, RulesetId, RunId, WorkflowRun,
 };
 use crate::branch;
 
@@ -41,6 +41,13 @@ pub struct FakePr {
     pub merge_state: MergeState,
     pub draft: bool,
     pub merged: bool,
+    pub base_sha: Sha,
+    /// `None` stands for a response without the field.
+    pub additions: Option<u64>,
+    /// `None` stands for a response without the field.
+    pub deletions: Option<u64>,
+    /// `None` stands for a response without the field.
+    pub changed_files: Option<u64>,
 }
 
 /// An Actions workflow run.
@@ -59,6 +66,9 @@ pub struct State {
     /// Check results per commit, newest first.
     pub checks: BTreeMap<Sha, Vec<CheckResult>>,
     pub comments: BTreeMap<u64, Vec<String>>,
+    /// The files each pull request changes, in listing order; none when
+    /// unset.
+    pub files: BTreeMap<u64, Vec<ChangedFile>>,
     /// Plain issues by number, with their bodies; a body written to a pull
     /// request's number is kept here too.
     pub issues: BTreeMap<u64, String>,
@@ -200,9 +210,24 @@ impl FakeGitHub {
                 merge_state: MergeState::Clean,
                 draft: false,
                 merged: false,
+                base_sha: parent.clone(),
+                additions: Some(0),
+                deletions: Some(0),
+                changed_files: Some(0),
             },
         );
         head
+    }
+
+    /// Sets the files pull request `number` changes, and its counts to
+    /// match them.
+    pub fn set_files(&self, number: u64, files: Vec<ChangedFile>) {
+        let mut state = self.state();
+        let pr = state.prs.get_mut(&number).expect("pull request exists");
+        pr.additions = Some(files.iter().map(|f| f.additions).sum());
+        pr.deletions = Some(files.iter().map(|f| f.deletions).sum());
+        pr.changed_files = Some(u64::try_from(files.len()).expect("a fake listing fits u64"));
+        state.files.insert(number, files);
     }
 
     /// Moves pull request `number`'s head, and its head branch with it.
@@ -606,7 +631,21 @@ impl GitHubApi for FakeGitHub {
             },
             draft: pr.draft,
             merged: pr.merged,
+            base_sha: pr.base_sha.clone(),
+            additions: pr.additions,
+            deletions: pr.deletions,
+            changed_files: pr.changed_files,
         })
+    }
+
+    fn pr_files(&mut self, number: PrNumber) -> Result<Vec<ChangedFile>, ApiError> {
+        self.enter("pr_files", number.0.to_string())?;
+        Ok(self
+            .state()
+            .files
+            .get(&number.0)
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn set_base(&mut self, number: PrNumber, base: &str) -> Result<(), ApiError> {

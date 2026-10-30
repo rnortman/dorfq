@@ -10,11 +10,11 @@ use dorfq_core::{
     PrBase, PrNumber, PrStatus, Sha, Timestamp, Withdrawal,
 };
 
-use crate::api::{ApiError, CheckOutcome, CheckResult, MergeState, RulesetId};
+use crate::api::{ApiError, ChangedFile, CheckOutcome, CheckResult, MergeState, RulesetId};
 use crate::fake::{Failure, FakeGitHub};
 use crate::record::{Moved, Record, RecordState};
 use crate::refresh::{Entity, Refresh};
-use crate::{Ci, Clock, GitHubForge, Settings, branch};
+use crate::{Ci, Clock, GitHubForge, HeadFiles, Settings, branch};
 
 mod schedule;
 mod status;
@@ -5382,4 +5382,103 @@ fn rate_limit_remaining_reads_the_api_clients() {
     assert_eq!(forge.rate_limit_remaining(), None);
     fake.state().rate_limit_remaining = Some(4321);
     assert_eq!(forge.rate_limit_remaining(), Some(4321));
+}
+
+fn changed(path: &str, additions: u64, deletions: u64) -> ChangedFile {
+    ChangedFile {
+        path: path.to_owned(),
+        additions,
+        deletions,
+        status: "modified".to_owned(),
+        previous: None,
+    }
+}
+
+#[test]
+fn head_files_reads_the_sighted_head_s_files_and_size() {
+    let fake = FakeGitHub::new();
+    let base = fake.trunk();
+    let head = ready_pr(&fake, 1);
+    let files = vec![changed("src/b.rs", 10, 2), changed("src/a.rs", 3, 0)];
+    fake.set_files(1, files.clone());
+    let (mut forge, _) = forge(&fake);
+    let before = forge.observe().unwrap();
+    let calls = fake.state().calls.len();
+    let writes = fake.writes().len();
+
+    let read = forge.head_files(PrNumber(1), &head).unwrap();
+    assert_eq!(
+        read,
+        Ok(HeadFiles {
+            base,
+            additions: 13,
+            deletions: 2,
+            changed_files: 2,
+            files,
+        })
+    );
+    assert_eq!(fake.state().calls[calls..], ["get_pr 1", "pr_files 1"]);
+    assert_eq!(fake.writes().len(), writes, "{:?}", fake.writes());
+    let after = forge.observe().unwrap();
+    assert_eq!(after.prs, before.prs);
+    assert_eq!(after.trunk, before.trunk);
+}
+
+#[test]
+fn head_files_reports_a_moved_head_without_listing() {
+    let fake = FakeGitHub::new();
+    let old = ready_pr(&fake, 1);
+    let new = fake.commit(std::slice::from_ref(&old));
+    fake.push(1, &new);
+    let (mut forge, _) = forge(&fake);
+
+    assert_eq!(forge.head_files(PrNumber(1), &old).unwrap(), Err(new));
+    assert!(fake.calls_to(&["pr_files"]).is_empty());
+}
+
+#[test]
+fn head_files_passes_the_api_s_failures_through() {
+    let fake = FakeGitHub::new();
+    let head = ready_pr(&fake, 1);
+    let (mut forge, _) = forge(&fake);
+
+    fake.fail("pr_files", Failure::Transient);
+    let error = forge.head_files(PrNumber(1), &head).unwrap_err();
+    assert!(matches!(error, ApiError::Transient(_)), "{error}");
+
+    fake.fail("get_pr", Failure::Permanent);
+    let error = forge.head_files(PrNumber(1), &head).unwrap_err();
+    assert!(matches!(error, ApiError::Permanent(_)), "{error}");
+
+    assert!(forge.head_files(PrNumber(1), &head).unwrap().is_ok());
+}
+
+#[test]
+fn head_files_requires_the_counts_the_queue_does_not() {
+    for field in ["additions", "deletions", "changed_files"] {
+        let fake = FakeGitHub::new();
+        let head = ready_pr(&fake, 1);
+        {
+            let mut pr = fake.pr(1);
+            match field {
+                "additions" => pr.additions = None,
+                "deletions" => pr.deletions = None,
+                _ => pr.changed_files = None,
+            }
+        }
+        let (mut forge, _) = forge(&fake);
+
+        let error = forge.head_files(PrNumber(1), &head).unwrap_err();
+        assert!(matches!(error, ApiError::Permanent(_)), "{field}: {error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("GET /pulls/1: no {field} field")),
+            "{error}"
+        );
+        assert!(fake.calls_to(&["pr_files"]).is_empty(), "{field}");
+        let observation = forge.observe().unwrap();
+        assert_eq!(observation.prs.len(), 1, "{field}");
+        assert_eq!(observation.prs[0].head, head, "{field}");
+    }
 }

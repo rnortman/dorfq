@@ -126,6 +126,9 @@ fn pr_json(number: u64, head: &str, labels: &[&str], merge_state: &str) -> Value
         "mergeable_state": merge_state,
         "draft": false,
         "merged": false,
+        "additions": 120,
+        "deletions": 7,
+        "changed_files": 3,
     })
 }
 
@@ -147,8 +150,153 @@ fn get_pr_decodes_every_field() {
             merge_state: MergeState::Unknown,
             draft: true,
             merged: false,
+            base_sha: sha(A),
+            additions: Some(120),
+            deletions: Some(7),
+            changed_files: Some(3),
         }
     );
+}
+
+#[test]
+fn get_pr_decodes_the_base_sha_and_the_size() {
+    let mut moved_base = pr_json(5, B, &[], "clean");
+    moved_base["base"]["sha"] = json!(C);
+    let mut no_count = pr_json(6, B, &[], "clean");
+    no_count.as_object_mut().unwrap().remove("changed_files");
+    let mut bad_base = pr_json(7, B, &[], "clean");
+    bad_base["base"]["sha"] = json!("not a sha");
+    let (mut api, _) = client(vec![
+        route("GET", "/pulls/5", ok(moved_base)),
+        route("GET", "/pulls/6", ok(no_count)),
+        route("GET", "/pulls/7", ok(bad_base)),
+    ]);
+    let pr = api.get_pr(PrNumber(5)).unwrap();
+    assert_eq!(
+        (pr.base_sha, pr.additions, pr.deletions, pr.changed_files),
+        (sha(C), Some(120), Some(7), Some(3))
+    );
+    // A count only the capture needs is not the refresh's to require.
+    let pr = api.get_pr(PrNumber(6)).unwrap();
+    assert_eq!(
+        (pr.additions, pr.deletions, pr.changed_files),
+        (Some(120), Some(7), None)
+    );
+    let error = api.get_pr(PrNumber(7)).unwrap_err();
+    assert!(!is_transient(&error), "{error}");
+    assert!(error.to_string().contains("GET /pulls/7"), "{error}");
+}
+
+fn file_json(path: &str, additions: u64, deletions: u64, status: &str) -> Value {
+    json!({
+        "sha": A,
+        "filename": path,
+        "status": status,
+        "additions": additions,
+        "deletions": deletions,
+        "changes": additions + deletions,
+        "patch": "@@ -1 +1 @@",
+    })
+}
+
+fn changed(path: &str, additions: u64, deletions: u64, status: &str) -> ChangedFile {
+    ChangedFile {
+        path: path.to_owned(),
+        additions,
+        deletions,
+        status: status.to_owned(),
+        previous: None,
+    }
+}
+
+#[test]
+fn pr_files_follows_link_next_and_keeps_the_listing_order() {
+    let page2 = format!("{REPO}/pulls/7/files?per_page=100&page=2");
+    let mut first = ok(Value::Array(
+        (0..100)
+            .map(|i| file_json(&format!("src/f{i:03}.rs"), i, 1, "modified"))
+            .collect(),
+    ));
+    first
+        .headers
+        .push(("link", format!("<{page2}>; rel=\"next\"")));
+    let mut renamed = file_json("docs/new.md", 20, 0, "renamed");
+    renamed["previous_filename"] = json!("docs/old.md");
+    let second = ok(json!([
+        file_json("b.txt", 0, 4, "removed"),
+        renamed,
+        file_json("a.txt", 9, 0, "added"),
+    ]));
+    let (mut api, seen) = client(vec![
+        route("GET", "/pulls/7/files?per_page=100", first),
+        (format!("GET {page2}"), second),
+    ]);
+    let files = api.pr_files(PrNumber(7)).unwrap();
+    assert_eq!(files.len(), 103);
+    assert_eq!(files[0], changed("src/f000.rs", 0, 1, "modified"));
+    assert_eq!(files[99], changed("src/f099.rs", 99, 1, "modified"));
+    assert_eq!(
+        files[100..],
+        [
+            changed("b.txt", 0, 4, "removed"),
+            ChangedFile {
+                previous: Some("docs/old.md".to_owned()),
+                ..changed("docs/new.md", 20, 0, "renamed")
+            },
+            changed("a.txt", 9, 0, "added"),
+        ]
+    );
+    assert_eq!(seen.borrow().len(), 2);
+}
+
+#[test]
+fn pr_files_classifies_a_later_page_s_failure() {
+    let path = "/pulls/7/files?per_page=100";
+    let page2 = format!("{REPO}/pulls/7/files?per_page=100&page=2");
+    let mut first = ok(json!([file_json("a.txt", 1, 0, "added")]));
+    first
+        .headers
+        .push(("link", format!("<{page2}>; rel=\"next\"")));
+    let (mut api, _) = client(vec![
+        route("GET", path, first),
+        (
+            format!("GET {page2}"),
+            status(502, json!({ "message": "Bad Gateway" })),
+        ),
+    ]);
+    let error = api.pr_files(PrNumber(7)).unwrap_err();
+    assert!(is_transient(&error), "{error}");
+    assert!(error.to_string().contains("HTTP 502"), "{error}");
+
+    let (mut api, _) = client(vec![route(
+        "GET",
+        path,
+        status(404, json!({ "message": "Not Found" })),
+    )]);
+    let error = api.pr_files(PrNumber(7)).unwrap_err();
+    assert!(!is_transient(&error), "{error}");
+    assert!(error.to_string().contains("/pulls/7/files"), "{error}");
+
+    let clock = Rc::new(Cell::new(UNIX_EPOCH + Duration::from_secs(1000)));
+    let (mut api, _) = client_with(
+        Auth::Token(TOKEN.to_owned()),
+        vec![route(
+            "GET",
+            path,
+            limited(
+                403,
+                "API rate limit exceeded",
+                &[
+                    ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", "1792000000"),
+                ],
+            ),
+        )],
+        clock,
+    );
+    let error = api.pr_files(PrNumber(7)).unwrap_err();
+    assert!(is_transient(&error), "{error}");
+    assert_eq!(api.rate_limit_pause(), paused_at(1_792_000_000));
 }
 
 #[test]

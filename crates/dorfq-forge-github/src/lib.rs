@@ -231,11 +231,28 @@ use dorfq_core::{
     PrBase, PrNumber, PrSnapshot, PrStatus, Sha, Timestamp, Withdrawal,
 };
 
-use api::{ApiError, GitHubApi, Merge, MergeState, OpenPr, PrDetail, RefUpdate, RulesetId, RunId};
+use api::{
+    ApiError, ChangedFile, GitHubApi, Merge, MergeState, OpenPr, PrDetail, RefUpdate, RulesetId,
+    RunId,
+};
 use messages::{Blocker, Event, Marker, Message};
 use record::{Moved, Record, RecordState};
 use refresh::{Entity, Refresh, Schedule};
 use webhook::Hint;
+
+/// What a pull request's head changes: its files, base and size, read now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadFiles {
+    /// The base branch's sha at the read.
+    pub base: Sha,
+    pub additions: u64,
+    pub deletions: u64,
+    /// How many files it changes; more than `files` holds when GitHub's
+    /// listing stopped at its limit.
+    pub changed_files: u64,
+    /// In the listing's order.
+    pub files: Vec<ChangedFile>,
+}
 
 /// What the forge is configured with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -940,6 +957,37 @@ impl GitHubForge {
     /// See [`GitHubApi::rate_limit_remaining`].
     pub fn rate_limit_remaining(&self) -> Option<u64> {
         self.api.rate_limit_remaining()
+    }
+
+    /// The files of pull request `pr` at `head`, read now: `Ok(Err(now))`
+    /// when GitHub's head is `now`, not `head`, so the listing would be
+    /// another head's. A response to `GET /pulls/{n}` without one of the
+    /// three counts is a permanent error. Consults and updates no cache.
+    pub fn head_files(
+        &mut self,
+        pr: PrNumber,
+        head: &Sha,
+    ) -> Result<Result<HeadFiles, Sha>, ApiError> {
+        let detail = self.api.get_pr(pr)?;
+        if detail.head != *head {
+            return Ok(Err(detail.head));
+        }
+        let count = |value: Option<u64>, field: &str| {
+            value.ok_or_else(|| {
+                ApiError::Permanent(format!("GET /pulls/{}: no {field} field", pr.0).into())
+            })
+        };
+        let additions = count(detail.additions, "additions")?;
+        let deletions = count(detail.deletions, "deletions")?;
+        let changed_files = count(detail.changed_files, "changed_files")?;
+        let files = self.api.pr_files(pr)?;
+        Ok(Ok(HeadFiles {
+            base: detail.base_sha,
+            additions,
+            deletions,
+            changed_files,
+            files,
+        }))
     }
 
     /// Moves the rate-limit pause the API client recorded into the schedule,

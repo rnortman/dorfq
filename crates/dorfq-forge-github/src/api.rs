@@ -45,6 +45,9 @@ pub trait GitHubApi {
     /// in this repository.
     fn open_pr_with_head(&mut self, branch: &str) -> Result<Option<OpenPr>, ApiError>;
     fn get_pr(&mut self, number: PrNumber) -> Result<PrDetail, ApiError>;
+    /// The files the pull request changes, in the listing's order; at most
+    /// 3,000, GitHub's limit, however many it changes.
+    fn pr_files(&mut self, number: PrNumber) -> Result<Vec<ChangedFile>, ApiError>;
     /// Changes the branch a pull request targets.
     fn set_base(&mut self, number: PrNumber, base: &str) -> Result<(), ApiError>;
     /// The heads, as merged, of the closed and merged pull requests whose head
@@ -202,6 +205,30 @@ pub struct PrDetail {
     pub draft: bool,
     /// Whether it was merged, by any hand.
     pub merged: bool,
+    /// Its base branch's sha at the read.
+    pub base_sha: Sha,
+    /// Lines added across the pull request; `None` when the response
+    /// carried no such field.
+    pub additions: Option<u64>,
+    /// Lines deleted across the pull request; `None` when the response
+    /// carried no such field.
+    pub deletions: Option<u64>,
+    /// How many files it changes; `None` when the response carried no such
+    /// field.
+    pub changed_files: Option<u64>,
+}
+
+/// One file a pull request changes, as `GET /pulls/{n}/files` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
+    /// GitHub's word: `added`, `removed`, `modified`, `renamed`, `copied`,
+    /// `changed`, `unchanged`.
+    pub status: String,
+    /// The path before a rename or copy.
+    pub previous: Option<String>,
 }
 
 /// One issue, as the single-item endpoint reports it.
@@ -875,7 +902,25 @@ impl GitHubApi for RestClient {
             merge_state,
             draft,
             merged,
+            base_sha: parse_sha(&what, &pr.base.sha)?,
+            additions: pr.additions,
+            deletions: pr.deletions,
+            changed_files: pr.changed_files,
         })
+    }
+
+    fn pr_files(&mut self, number: PrNumber) -> Result<Vec<ChangedFile>, ApiError> {
+        let found: Vec<FileJson> = self.get_array(&format!("/pulls/{}/files", number.0))?;
+        Ok(found
+            .into_iter()
+            .map(|file| ChangedFile {
+                path: file.filename,
+                additions: file.additions,
+                deletions: file.deletions,
+                status: file.status,
+                previous: file.previous_filename,
+            })
+            .collect())
     }
 
     fn set_base(&mut self, number: PrNumber, base: &str) -> Result<(), ApiError> {
@@ -1554,6 +1599,7 @@ struct LabelJson {
 
 #[derive(Deserialize)]
 struct BranchJson {
+    sha: String,
     #[serde(rename = "ref")]
     branch: String,
 }
@@ -1599,6 +1645,26 @@ struct PrJson {
     /// The list endpoint's merge record; null when not merged.
     #[serde(default)]
     merged_at: Option<String>,
+    /// Only the single-item endpoint carries it.
+    #[serde(default)]
+    additions: Option<u64>,
+    /// Only the single-item endpoint carries it.
+    #[serde(default)]
+    deletions: Option<u64>,
+    /// Only the single-item endpoint carries it.
+    #[serde(default)]
+    changed_files: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct FileJson {
+    filename: String,
+    additions: u64,
+    deletions: u64,
+    status: String,
+    /// Present only on a renamed or copied file.
+    #[serde(default)]
+    previous_filename: Option<String>,
 }
 
 #[derive(Deserialize)]

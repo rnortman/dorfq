@@ -328,8 +328,8 @@ mod tests {
 
     use dorfq_core::Sha;
     use dorfq_forge_github::api::{
-        CheckResult, Commit, Compare, IssueDetail, Merge, OpenPr, PrDetail, RefEntry, RefUpdate,
-        RulesetId, RunId, WorkflowRun,
+        ChangedFile, CheckResult, Commit, Compare, IssueDetail, Merge, OpenPr, PrDetail, RefEntry,
+        RefUpdate, RulesetId, RunId, WorkflowRun,
     };
 
     use super::*;
@@ -568,6 +568,9 @@ mod tests {
             unreachable!("{NOT_AT_STARTUP}")
         }
         fn get_pr(&mut self, _: PrNumber) -> Result<PrDetail, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn pr_files(&mut self, _: PrNumber) -> Result<Vec<ChangedFile>, ApiError> {
             unreachable!("{NOT_AT_STARTUP}")
         }
         fn set_base(&mut self, _: PrNumber, _: &str) -> Result<(), ApiError> {

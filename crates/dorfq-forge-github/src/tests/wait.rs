@@ -252,6 +252,22 @@ fn a_pause_ending_inside_a_second_rounds_up() {
 }
 
 #[test]
+fn a_rate_limited_files_read_holds_the_next_wait_to_its_end() {
+    let fake = FakeGitHub::new();
+    let head = queued(&fake, 1).remove(0);
+    let (clock, _) = scripted(&[0, 100]);
+    let (mut forge, _send) = hinted(&fake, clock);
+    fake.fail(
+        "pr_files",
+        Failure::RateLimited(UNIX_EPOCH + StdDuration::from_secs(NOW.0 + 40)),
+    );
+    let error = forge.head_files(PrNumber(1), &head).unwrap_err();
+    assert!(matches!(error, ApiError::Transient(_)), "{error}");
+    forge.wait(false);
+    assert_eq!(forge.schedule.next_deadline(), Some(Timestamp(NOW.0 + 40)));
+}
+
+#[test]
 fn transient_failures_back_off_doubling_to_a_minute_and_a_completed_tick_resets() {
     // Each wait reads its start, a second before its hold ends, the same
     // second again for the hint that arrives, and the hold's end. A hint
