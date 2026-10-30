@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 use super::otlp::{
-    Attr, Data, LogRecord, Metric, Number, Point, Resource, logs_request, metrics_request,
+    Attr, Data, Encoding, LogRecord, Metric, Number, Point, Resource, logs_request, metrics_request,
 };
+use super::wire_reader::{Field, Fields, Payload, fields};
 use super::*;
 use crate::journal::status::{Batch, QueuedPr};
 use crate::{driver, journal};
@@ -24,9 +25,8 @@ fn resource_fixture() -> Resource {
     }
 }
 
-#[test]
-fn metrics_request_encodes_a_gauge_and_a_sum() {
-    let metrics = vec![
+fn metrics_fixture() -> Vec<Metric> {
+    vec![
         Metric {
             name: "g".to_owned(),
             description: "a gauge".to_owned(),
@@ -60,8 +60,22 @@ fn metrics_request_encodes_a_gauge_and_a_sum() {
                 }],
             },
         },
-    ];
-    let body = metrics_request(&resource_fixture(), "dorfq", &metrics);
+    ]
+}
+
+/// `body` as UTF-8, the JSON encoding's bytes.
+fn text(body: Vec<u8>) -> String {
+    String::from_utf8(body).expect("a JSON body is UTF-8")
+}
+
+#[test]
+fn metrics_request_encodes_a_gauge_and_a_sum() {
+    let body = text(metrics_request(
+        Encoding::Json,
+        &resource_fixture(),
+        "dorfq",
+        &metrics_fixture(),
+    ));
     let expected = concat!(
         r#"{"resourceMetrics":[{"resource":{"attributes":["#,
         r#"{"key":"service.name","value":{"stringValue":"dorfq"}},"#,
@@ -107,7 +121,12 @@ fn log_records() -> Vec<LogRecord> {
 
 #[test]
 fn logs_request_encodes_records() {
-    let body = logs_request(&resource_fixture(), "dorfq", &log_records());
+    let body = text(logs_request(
+        Encoding::Json,
+        &resource_fixture(),
+        "dorfq",
+        &log_records(),
+    ));
     let expected = concat!(
         r#"{"resourceLogs":[{"resource":{"attributes":["#,
         r#"{"key":"service.name","value":{"stringValue":"dorfq"}},"#,
@@ -129,22 +148,336 @@ fn logs_request_encodes_records() {
 fn encoding_is_deterministic() {
     let snapshot = snapshot(&document(), 1_000, Some(gauges(Some(10))));
     let counters = counters();
-    let a = metrics_request(
-        &resource(),
-        SCOPE,
-        &metrics(&snapshot, Some(3), &counters, 2_000),
-    );
-    let b = metrics_request(
-        &resource(),
-        SCOPE,
-        &metrics(&snapshot, Some(3), &counters, 2_000),
-    );
-    assert_eq!(a, b);
     let records = log_records();
-    assert_eq!(
-        logs_request(&resource(), SCOPE, &records),
-        logs_request(&resource(), SCOPE, &records)
+    for encoding in [Encoding::Protobuf, Encoding::Json] {
+        let a = metrics_request(
+            encoding,
+            &resource(),
+            SCOPE,
+            &metrics(&snapshot, Some(3), &counters, 2_000),
+        );
+        let b = metrics_request(
+            encoding,
+            &resource(),
+            SCOPE,
+            &metrics(&snapshot, Some(3), &counters, 2_000),
+        );
+        assert_eq!(a, b);
+        assert_eq!(
+            logs_request(encoding, &resource(), SCOPE, &records),
+            logs_request(encoding, &resource(), SCOPE, &records)
+        );
+    }
+}
+
+// The protobuf tests read the bytes with the schema-free `wire_reader`; every
+// field number below is the `.proto`'s, written beside its message's name.
+
+/// A `KeyValue` (`key = 1`, `value = 2`): its key and its `AnyValue`'s fields.
+fn key_value(payload: &Payload) -> (String, Vec<Field>) {
+    let key_value = payload.message();
+    assert_eq!(key_value.numbers(), [1, 2]);
+    (
+        key_value.one(1).string().to_owned(),
+        key_value.one(2).message(),
+    )
+}
+
+/// An `AnyValue` holding `string_value = 1`.
+fn assert_string_value(any_value: &[Field], expected: &str) {
+    assert_eq!(any_value.numbers(), [1]);
+    assert_eq!(any_value.one(1).string(), expected);
+}
+
+/// An `AnyValue` holding `int_value = 3`.
+fn assert_int_value(any_value: &[Field], expected: u64) {
+    assert_eq!(any_value.numbers(), [3]);
+    assert_eq!(*any_value.one(3), Payload::Varint(expected));
+}
+
+/// `resource_fixture()` as a `Resource`: `attributes = 1`.
+fn assert_resource_fixture(resource: &[Field]) {
+    assert_eq!(resource.numbers(), [1, 1]);
+    let attributes = resource.all(1);
+    let (key, value) = key_value(attributes[0]);
+    assert_eq!(key, "service.name");
+    assert_string_value(&value, "dorfq");
+    let (key, value) = key_value(attributes[1]);
+    assert_eq!(key, "service.version");
+    assert_string_value(&value, "1.2.3");
+}
+
+/// An `InstrumentationScope` named `dorfq`: `name = 1`.
+fn assert_dorfq_scope(scope: &[Field]) {
+    assert_eq!(scope.numbers(), [1]);
+    assert_eq!(scope.one(1).string(), "dorfq");
+}
+
+/// The metrics of a one-resource, one-scope `ExportMetricsServiceRequest`,
+/// with the resource's and the scope's fields.
+fn metrics_of(body: &[u8]) -> (Vec<Field>, Vec<Field>, Vec<Vec<Field>>) {
+    // ExportMetricsServiceRequest: resource_metrics = 1
+    let request = fields(body);
+    assert_eq!(request.numbers(), [1]);
+    // ResourceMetrics: resource = 1, scope_metrics = 2
+    let resource_metrics = request.one(1).message();
+    assert_eq!(resource_metrics.numbers(), [1, 2]);
+    // ScopeMetrics: scope = 1, metrics = 2
+    let scope_metrics = resource_metrics.one(2).message();
+    let metrics = scope_metrics.all(2);
+    let mut expected = vec![1];
+    expected.resize(1 + metrics.len(), 2);
+    assert_eq!(scope_metrics.numbers(), expected);
+    let metrics = metrics.into_iter().map(Payload::message);
+    (
+        resource_metrics.one(1).message(),
+        scope_metrics.one(1).message(),
+        metrics.collect(),
+    )
+}
+
+#[test]
+fn protobuf_metrics_request_carries_the_schema_fields() {
+    let body = metrics_request(
+        Encoding::Protobuf,
+        &resource_fixture(),
+        "dorfq",
+        &metrics_fixture(),
     );
+    let (resource, scope, metrics) = metrics_of(&body);
+    assert_resource_fixture(&resource);
+    assert_dorfq_scope(&scope);
+    assert_eq!(metrics.len(), 2);
+
+    // Metric: name = 1, description = 2, unit = 3, gauge = 5
+    let gauge_metric = &metrics[0];
+    assert_eq!(gauge_metric.numbers(), [1, 2, 3, 5]);
+    assert_eq!(gauge_metric.one(1).string(), "g");
+    assert_eq!(gauge_metric.one(2).string(), "a gauge");
+    assert_eq!(gauge_metric.one(3).string(), "s");
+    // Gauge: data_points = 1
+    let gauge = gauge_metric.one(5).message();
+    assert_eq!(gauge.numbers(), [1, 1]);
+    let points = gauge.all(1);
+    // NumberDataPoint: time_unix_nano = 3, as_int = 6, attributes = 7
+    let first = points[0].message();
+    assert_eq!(first.numbers(), [3, 6, 7, 7]);
+    assert_eq!(*first.one(3), Payload::Fixed64(1_700_000_000_000_000_000));
+    assert_eq!(*first.one(6), Payload::Fixed64(3));
+    assert_eq!(first.one(6).sfixed64(), 3);
+    let attributes = first.all(7);
+    let (key, value) = key_value(attributes[0]);
+    assert_eq!(key, "status");
+    assert_string_value(&value, "ready");
+    let (key, value) = key_value(attributes[1]);
+    assert_eq!(key, "window_seconds");
+    assert_int_value(&value, 86400);
+    // NumberDataPoint: time_unix_nano = 3, as_double = 4
+    let second = points[1].message();
+    assert_eq!(second.numbers(), [3, 4]);
+    assert_eq!(second.one(3).fixed64(), 1_700_000_000_000_000_000);
+    assert_eq!(second.one(4).double().to_bits(), 1.5_f64.to_bits());
+
+    // Metric: name = 1, description = 2, unit = 3, sum = 7
+    let sum_metric = &metrics[1];
+    assert_eq!(sum_metric.numbers(), [1, 2, 3, 7]);
+    assert_eq!(sum_metric.one(1).string(), "c_total");
+    assert_eq!(sum_metric.one(2).string(), "a sum");
+    assert_eq!(sum_metric.one(3).string(), "{request}");
+    // Sum: data_points = 1, aggregation_temporality = 2 (CUMULATIVE),
+    // is_monotonic = 3
+    let sum = sum_metric.one(7).message();
+    assert_eq!(sum.numbers(), [1, 2, 3]);
+    assert_eq!(*sum.one(2), Payload::Varint(2));
+    assert_eq!(sum.one(3).varint(), 1);
+    // NumberDataPoint: start_time_unix_nano = 2, time_unix_nano = 3,
+    // as_int = 6
+    let point = sum.one(1).message();
+    assert_eq!(point.numbers(), [2, 3, 6]);
+    assert_eq!(*point.one(2), Payload::Fixed64(1_600_000_000_000_000_000));
+    assert_eq!(*point.one(3), Payload::Fixed64(1_700_000_000_000_000_000));
+    assert_eq!(point.one(6).sfixed64(), 7);
+}
+
+#[test]
+fn protobuf_logs_request_carries_the_schema_fields() {
+    let body = logs_request(
+        Encoding::Protobuf,
+        &resource_fixture(),
+        "dorfq",
+        &log_records(),
+    );
+    // ExportLogsServiceRequest: resource_logs = 1
+    let request = fields(&body);
+    assert_eq!(request.numbers(), [1]);
+    // ResourceLogs: resource = 1, scope_logs = 2
+    let resource_logs = request.one(1).message();
+    assert_eq!(resource_logs.numbers(), [1, 2]);
+    assert_resource_fixture(&resource_logs.one(1).message());
+    // ScopeLogs: scope = 1, log_records = 2
+    let scope_logs = resource_logs.one(2).message();
+    assert_eq!(scope_logs.numbers(), [1, 2, 2]);
+    assert_dorfq_scope(&scope_logs.one(1).message());
+    let records = scope_logs.all(2);
+
+    // LogRecord: time_unix_nano = 1, severity_number = 2, severity_text = 3,
+    // body = 5, attributes = 6, observed_time_unix_nano = 11
+    let first = records[0].message();
+    assert_eq!(first.numbers(), [1, 2, 3, 5, 6, 6, 11]);
+    assert_eq!(*first.one(1), Payload::Fixed64(5_000_000_000));
+    assert_eq!(*first.one(2), Payload::Varint(9));
+    assert_eq!(first.one(3).string(), "INFO");
+    assert_string_value(&first.one(5).message(), r#"{"t":5,"kind":"merged","pr":4}"#);
+    let attributes = first.all(6);
+    let (key, value) = key_value(attributes[0]);
+    assert_eq!(key, "kind");
+    assert_string_value(&value, "merged");
+    let (key, value) = key_value(attributes[1]);
+    assert_eq!(key, "pr");
+    assert_int_value(&value, 4);
+    assert_eq!(*first.one(11), Payload::Fixed64(6_000_000_000));
+
+    let second = records[1].message();
+    assert_eq!(second.numbers(), [1, 2, 3, 5, 11]);
+    assert_eq!(*second.one(1), Payload::Fixed64(7_000_000_000));
+    assert_eq!(*second.one(2), Payload::Varint(17));
+    assert_eq!(second.one(3).string(), "ERROR");
+    assert_string_value(&second.one(5).message(), "boom");
+    assert_eq!(*second.one(11), Payload::Fixed64(8_000_000_000));
+}
+
+#[test]
+fn protobuf_omits_default_scalars_and_writes_set_oneof_members() {
+    let empty = Resource {
+        attributes: Vec::new(),
+    };
+    let metric = Metric {
+        name: "m".to_owned(),
+        description: String::new(),
+        unit: String::new(),
+        data: Data::Gauge(vec![Point {
+            attributes: vec![("n".to_owned(), Attr::Int(0))],
+            time_unix_nano: 0,
+            value: Number::Int(0),
+        }]),
+    };
+    let body = metrics_request(Encoding::Protobuf, &empty, "", &[metric]);
+    let (resource, scope, metrics) = metrics_of(&body);
+    // A set embedded message is written even when empty.
+    assert_eq!(resource.numbers(), [] as [u32; 0]);
+    assert_eq!(scope.numbers(), [] as [u32; 0]);
+    // Metric: name = 1, gauge = 5
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics[0].numbers(), [1, 5]);
+    // Gauge: data_points = 1; NumberDataPoint: as_int = 6, attributes = 7
+    let point = metrics[0].one(5).message().one(1).message();
+    assert_eq!(point.numbers(), [6, 7]);
+    assert_eq!(*point.one(6), Payload::Fixed64(0));
+    let (key, value) = key_value(point.one(7));
+    assert_eq!(key, "n");
+    assert_int_value(&value, 0);
+
+    let record = LogRecord {
+        time_unix_nano: 0,
+        observed_time_unix_nano: 0,
+        severity_number: 0,
+        severity_text: "",
+        body: String::new(),
+        attributes: Vec::new(),
+    };
+    let body = logs_request(Encoding::Protobuf, &empty, "", &[record]);
+    // ExportLogsServiceRequest.resource_logs = 1, ResourceLogs.scope_logs = 2,
+    // ScopeLogs.log_records = 2
+    let record = fields(&body)
+        .one(1)
+        .message()
+        .one(2)
+        .message()
+        .one(2)
+        .message();
+    // LogRecord: body = 5, its AnyValue's string_value = 1 written empty
+    assert_eq!(record.numbers(), [5]);
+    assert_string_value(&record.one(5).message(), "");
+}
+
+#[test]
+fn protobuf_writes_negative_integers_as_the_schema_does() {
+    let metric = Metric {
+        name: "m".to_owned(),
+        description: String::new(),
+        unit: String::new(),
+        data: Data::Gauge(vec![
+            Point {
+                attributes: vec![
+                    ("a".to_owned(), Attr::Int(-1)),
+                    ("b".to_owned(), Attr::Int(i64::MIN)),
+                ],
+                time_unix_nano: 1,
+                value: Number::Int(-1),
+            },
+            Point {
+                attributes: Vec::new(),
+                time_unix_nano: 1,
+                value: Number::Int(i64::MIN),
+            },
+        ]),
+    };
+    let body = metrics_request(Encoding::Protobuf, &resource_fixture(), "dorfq", &[metric]);
+    let (_, _, metrics) = metrics_of(&body);
+    // Metric.gauge = 5, Gauge.data_points = 1
+    let points = metrics[0].one(5).message();
+    let points = points.all(1);
+    // NumberDataPoint: as_int = 6, an sfixed64: eight bytes
+    let first = points[0].message();
+    assert_eq!(*first.one(6), Payload::Fixed64(u64::MAX));
+    assert_eq!(first.one(6).sfixed64(), -1);
+    assert_eq!(points[1].message().one(6).sfixed64(), i64::MIN);
+    // NumberDataPoint.attributes = 7; KeyValue.value = 2 holds an AnyValue
+    // whose int_value = 3 is an int64: a ten-byte varint when negative.
+    let attributes = first.all(7);
+    let minus_one = attributes[0].message();
+    let tag = 3 << 3;
+    let ten_bytes = [vec![tag], vec![0xff; 9], vec![0x01]].concat();
+    assert_eq!(*minus_one.one(2), Payload::Len(ten_bytes));
+    let (_, value) = key_value(attributes[0]);
+    assert_eq!(value.one(3).int64(), -1);
+    let (_, value) = key_value(attributes[1]);
+    assert_eq!(value.one(3).int64(), i64::MIN);
+}
+
+#[test]
+fn wire_reader_reads_the_three_wire_types() {
+    let mut buffer = vec![0x08, 0x96, 0x01, 0x12, 0x02, b'h', b'i', 0x19];
+    buffer.extend_from_slice(&0x0102_0304_0506_0708_u64.to_le_bytes());
+    assert_eq!(
+        fields(&buffer),
+        vec![
+            Field {
+                number: 1,
+                payload: Payload::Varint(150),
+            },
+            Field {
+                number: 2,
+                payload: Payload::Len(b"hi".to_vec()),
+            },
+            Field {
+                number: 3,
+                payload: Payload::Fixed64(0x0102_0304_0506_0708),
+            },
+        ]
+    );
+}
+
+#[test]
+#[should_panic(expected = "a payload ends before the buffer")]
+fn wire_reader_rejects_a_truncated_buffer() {
+    fields(&[0x12, 0x05, b'h']);
+}
+
+#[test]
+#[should_panic(expected = "field 1: unhandled wire type 5")]
+fn wire_reader_rejects_an_unhandled_wire_type() {
+    fields(&[0x0d, 0, 0, 0, 0]);
 }
 
 #[test]

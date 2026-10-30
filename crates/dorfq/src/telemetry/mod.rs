@@ -1,5 +1,5 @@
 //! Telemetry: the queue's gauges, derived from the status document, and its
-//! events, one log record each, as OTLP/JSON request bodies.
+//! events, one log record each, as OTLP request bodies.
 //!
 //! A gauge's time is the host time of the export that carries it; a log
 //! record's is its event's forge time, its observed time the host time of
@@ -27,7 +27,7 @@ use crate::journal::status::{Document, Figures, WINDOW};
 use crate::journal::summary::HOUR;
 use crate::providers::ForgeGauges;
 use crate::unix_now;
-use otlp::{Attr, Data, LogRecord, Metric, Number, Point, Resource};
+use otlp::{Attr, Data, Encoding, LogRecord, Metric, Number, Point, Resource};
 
 /// The instrumentation scope's name.
 pub const SCOPE: &str = "dorfq";
@@ -511,11 +511,12 @@ impl Pump {
         if let Some(latest) = &self.latest {
             let tick_age = self.last_observed_at.map(|t| at.saturating_sub(t));
             let body = otlp::metrics_request(
+                Encoding::Json,
                 &resource,
                 SCOPE,
                 &metrics(latest, tick_age, &self.counters, at),
             );
-            let result = sink("/v1/metrics", body.as_bytes());
+            let result = sink("/v1/metrics", &body);
             self.count("/v1/metrics", result, notes);
         }
         while !self.pending.is_empty() {
@@ -525,8 +526,8 @@ impl Pump {
                 .range(..chunk)
                 .map(|(observed_at, event)| record(event, *observed_at))
                 .collect();
-            let body = otlp::logs_request(&resource, SCOPE, &records);
-            let result = sink("/v1/logs", body.as_bytes());
+            let body = otlp::logs_request(Encoding::Json, &resource, SCOPE, &records);
+            let result = sink("/v1/logs", &body);
             if !self.count("/v1/logs", result, notes) {
                 break;
             }
@@ -625,9 +626,9 @@ impl fmt::Display for AuthorizationError {
 impl std::error::Error for AuthorizationError {}
 
 /// A [`Sink`] that POSTs each body to the configured collector as
-/// `application/json`, with the `Authorization` header when one is
-/// configured. A 2xx is delivered; any other status, or no response, is
-/// the failure's description.
+/// [`Encoding::Json`]'s content type, with the `Authorization` header when
+/// one is configured. A 2xx is delivered; any other status, or no response,
+/// is the failure's description.
 pub fn http_sink(config: &TelemetryConfig) -> Result<Sink, AuthorizationError> {
     let authorization = config
         .authorization_env
@@ -663,7 +664,7 @@ fn post_to(endpoint: String, authorization: Option<HeaderValue>) -> Sink {
     Box::new(move |path: &str, body: &[u8]| {
         let mut request = agent
             .post(format!("{endpoint}{path}"))
-            .header("Content-Type", "application/json");
+            .header("Content-Type", Encoding::Json.content_type());
         if let Some(authorization) = &authorization {
             request = request.header("Authorization", authorization.clone());
         }
@@ -699,3 +700,5 @@ fn one_line(text: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wire_reader;
