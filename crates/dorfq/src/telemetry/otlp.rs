@@ -91,7 +91,7 @@ impl Encoding {
 /// `AggregationTemporality.AGGREGATION_TEMPORALITY_CUMULATIVE`.
 const AGGREGATION_TEMPORALITY_CUMULATIVE: u8 = 2;
 
-/// The body of a POST to `/v1/metrics`: `metrics` under one resource and
+/// The body of a metrics request: `metrics` under one resource and
 /// one instrumentation scope named `scope`.
 pub fn metrics_request(
     encoding: Encoding,
@@ -105,7 +105,7 @@ pub fn metrics_request(
     }
 }
 
-/// The body of a POST to `/v1/logs`: `records` under one resource and one
+/// The body of a logs request: `records` under one resource and one
 /// instrumentation scope named `scope`.
 pub fn logs_request(
     encoding: Encoding,

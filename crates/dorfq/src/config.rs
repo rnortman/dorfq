@@ -49,10 +49,11 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
-    /// The collector's OTLP/HTTP base URL, `http://` or `https://`;
-    /// `/v1/metrics` and `/v1/logs` are appended. A trailing `/` is
-    /// dropped at load.
-    pub otlp_endpoint: String,
+    /// Where metrics requests are posted: the complete OTLP/HTTP URL,
+    /// `http://` or `https://`, used as given.
+    pub metrics_endpoint: String,
+    /// Where logs requests are posted, likewise.
+    pub logs_endpoint: String,
     /// Seconds between exports; 1 to [`MAX_INTERVAL_SECS`].
     pub interval_secs: u64,
     /// The encoding of every request body: `protobuf` (the default, the one
@@ -71,44 +72,9 @@ pub struct TelemetryConfig {
 pub const MAX_INTERVAL_SECS: u64 = 86_400;
 
 impl TelemetryConfig {
-    /// Checks the table and trims the endpoint's trailing `/`.
-    fn validate(&mut self) -> Result<(), String> {
-        let endpoint = &self.otlp_endpoint;
-        // Credentials or a token may sit after an `@`, a `?` or a `#`, so
-        // such an endpoint is never written into the message.
-        let shown = if endpoint.contains(['@', '?', '#']) {
-            String::new()
-        } else {
-            format!(" {endpoint:?}")
-        };
-        let problem = |reason: &str| format!("telemetry.otlp_endpoint{shown} {reason}");
-        let uri: Uri = endpoint
-            .parse()
-            .map_err(|error| problem(&format!("is not a URL: {error}")))?;
-        if !matches!(uri.scheme_str(), Some("http" | "https")) {
-            return Err(problem("is not an http:// or https:// URL"));
-        }
-        let (Some(authority), Some(host)) = (uri.authority(), uri.host()) else {
-            return Err(problem("has no host"));
-        };
-        if host.is_empty() {
-            return Err(problem("has no host"));
-        }
-        if authority.as_str().contains('@') {
-            return Err(problem("carries credentials; use authorization_env"));
-        }
-        // Without credentials the authority is the host and, when it is
-        // longer, a `:` and the port.
-        if authority.as_str().len() > host.len() && uri.port_u16().is_none() {
-            return Err(problem("has an invalid port"));
-        }
-        // `Uri` keeps a query but discards a fragment, so both are read off
-        // the text.
-        if endpoint.contains(['?', '#']) {
-            return Err(problem("has a query or fragment"));
-        }
-        let trimmed = endpoint.trim_end_matches('/').len();
-        self.otlp_endpoint.truncate(trimmed);
+    fn validate(&self) -> Result<(), String> {
+        check_endpoint("telemetry.metrics_endpoint", &self.metrics_endpoint)?;
+        check_endpoint("telemetry.logs_endpoint", &self.logs_endpoint)?;
         if self.interval_secs == 0 {
             return Err("telemetry.interval_secs is 0".to_owned());
         }
@@ -122,6 +88,45 @@ impl TelemetryConfig {
         }
         Ok(())
     }
+}
+
+/// Checks that `endpoint`, the value of the key `key`, is an `http://` or
+/// `https://` URL with a host, no credentials, no query and no fragment.
+fn check_endpoint(key: &str, endpoint: &str) -> Result<(), String> {
+    // Credentials or a token may sit after an `@`, a `?` or a `#`, so such
+    // an endpoint is never written into the message.
+    let shown = if endpoint.contains(['@', '?', '#']) {
+        String::new()
+    } else {
+        format!(" {endpoint:?}")
+    };
+    let problem = |reason: &str| format!("{key}{shown} {reason}");
+    let uri: Uri = endpoint
+        .parse()
+        .map_err(|error| problem(&format!("is not a URL: {error}")))?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return Err(problem("is not an http:// or https:// URL"));
+    }
+    let (Some(authority), Some(host)) = (uri.authority(), uri.host()) else {
+        return Err(problem("has no host"));
+    };
+    if host.is_empty() {
+        return Err(problem("has no host"));
+    }
+    if authority.as_str().contains('@') {
+        return Err(problem("carries credentials; use authorization_env"));
+    }
+    // Without credentials the authority is the host and, when it is longer,
+    // a `:` and the port.
+    if authority.as_str().len() > host.len() && uri.port_u16().is_none() {
+        return Err(problem("has an invalid port"));
+    }
+    // `Uri` keeps a query but discards a fragment, so both are read off the
+    // text.
+    if endpoint.contains(['?', '#']) {
+        return Err(problem("has a query or fragment"));
+    }
+    Ok(())
 }
 
 /// The forge to build.
@@ -305,7 +310,7 @@ impl Config {
         {
             return Err("forge.status_issue needs journal".to_owned());
         }
-        if let Some(telemetry) = &mut config.telemetry {
+        if let Some(telemetry) = &config.telemetry {
             if config.journal.is_none() {
                 return Err("telemetry needs journal".to_owned());
             }
@@ -522,6 +527,10 @@ kind = "all-at-once"
         format!("journal = \"q.journal\"\n{base}\n[telemetry]\n{body}")
     }
 
+    /// Both endpoint keys, on one local collector.
+    const ENDPOINTS: &str = "metrics_endpoint = \"http://127.0.0.1:4318/v1/metrics\"\n\
+                             logs_endpoint = \"http://127.0.0.1:4318/v1/logs\"\n";
+
     fn telemetry_of(text: &str) -> TelemetryConfig {
         Config::parse(text, Path::new("conf"))
             .unwrap()
@@ -532,9 +541,10 @@ kind = "all-at-once"
     #[test]
     fn telemetry_parses_under_either_forge_and_is_absent_unless_set() {
         assert_eq!(Config::parse(VALID, Path::new("")).unwrap().telemetry, None);
-        let body = "otlp_endpoint = \"http://127.0.0.1:4318\"\ninterval_secs = 60\n";
+        let body = &format!("{ENDPOINTS}interval_secs = 60\n");
         let expected = TelemetryConfig {
-            otlp_endpoint: "http://127.0.0.1:4318".to_owned(),
+            metrics_endpoint: "http://127.0.0.1:4318/v1/metrics".to_owned(),
+            logs_endpoint: "http://127.0.0.1:4318/v1/logs".to_owned(),
             interval_secs: 60,
             encoding: Encoding::Protobuf,
             authorization_env: None,
@@ -553,7 +563,7 @@ kind = "all-at-once"
 
     #[test]
     fn telemetry_encoding_is_protobuf_or_json() {
-        let body = "otlp_endpoint = \"http://127.0.0.1:4318\"\ninterval_secs = 60\n";
+        let body = format!("{ENDPOINTS}interval_secs = 60\n");
         let json = with_telemetry(VALID, &format!("{body}encoding = \"json\"\n"));
         assert_eq!(telemetry_of(&json).encoding, Encoding::Json);
         let xml = with_telemetry(VALID, &format!("{body}encoding = \"xml\"\n"));
@@ -562,26 +572,40 @@ kind = "all-at-once"
         assert!(error.contains("expected `protobuf` or `json`"), "{error}");
     }
 
+    /// A `[telemetry]` body with `endpoint` under `key` and a valid URL
+    /// under the other endpoint key.
+    fn one_endpoint(key: &str, endpoint: &str) -> String {
+        let other = if key == "metrics_endpoint" {
+            "logs_endpoint = \"http://host/v1/logs\""
+        } else {
+            "metrics_endpoint = \"http://host/v1/metrics\""
+        };
+        format!("{key} = {endpoint:?}\n{other}\ninterval_secs = 60\n")
+    }
+
     #[test]
-    fn telemetry_endpoint_keeps_its_path_and_loses_a_trailing_slash() {
-        for (given, kept) in [
-            ("https://otlp.example/otlp/", "https://otlp.example/otlp"),
-            ("http://collector:4318//", "http://collector:4318"),
-            ("http://collector/", "http://collector"),
-            ("http://[::1]:4318", "http://[::1]:4318"),
+    fn telemetry_endpoints_are_kept_as_given() {
+        for given in [
+            "https://otlp.example/otlp/v1/metrics/",
+            "http://collector:4318//",
+            "http://[::1]:4318/v1/logs",
         ] {
-            let text = with_telemetry(
+            let metrics = telemetry_of(&with_telemetry(
                 VALID,
-                &format!("otlp_endpoint = {given:?}\ninterval_secs = 1\n"),
-            );
-            assert_eq!(telemetry_of(&text).otlp_endpoint, kept, "{given}");
+                &one_endpoint("metrics_endpoint", given),
+            ));
+            assert_eq!(metrics.metrics_endpoint, given);
+            let logs = telemetry_of(&with_telemetry(
+                VALID,
+                &one_endpoint("logs_endpoint", given),
+            ));
+            assert_eq!(logs.logs_endpoint, given);
         }
     }
 
     #[test]
     fn telemetry_without_a_journal_is_rejected_naming_both() {
-        let text =
-            format!("{VALID}\n[telemetry]\notlp_endpoint = \"http://host\"\ninterval_secs = 60\n");
+        let text = format!("{VALID}\n[telemetry]\n{ENDPOINTS}interval_secs = 60\n");
         assert_eq!(rejected(&text), "telemetry needs journal");
     }
 
@@ -595,12 +619,11 @@ kind = "all-at-once"
             ("http://host:99999", "has an invalid port"),
             ("http://host:", "has an invalid port"),
         ] {
-            let message = rejected(&with_telemetry(
-                VALID,
-                &format!("otlp_endpoint = {endpoint:?}\ninterval_secs = 60\n"),
-            ));
-            let prefix = format!("telemetry.otlp_endpoint {endpoint:?} {reason}");
-            assert!(message.starts_with(&prefix), "{endpoint}: {message}");
+            for key in ["metrics_endpoint", "logs_endpoint"] {
+                let message = rejected(&with_telemetry(VALID, &one_endpoint(key, endpoint)));
+                let prefix = format!("telemetry.{key} {endpoint:?} {reason}");
+                assert!(message.starts_with(&prefix), "{endpoint}: {message}");
+            }
         }
     }
 
@@ -616,19 +639,18 @@ kind = "all-at-once"
             ("http://host/?api-key=secret", "has a query or fragment"),
             ("http://host/#secret", "has a query or fragment"),
         ] {
-            let message = rejected(&with_telemetry(
-                VALID,
-                &format!("otlp_endpoint = {endpoint:?}\ninterval_secs = 60\n"),
-            ));
-            let prefix = format!("telemetry.otlp_endpoint {reason}");
-            assert!(message.starts_with(&prefix), "{endpoint}: {message}");
-            assert!(!message.contains("secret"), "{endpoint}: {message}");
+            for key in ["metrics_endpoint", "logs_endpoint"] {
+                let message = rejected(&with_telemetry(VALID, &one_endpoint(key, endpoint)));
+                let prefix = format!("telemetry.{key} {reason}");
+                assert!(message.starts_with(&prefix), "{endpoint}: {message}");
+                assert!(!message.contains("secret"), "{endpoint}: {message}");
+            }
         }
     }
 
     #[test]
     fn telemetry_interval_out_of_range_and_empty_variable_are_rejected() {
-        let endpoint = "otlp_endpoint = \"http://host\"\n";
+        let endpoint = ENDPOINTS;
         assert_eq!(
             rejected(&with_telemetry(
                 VALID,
@@ -664,11 +686,19 @@ kind = "all-at-once"
     fn telemetry_unknown_or_missing_field_is_rejected_naming_it() {
         let message = rejected(&with_telemetry(
             VALID,
-            "otlp_endpoint = \"http://host\"\ninterval_sec = 60\n",
+            &format!("{ENDPOINTS}interval_sec = 60\n"),
         ));
         assert!(message.contains("interval_sec"), "{message}");
-        let message = rejected(&with_telemetry(VALID, "interval_secs = 60\n"));
-        assert!(message.contains("otlp_endpoint"), "{message}");
+        let message = rejected(&with_telemetry(
+            VALID,
+            "metrics_endpoint = \"http://host/v1/metrics\"\ninterval_secs = 60\n",
+        ));
+        assert!(message.contains("logs_endpoint"), "{message}");
+        let message = rejected(&with_telemetry(
+            VALID,
+            "logs_endpoint = \"http://host/v1/logs\"\ninterval_secs = 60\n",
+        ));
+        assert!(message.contains("metrics_endpoint"), "{message}");
     }
 
     #[test]

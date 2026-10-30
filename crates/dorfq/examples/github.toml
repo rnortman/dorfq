@@ -21,7 +21,8 @@
 # Telemetry: the queue's gauges and its events pushed over OTLP/HTTP to a
 # collector, every interval_secs; needs journal. See docs/running-on-github.md.
 # [telemetry]
-# otlp_endpoint = "http://127.0.0.1:4318"          # the collector's OTLP/HTTP base; /v1/metrics and /v1/logs are appended
+# metrics_endpoint = "http://127.0.0.1:4318/v1/metrics"   # the complete URL metrics are posted to, as given
+# logs_endpoint = "http://127.0.0.1:4318/v1/logs"         # the complete URL logs are posted to, as given
 # interval_secs = 60
 # encoding = "protobuf"                            # or "json", for a collector that takes only OTLP/JSON
 # authorization_env = "DORFQ_OTLP_AUTHORIZATION"   # the environment variable holding the Authorization header's value, if the collector needs one

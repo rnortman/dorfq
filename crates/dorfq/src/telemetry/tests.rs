@@ -1012,7 +1012,7 @@ fn record_carries_the_event_line_and_its_numbers() {
     }
 }
 
-type Requests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+type Requests = Arc<Mutex<Vec<(Signal, Vec<u8>)>>>;
 
 /// A sink that records every request and refuses each while `refusing` is
 /// set. Every exporter it serves encodes JSON.
@@ -1020,9 +1020,9 @@ fn recording(refusing: &Arc<AtomicBool>) -> (Sink, Requests) {
     let requests = Requests::default();
     let kept = Arc::clone(&requests);
     let refusing = Arc::clone(refusing);
-    let sink = Box::new(move |path: &str, encoding: Encoding, body: &[u8]| {
-        assert_eq!(encoding, Encoding::Json, "{path}");
-        kept.lock().unwrap().push((path.to_owned(), body.to_vec()));
+    let sink = Box::new(move |signal: Signal, encoding: Encoding, body: &[u8]| {
+        assert_eq!(encoding, Encoding::Json, "{signal}");
+        kept.lock().unwrap().push((signal, body.to_vec()));
         if refusing.load(Ordering::SeqCst) {
             Err("refused".to_owned())
         } else {
@@ -1051,15 +1051,15 @@ fn tick(at: u64, events: Vec<Event>, snapshot: Option<Snapshot>) -> Tick {
     }
 }
 
-fn paths_of(requests: &[(String, Vec<u8>)]) -> Vec<&str> {
-    requests.iter().map(|(path, _)| path.as_str()).collect()
+fn signals_of(requests: &[(Signal, Vec<u8>)]) -> Vec<Signal> {
+    requests.iter().map(|(signal, _)| *signal).collect()
 }
 
 fn json(body: &[u8]) -> Value {
     serde_json::from_slice(body).expect("a request body is JSON")
 }
 
-/// The metric `name` of a `/v1/metrics` body.
+/// The metric `name` of a metrics body.
 fn metric_in(body: &Value, name: &str) -> Value {
     body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
         .as_array()
@@ -1070,7 +1070,7 @@ fn metric_in(body: &Value, name: &str) -> Value {
         .clone()
 }
 
-/// The single value of the sum `name` in a `/v1/metrics` body.
+/// The single value of the sum `name` in a metrics body.
 fn sum_in(body: &Value, name: &str) -> String {
     metric_in(body, name)["sum"]["dataPoints"][0]["asInt"]
         .as_str()
@@ -1078,7 +1078,7 @@ fn sum_in(body: &Value, name: &str) -> String {
         .to_owned()
 }
 
-/// The log record bodies of a `/v1/logs` body.
+/// The log record bodies of a logs body.
 fn log_bodies(body: &Value) -> Vec<String> {
     body["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
         .as_array()
@@ -1112,8 +1112,8 @@ fn the_exporter_exports_on_its_interval_while_the_queue_idles() {
         .lock()
         .unwrap()
         .iter()
-        .map(|(path, body)| {
-            assert_eq!(path, "/v1/metrics");
+        .map(|(signal, body)| {
+            assert_eq!(*signal, Signal::Metrics);
             json(body)
         })
         .collect();
@@ -1153,7 +1153,7 @@ fn nothing_is_sent_before_a_snapshot_or_an_event() {
     });
     thread::sleep(Duration::from_millis(60));
     drop(exporter);
-    assert!(paths_of(&requests.lock().unwrap()).is_empty());
+    assert!(signals_of(&requests.lock().unwrap()).is_empty());
 }
 
 #[test]
@@ -1164,7 +1164,7 @@ fn dropping_the_exporter_exports_what_is_pending() {
     drop(exporter);
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].0, "/v1/logs");
+    assert_eq!(requests[0].0, Signal::Logs);
     assert_eq!(log_bodies(&json(&requests[0].1)).len(), 2);
 }
 
@@ -1175,7 +1175,7 @@ fn a_tick_with_events_and_no_snapshot_sends_logs_only() {
     let mut notes = Vec::new();
     pump.take(tick(7, ci_events(3), None), &mut notes);
     pump.export(8, &mut sink, &mut notes);
-    assert_eq!(paths_of(&requests.lock().unwrap()), ["/v1/logs"]);
+    assert_eq!(signals_of(&requests.lock().unwrap()), [Signal::Logs]);
     let body = json(&requests.lock().unwrap()[0].1);
     let record = &body["resourceLogs"][0]["scopeLogs"][0]["logRecords"][2];
     assert_eq!(record["timeUnixNano"], "2000000000");
@@ -1199,8 +1199,8 @@ fn a_failed_export_is_counted_said_once_and_its_events_kept() {
     assert_eq!(
         lines(&notes),
         [
-            "dorfq: telemetry: export to /v1/metrics failed: refused; retrying every 60s",
-            "dorfq: telemetry: export to /v1/logs failed: refused; retrying every 60s",
+            "dorfq: telemetry: metrics export failed: refused; retrying every 60s",
+            "dorfq: telemetry: logs export failed: refused; retrying every 60s",
         ]
     );
 
@@ -1208,7 +1208,7 @@ fn a_failed_export_is_counted_said_once_and_its_events_kept() {
     requests.lock().unwrap().clear();
     pump.export(10, &mut sink, &mut notes);
     let requests = requests.lock().unwrap();
-    assert_eq!(paths_of(&requests), ["/v1/metrics", "/v1/logs"]);
+    assert_eq!(signals_of(&requests), [Signal::Metrics, Signal::Logs]);
     let metrics = json(&requests[0].1);
     assert_eq!(
         sum_in(&metrics, "dorfq_telemetry_export_failures_total"),
@@ -1223,17 +1223,17 @@ fn a_failed_export_is_counted_said_once_and_its_events_kept() {
     assert_eq!(
         lines(&notes)[2..],
         [
-            "dorfq: telemetry: export to /v1/metrics resumed after 2 failed requests",
-            "dorfq: telemetry: export to /v1/logs resumed after 2 failed requests",
+            "dorfq: telemetry: metrics export resumed after 2 failed requests",
+            "dorfq: telemetry: logs export resumed after 2 failed requests",
         ]
     );
 }
 
 #[test]
-fn a_path_refused_while_the_other_delivers_is_said_once() {
-    let mut sink: Sink = Box::new(|path: &str, _: Encoding, _: &[u8]| match path {
-        "/v1/logs" => Err("HTTP 404: ".to_owned()),
-        _ => Ok(()),
+fn a_signal_refused_while_the_other_delivers_is_said_once() {
+    let mut sink: Sink = Box::new(|signal: Signal, _: Encoding, _: &[u8]| match signal {
+        Signal::Logs => Err("HTTP 404: ".to_owned()),
+        Signal::Metrics => Ok(()),
     });
     let mut pump = Pump::new(Duration::from_secs(60), 0, Encoding::Json);
     let mut notes = Vec::new();
@@ -1257,7 +1257,7 @@ fn a_path_refused_while_the_other_delivers_is_said_once() {
         lines(&notes),
         [
             "dorfq: telemetry: 10000 events pending; dropping the oldest until the collector takes them",
-            "dorfq: telemetry: export to /v1/logs failed: HTTP 404: ; retrying every 60s",
+            "dorfq: telemetry: logs export failed: HTTP 404: ; retrying every 60s",
         ]
     );
 }
@@ -1325,10 +1325,10 @@ fn the_buffer_keeps_the_newest_events_and_counts_the_dropped() {
         lines(&notes),
         [
             "dorfq: telemetry: 10000 events pending; dropping the oldest until the collector takes them",
-            "dorfq: telemetry: export to /v1/metrics failed: refused; retrying every 60s",
-            "dorfq: telemetry: export to /v1/logs failed: refused; retrying every 60s",
-            "dorfq: telemetry: export to /v1/metrics resumed after 1 failed requests",
-            "dorfq: telemetry: export to /v1/logs resumed after 1 failed requests, 1 events dropped",
+            "dorfq: telemetry: metrics export failed: refused; retrying every 60s",
+            "dorfq: telemetry: logs export failed: refused; retrying every 60s",
+            "dorfq: telemetry: metrics export resumed after 1 failed requests",
+            "dorfq: telemetry: logs export resumed after 1 failed requests, 1 events dropped",
         ]
     );
 }
@@ -1358,7 +1358,7 @@ fn a_refused_chunk_stops_the_export_and_keeps_the_rest() {
     let mut notes = Vec::new();
     pump.take(tick(7, ci_events(2_500), None), &mut notes);
     pump.export(8, &mut sink, &mut notes);
-    assert_eq!(paths_of(&requests.lock().unwrap()), ["/v1/logs"]);
+    assert_eq!(signals_of(&requests.lock().unwrap()), [Signal::Logs]);
     assert_eq!(pump.pending.len(), 2_500);
 }
 
@@ -1391,7 +1391,8 @@ fn tick_age_measures_from_the_last_observing_tick() {
 #[test]
 fn http_sink_refuses_an_authorization_variable_that_is_unset() {
     let config = TelemetryConfig {
-        otlp_endpoint: "http://127.0.0.1:4318".to_owned(),
+        metrics_endpoint: "http://127.0.0.1:4318/v1/metrics".to_owned(),
+        logs_endpoint: "http://127.0.0.1:4318/v1/logs".to_owned(),
         interval_secs: 60,
         encoding: Encoding::Protobuf,
         authorization_env: Some("DORFQ_TEST_OTLP_AUTHORIZATION_NEVER_SET".to_owned()),
@@ -1462,12 +1463,16 @@ fn the_http_sink_posts_json_with_the_authorization_header() {
     let (endpoint, server) =
         serve_once("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
     let authorization = authorization_header("AUTH", "Basic dTpw").unwrap();
-    let mut sink = post_to(format!("{endpoint}/otlp"), Some(authorization));
-    assert_eq!(sink("/v1/logs", Encoding::Json, b"{\"a\":1}"), Ok(()));
+    let mut sink = post_to(
+        format!("{endpoint}/never"),
+        format!("{endpoint}/insert/opentelemetry/v1/logs"),
+        Some(authorization),
+    );
+    assert_eq!(sink(Signal::Logs, Encoding::Json, b"{\"a\":1}"), Ok(()));
     let (head, body) = server.join().unwrap();
     let head = head.to_ascii_lowercase();
     assert!(
-        head.starts_with("post /otlp/v1/logs http/1.1\r\n"),
+        head.starts_with("post /insert/opentelemetry/v1/logs http/1.1\r\n"),
         "{head}"
     );
     assert!(
@@ -1479,12 +1484,54 @@ fn the_http_sink_posts_json_with_the_authorization_header() {
 }
 
 #[test]
+fn the_http_sink_posts_each_signal_to_its_own_url() {
+    let ok = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let (first, metrics_server) = serve_once(ok);
+    let (second, logs_server) = serve_once(ok);
+    let mut sink = post_to(
+        format!("{first}/opentelemetry/v1/metrics"),
+        format!("{second}/insert/opentelemetry/v1/logs/"),
+        None,
+    );
+    assert_eq!(
+        sink(Signal::Metrics, Encoding::Protobuf, &[0x0a, 0x00]),
+        Ok(())
+    );
+    assert_eq!(
+        sink(Signal::Logs, Encoding::Protobuf, &[0x0a, 0x00]),
+        Ok(())
+    );
+    let (head, _) = metrics_server.join().unwrap();
+    let head = head.to_ascii_lowercase();
+    assert!(
+        head.starts_with("post /opentelemetry/v1/metrics http/1.1\r\n"),
+        "{head}"
+    );
+    let (head, _) = logs_server.join().unwrap();
+    let head = head.to_ascii_lowercase();
+    assert!(
+        head.starts_with("post /insert/opentelemetry/v1/logs/ http/1.1\r\n"),
+        "{head}"
+    );
+}
+
+/// The sink posting to `/v1/metrics` and `/v1/logs` under `endpoint`, with
+/// no `Authorization` header.
+fn sink_at(endpoint: &str) -> Sink {
+    post_to(
+        format!("{endpoint}/v1/metrics"),
+        format!("{endpoint}/v1/logs"),
+        None,
+    )
+}
+
+#[test]
 fn the_http_sink_posts_protobuf_with_its_content_type() {
     let (endpoint, server) =
         serve_once("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-    let mut sink = post_to(endpoint, None);
+    let mut sink = sink_at(&endpoint);
     assert_eq!(
-        sink("/v1/metrics", Encoding::Protobuf, &[0x0a, 0x00]),
+        sink(Signal::Metrics, Encoding::Protobuf, &[0x0a, 0x00]),
         Ok(())
     );
     let (head, body) = server.join().unwrap();
@@ -1513,9 +1560,9 @@ fn the_http_sink_omits_a_refusal_body_that_is_not_text() {
     let status = b"\x08\x03\x12\x04bad\n";
     for content_type in ["application/x-protobuf", "Application/X-Protobuf ; x=y"] {
         let (endpoint, server) = serve_once(refusal(content_type, status));
-        let mut sink = post_to(endpoint, None);
+        let mut sink = sink_at(&endpoint);
         assert_eq!(
-            sink("/v1/metrics", Encoding::Protobuf, &[0x0a, 0x00]),
+            sink(Signal::Metrics, Encoding::Protobuf, &[0x0a, 0x00]),
             Err("HTTP 400: application/x-protobuf body omitted".to_owned())
         );
         server.join().unwrap();
@@ -1531,9 +1578,9 @@ fn the_http_sink_quotes_a_json_refusal_body_whatever_its_parameters() {
     ] {
         let (endpoint, server) =
             serve_once(refusal(content_type, br#"{"code":3,"message":"bad"}"#));
-        let mut sink = post_to(endpoint, None);
+        let mut sink = sink_at(&endpoint);
         assert_eq!(
-            sink("/v1/metrics", Encoding::Json, b"{}"),
+            sink(Signal::Metrics, Encoding::Json, b"{}"),
             Err(r#"HTTP 400: {"code":3,"message":"bad"}"#.to_owned()),
             "{content_type}"
         );
@@ -1551,9 +1598,9 @@ fn the_http_sink_quotes_a_text_refusal_body_and_one_with_an_empty_type() {
         "; charset=utf-8",
     ] {
         let (endpoint, server) = serve_once(refusal(content_type, b"bad\nrequest"));
-        let mut sink = post_to(endpoint, None);
+        let mut sink = sink_at(&endpoint);
         assert_eq!(
-            sink("/v1/metrics", Encoding::Json, b"{}"),
+            sink(Signal::Metrics, Encoding::Json, b"{}"),
             Err("HTTP 400: bad request".to_owned()),
             "{content_type:?}"
         );
@@ -1565,9 +1612,9 @@ fn the_http_sink_quotes_a_text_refusal_body_and_one_with_an_empty_type() {
 fn the_http_sink_cuts_a_long_media_type_to_200_characters() {
     let content_type = format!("application/{}", "x".repeat(1_000));
     let (endpoint, server) = serve_once(refusal(&content_type, b"\x08\x03"));
-    let mut sink = post_to(endpoint, None);
+    let mut sink = sink_at(&endpoint);
     assert_eq!(
-        sink("/v1/metrics", Encoding::Protobuf, &[0x0a, 0x00]),
+        sink(Signal::Metrics, Encoding::Protobuf, &[0x0a, 0x00]),
         Err(format!(
             "HTTP 400: application/{} body omitted",
             "x".repeat(188)
@@ -1585,9 +1632,9 @@ fn the_http_sink_reports_a_refusal_with_its_status_and_body_on_one_line() {
     )
     .leak();
     let (endpoint, server) = serve_once(response);
-    let mut sink = post_to(endpoint, None);
+    let mut sink = sink_at(&endpoint);
     let expected = format!("HTTP 503: <html> <title>busy</title> {}", "x".repeat(171));
-    assert_eq!(sink("/v1/metrics", Encoding::Json, b"{}"), Err(expected));
+    assert_eq!(sink(Signal::Metrics, Encoding::Json, b"{}"), Err(expected));
     server.join().unwrap();
 }
 
@@ -1596,10 +1643,10 @@ fn the_http_sink_does_not_follow_a_redirect() {
     let (endpoint, server) = serve_once(
         "HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 5\r\nConnection: close\r\n\r\nmoved",
     );
-    let mut sink = post_to(endpoint, None);
+    let mut sink = sink_at(&endpoint);
     // A followed redirect would reach a closed port and fail otherwise.
     assert_eq!(
-        sink("/v1/metrics", Encoding::Json, b"{}"),
+        sink(Signal::Metrics, Encoding::Json, b"{}"),
         Err("HTTP 302: moved".to_owned())
     );
     server.join().unwrap();
@@ -1611,7 +1658,7 @@ fn the_http_sink_reports_a_collector_that_is_not_there() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         format!("http://{}", listener.local_addr().unwrap())
     };
-    let mut sink = post_to(endpoint, None);
-    let error = sink("/v1/metrics", Encoding::Json, b"{}").unwrap_err();
+    let mut sink = sink_at(&endpoint);
+    let error = sink(Signal::Metrics, Encoding::Json, b"{}").unwrap_err();
     assert!(!error.starts_with("HTTP "), "{error}");
 }

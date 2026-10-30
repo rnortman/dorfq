@@ -355,7 +355,7 @@ pub fn record(event: &Event, observed_at: u64) -> LogRecord {
 /// Events held for delivery at most; past it the oldest are dropped.
 pub const EVENT_BUFFER: usize = 10_000;
 
-/// Log records per `/v1/logs` request at most.
+/// Log records per logs request at most.
 pub const LOGS_PER_REQUEST: usize = 1_000;
 
 /// The bound on one request, connection to response.
@@ -374,9 +374,26 @@ pub struct Tick {
     pub observed: bool,
 }
 
-/// Sends one request body, in the given encoding, to `path` (`/v1/metrics`
-/// or `/v1/logs`); `Err` is the failure's description.
-pub type Sink = Box<dyn FnMut(&str, Encoding, &[u8]) -> Result<(), String> + Send>;
+/// An OTLP signal the exporter sends: what a request body carries and
+/// which URL it is posted to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Signal {
+    Metrics,
+    Logs,
+}
+
+impl fmt::Display for Signal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Signal::Metrics => "metrics",
+            Signal::Logs => "logs",
+        })
+    }
+}
+
+/// Sends one request body, in the given encoding, for `signal`; `Err` is
+/// the failure's description.
+pub type Sink = Box<dyn FnMut(Signal, Encoding, &[u8]) -> Result<(), String> + Send>;
 
 /// The exporter thread's handle. Dropping it hands the thread nothing more
 /// and waits for the export in flight, if any, then for one last export:
@@ -461,9 +478,9 @@ struct Pump {
     latest: Option<Snapshot>,
     last_observed_at: Option<u64>,
     counters: Counters,
-    /// Per path, the requests failed since the last one delivered there.
-    failed_runs: BTreeMap<&'static str, u64>,
-    /// Events dropped since the last `/v1/logs` request delivered.
+    /// Per signal, the requests failed since the last one delivered.
+    failed_runs: BTreeMap<Signal, u64>,
+    /// Events dropped since the last logs request delivered.
     dropped_run: u64,
 }
 
@@ -526,8 +543,8 @@ impl Pump {
                 SCOPE,
                 &metrics(latest, tick_age, &self.counters, at),
             );
-            let result = sink("/v1/metrics", self.encoding, &body);
-            self.count("/v1/metrics", result, notes);
+            let result = sink(Signal::Metrics, self.encoding, &body);
+            self.count(Signal::Metrics, result, notes);
         }
         while !self.pending.is_empty() {
             let chunk = self.pending.len().min(LOGS_PER_REQUEST);
@@ -537,8 +554,8 @@ impl Pump {
                 .map(|(observed_at, event)| record(event, *observed_at))
                 .collect();
             let body = otlp::logs_request(self.encoding, &resource, SCOPE, &records);
-            let result = sink("/v1/logs", self.encoding, &body);
-            if !self.count("/v1/logs", result, notes) {
+            let result = sink(Signal::Logs, self.encoding, &body);
+            if !self.count(Signal::Logs, result, notes) {
                 break;
             }
             self.pending.drain(..chunk);
@@ -546,22 +563,16 @@ impl Pump {
     }
 
     /// Counts one request's `result` and says so on a change between
-    /// delivering and failing on `path`; a delivered `/v1/logs` request
-    /// also ends a run of drops and says how many. Whether it was
-    /// delivered.
-    fn count(
-        &mut self,
-        path: &'static str,
-        result: Result<(), String>,
-        notes: &mut dyn Write,
-    ) -> bool {
-        let run = self.failed_runs.entry(path).or_default();
+    /// delivering and failing for `signal`; a delivered logs request also
+    /// ends a run of drops and says how many. Whether it was delivered.
+    fn count(&mut self, signal: Signal, result: Result<(), String>, notes: &mut dyn Write) -> bool {
+        let run = self.failed_runs.entry(signal).or_default();
         match result {
             Ok(()) => {
                 let failed = std::mem::take(run);
-                let dropped = match path {
-                    "/v1/logs" => std::mem::take(&mut self.dropped_run),
-                    _ => 0,
+                let dropped = match signal {
+                    Signal::Logs => std::mem::take(&mut self.dropped_run),
+                    Signal::Metrics => 0,
                 };
                 match (failed, dropped) {
                     (0, 0) => {}
@@ -571,12 +582,12 @@ impl Pump {
                     ),
                     (failed, 0) => note(
                         notes,
-                        format_args!("export to {path} resumed after {failed} failed requests"),
+                        format_args!("{signal} export resumed after {failed} failed requests"),
                     ),
                     (failed, dropped) => note(
                         notes,
                         format_args!(
-                            "export to {path} resumed after {failed} failed requests, \
+                            "{signal} export resumed after {failed} failed requests, \
                              {dropped} events dropped"
                         ),
                     ),
@@ -588,7 +599,7 @@ impl Pump {
                     note(
                         notes,
                         format_args!(
-                            "export to {path} failed: {error}; retrying every {:?}",
+                            "{signal} export failed: {error}; retrying every {:?}",
                             self.interval
                         ),
                     );
@@ -635,8 +646,8 @@ impl fmt::Display for AuthorizationError {
 
 impl std::error::Error for AuthorizationError {}
 
-/// A [`Sink`] that POSTs each body to the configured collector as its
-/// encoding's content type, with the `Authorization` header when
+/// A [`Sink`] that POSTs each body to the configured URL for its signal,
+/// as its encoding's content type, with the `Authorization` header when
 /// one is configured. A 2xx is delivered; any other status, or no response,
 /// is the failure's description: the status, and the start of the body
 /// when it is text, or its media type when it is not.
@@ -649,7 +660,11 @@ pub fn http_sink(config: &TelemetryConfig) -> Result<Sink, AuthorizationError> {
             None => Err(AuthorizationError::Missing { var: var.clone() }),
         })
         .transpose()?;
-    Ok(post_to(config.otlp_endpoint.clone(), authorization))
+    Ok(post_to(
+        config.metrics_endpoint.clone(),
+        config.logs_endpoint.clone(),
+        authorization,
+    ))
 }
 
 /// `value`, read from the variable `var`, as a header value; never echoed.
@@ -661,9 +676,9 @@ fn authorization_header(var: &str, value: &str) -> Result<HeaderValue, Authoriza
     Ok(header)
 }
 
-/// The sink of [`http_sink`] for `endpoint` and an already checked
-/// `authorization`.
-fn post_to(endpoint: String, authorization: Option<HeaderValue>) -> Sink {
+/// The sink of [`http_sink`] for the two signals' URLs and an already
+/// checked `authorization`.
+fn post_to(metrics_url: String, logs_url: String, authorization: Option<HeaderValue>) -> Sink {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .https_only(false)
@@ -672,9 +687,13 @@ fn post_to(endpoint: String, authorization: Option<HeaderValue>) -> Sink {
         .user_agent(crate::user_agent())
         .build()
         .into();
-    Box::new(move |path: &str, encoding: Encoding, body: &[u8]| {
+    Box::new(move |signal: Signal, encoding: Encoding, body: &[u8]| {
+        let url = match signal {
+            Signal::Metrics => &metrics_url,
+            Signal::Logs => &logs_url,
+        };
         let mut request = agent
-            .post(format!("{endpoint}{path}"))
+            .post(url.as_str())
             .header("Content-Type", encoding.content_type());
         if let Some(authorization) = &authorization {
             request = request.header("Authorization", authorization.clone());

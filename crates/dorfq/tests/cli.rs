@@ -751,11 +751,13 @@ fn serve(mut stream: TcpStream, received: &Mutex<Vec<Received>>) {
     }
 }
 
-/// Appends a `[telemetry]` table pointing at `port` to `config`.
-fn with_telemetry(config: &Path, port: u16, extra: &str) {
+/// Appends a `[telemetry]` table posting metrics to `metrics_url` and logs
+/// to `logs_url` to `config`.
+fn with_telemetry(config: &Path, metrics_url: &str, logs_url: &str, extra: &str) {
     let mut text = fs::read_to_string(config).expect("read config");
     text.push_str(&format!(
-        "\n[telemetry]\notlp_endpoint = \"http://127.0.0.1:{port}\"\ninterval_secs = 3600\n{extra}"
+        "\n[telemetry]\nmetrics_endpoint = {metrics_url:?}\nlogs_endpoint = {logs_url:?}\n\
+         interval_secs = 3600\n{extra}"
     ));
     fs::write(config, text).expect("write config");
 }
@@ -985,7 +987,7 @@ fn protobuf_attributes(key_values: Vec<&Payload>) -> Vec<(String, AttrView)> {
         .collect()
 }
 
-/// A `/v1/metrics` request read by its content type.
+/// A metrics request read by its content type.
 fn metrics_view(received: &Received) -> MetricsView {
     match received.content_type.as_str() {
         JSON => {
@@ -1063,7 +1065,7 @@ fn metrics_view(received: &Received) -> MetricsView {
     }
 }
 
-/// A `/v1/logs` request's records, read by its content type.
+/// A logs request's records, read by its content type.
 fn logs_view(received: &Received) -> Vec<RecordView> {
     match received.content_type.as_str() {
         JSON => {
@@ -1106,43 +1108,48 @@ fn logs_view(received: &Received) -> Vec<RecordView> {
     }
 }
 
-/// Runs `dorfq run --exit-when-idle` against a collector, with `extra` in
-/// its `[telemetry]` table, and checks that every request is posted as
-/// `content_type` and carries the queue's gauges and every event.
+/// Runs `dorfq run --exit-when-idle` against a metrics collector and a
+/// logs collector on their own ports and paths, with `extra` in its
+/// `[telemetry]` table, and checks that every request is posted to its
+/// signal's URL as `content_type` and that they carry the queue's gauges
+/// and every event.
 fn assert_a_run_pushes_its_gauges_and_every_event(name: &str, extra: &str, content_type: &str) {
-    let collector = Collector::start();
+    const METRICS_PATH: &str = "/opentelemetry/v1/metrics";
+    const LOGS_PATH: &str = "/insert/opentelemetry/v1/logs";
+    let metrics_collector = Collector::start();
+    let logs_collector = Collector::start();
     let (config, dir) = journaled_config(name);
-    with_telemetry(&config, collector.port, extra);
+    with_telemetry(
+        &config,
+        &format!("http://127.0.0.1:{}{METRICS_PATH}", metrics_collector.port),
+        &format!("http://127.0.0.1:{}{LOGS_PATH}", logs_collector.port),
+        extra,
+    );
     let output = Command::new(env!("DORFQ_BIN"))
         .args(["run", "--config"])
         .arg(&config)
         .arg("--exit-when-idle")
         .output()
         .expect("spawn dorfq");
-    let received = collector.stop();
+    let metrics_received = metrics_collector.stop();
+    let logs_received = logs_collector.stop();
     assert!(output.status.success(), "dorfq run: {output:?}");
-    for request in &received {
-        assert!(
-            request.path == "/v1/metrics" || request.path == "/v1/logs",
-            "{}",
-            request.path
-        );
-        assert_eq!(request.content_type, content_type);
+    for (received, path) in [
+        (&metrics_received, METRICS_PATH),
+        (&logs_received, LOGS_PATH),
+    ] {
+        for request in received {
+            assert_eq!(request.path, path);
+            assert_eq!(request.content_type, content_type);
+        }
     }
-    let metrics: Vec<MetricsView> = received
-        .iter()
-        .filter(|r| r.path == "/v1/metrics")
-        .map(metrics_view)
-        .collect();
-    let records: Vec<RecordView> = received
-        .iter()
-        .filter(|r| r.path == "/v1/logs")
-        .flat_map(logs_view)
-        .collect();
+    let metrics: Vec<MetricsView> = metrics_received.iter().map(metrics_view).collect();
+    let records: Vec<RecordView> = logs_received.iter().flat_map(logs_view).collect();
     assert!(
         !metrics.is_empty() && !records.is_empty(),
-        "{} requests",
-        received.len()
+        "{} metrics and {} logs requests",
+        metrics_received.len(),
+        logs_received.len()
     );
 
     let last = metrics.last().expect("a metrics body");
@@ -1259,7 +1266,12 @@ fn a_run_without_telemetry_opens_no_connection() {
 fn telemetry_with_an_unset_authorization_variable_exits_one_naming_it() {
     let var = "DORFQ_TEST_OTLP_AUTHORIZATION_UNSET";
     let (config, _) = journaled_config("telemetry-unset-authorization");
-    with_telemetry(&config, 1, &format!("authorization_env = \"{var}\"\n"));
+    with_telemetry(
+        &config,
+        "http://127.0.0.1:1/v1/metrics",
+        "http://127.0.0.1:1/v1/logs",
+        &format!("authorization_env = \"{var}\"\n"),
+    );
     run_exits_one_naming(
         &config,
         &format!("dorfq: telemetry.authorization_env {var} is unset"),

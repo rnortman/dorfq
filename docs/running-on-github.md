@@ -798,16 +798,20 @@ or as JSON:
 journal = "dorfq.journal"
 
 [telemetry]
-otlp_endpoint = "http://127.0.0.1:4318"
+metrics_endpoint = "http://127.0.0.1:4318/v1/metrics"
+logs_endpoint = "http://127.0.0.1:4318/v1/logs"
 interval_secs = 60
 encoding = "protobuf"
 authorization_env = "DORFQ_OTLP_AUTHORIZATION"
 ```
 
-- `otlp_endpoint` is the collector's OTLP/HTTP base URL, `http://` or
-  `https://`; the queue posts to `<otlp_endpoint>/v1/metrics` and
-  `<otlp_endpoint>/v1/logs`. A path is kept (`https://host/otlp` posts to
-  `https://host/otlp/v1/metrics`), and a trailing `/` is dropped.
+- `metrics_endpoint` and `logs_endpoint` are the complete URLs the metrics
+  and the logs requests are posted to, `http://` or `https://`, used as
+  given: nothing is appended. The OpenTelemetry Collector takes both on one
+  port, `http://host:4318/v1/metrics` and `http://host:4318/v1/logs`; a
+  collector that serves the two signals from different ports or paths
+  (VictoriaMetrics at `/opentelemetry/v1/metrics`, VictoriaLogs at
+  `/insert/opentelemetry/v1/logs`) gets each URL as it documents it.
 - `interval_secs` is the time between exports, from 1 to 86400 (a day).
 - `encoding`, optional, is `protobuf` (the default; bodies are posted as
   `application/x-protobuf`) or `json` (`application/json`). Protobuf is the
@@ -823,11 +827,11 @@ authorization_env = "DORFQ_OTLP_AUTHORIZATION"
 stream the queue derives as it journals. It works under either forge.
 
 A configuration the queue cannot use stops it at load: `telemetry needs
-journal`; `telemetry.otlp_endpoint "<url>" is not a URL: …`, `… is not an
-http:// or https:// URL`, `… has no host` or `… has an invalid port`;
-`telemetry.otlp_endpoint carries credentials; use authorization_env` or
-`telemetry.otlp_endpoint has a query or fragment` (an endpoint that could
-hold a secret is not repeated); `telemetry.interval_secs is 0` or `… is above 86400`;
+journal`; `telemetry.metrics_endpoint "<url>" is not a URL: …`, `… is not
+an http:// or https:// URL`, `… has no host` or `… has an invalid port`;
+`telemetry.metrics_endpoint carries credentials; use authorization_env` or
+`telemetry.metrics_endpoint has a query or fragment` (an endpoint that could
+hold a secret is not repeated), and the same for `telemetry.logs_endpoint`; `telemetry.interval_secs is 0` or `… is above 86400`;
 `telemetry.authorization_env is empty`. `encoding` set to anything else is
 refused by the parser: ``unknown variant `xml`, expected `protobuf` or
 `json` ``. At start, before the forge is
@@ -896,18 +900,18 @@ again.
 
 The queue never waits on the collector: a thread of its own exports every
 `interval_secs`, whatever the queue is doing, and once more when the queue
-exits, idle or fatal. An export is one `/v1/metrics` request, then the
+exits, idle or fatal. An export is one metrics request, then the
 pending log records in requests of 1,000. A request is bounded by 10
 seconds; any answer but a 2xx is a failure, and a redirect is not followed.
 
 A failed request is counted in `dorfq_telemetry_export_failures_total` and
 tried again at the next interval; a refused log request keeps its records
-and the ones after it for then. Each path says it once on stderr when it
-starts failing, `dorfq: telemetry: export to /v1/logs failed: <error>;
-retrying every 60s`, with a refused answer's status and its first 200 bytes
-on one line, and once when it recovers, `dorfq: telemetry: export to
-/v1/logs resumed after <n> failed requests`. A collector that takes metrics
-and refuses logs is reported for `/v1/logs` alone, once. A refusal whose body
+and the ones after it for then. Each signal says it once on stderr when it
+starts failing, `dorfq: telemetry: logs export failed: <error>; retrying
+every 60s`, with a refused answer's status and its first 200 bytes on one
+line, and once when it recovers, `dorfq: telemetry: logs export resumed
+after <n> failed requests`. A collector that takes metrics and refuses logs
+is reported for logs alone, once. A refusal whose body
 is not text (a protobuf `Status`, for instance) is noted as `HTTP <status>:
 <type> body omitted`, its media type (its first 200 characters) in place
 of its bytes; one with an empty media type is quoted as one with none.
