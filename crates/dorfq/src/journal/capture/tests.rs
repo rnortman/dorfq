@@ -374,3 +374,67 @@ fn a_moved_head_writes_nothing_and_is_fetched_when_sighted_again() {
     assert_eq!(script.calls, [(1, sha(1)), (1, sha(1))]);
     assert_eq!(super::super::tests::text_lines(&path).len(), 1);
 }
+
+#[test]
+fn a_drain_reads_every_pending_head_past_the_per_tick_bound() {
+    let path = dir("capture-drain").join("q.capture");
+    let mut capture = open(&path);
+    let mut script = Script::default();
+    script.answer(3, sha(3), Ok(Err(sha(33))));
+    let sighted: Vec<Event> = (1..=20).map(|pr| arrive(5, pr, &sha(pr))).collect();
+    capture.sight(&sighted);
+    let lines = capture
+        .drain(1001, &mut |pr, head| script.read(pr, head))
+        .unwrap();
+    assert_eq!(
+        lines,
+        [format!(
+            "capture of #3 at {} not read: the head moved to {}",
+            sha(3),
+            sha(33)
+        )]
+    );
+    assert_eq!(script.calls.len(), 20);
+    let recorded: Vec<u64> = records(&path)
+        .iter()
+        .map(|r| r["pr"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        recorded,
+        (1..=20).filter(|&pr| pr != 3).collect::<Vec<u64>>()
+    );
+    assert!(records(&path).iter().all(|r| r["at"] == 1001));
+}
+
+#[test]
+fn a_drain_stops_at_a_transient_failure_and_names_each_head_left() {
+    let path = dir("capture-drain-transient").join("q.capture");
+    let mut capture = open(&path);
+    let mut script = Script::default();
+    script.answer(
+        12,
+        sha(12),
+        Err(ForgeError::Transient("GET /pulls/12: HTTP 429".into())),
+    );
+    let sighted: Vec<Event> = (1..=14).map(|pr| arrive(5, pr, &sha(pr))).collect();
+    capture.sight(&sighted);
+    let lines = capture
+        .drain(1001, &mut |pr, head| script.read(pr, head))
+        .unwrap();
+    let asked: Vec<u64> = script.calls.iter().map(|(pr, _)| *pr).collect();
+    assert_eq!(asked, (1..=12).collect::<Vec<u64>>());
+    let left = |pr: u64| format!("capture of #{pr} at {} not read before the exit", sha(pr));
+    assert_eq!(
+        lines,
+        [
+            format!(
+                "capture of #12 at {}: GET /pulls/12: HTTP 429; retrying",
+                sha(12)
+            ),
+            left(12),
+            left(13),
+            left(14),
+        ]
+    );
+    assert_eq!(records(&path).len(), 11);
+}

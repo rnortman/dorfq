@@ -182,6 +182,36 @@ impl Capture {
         read: &mut Reader<'_>,
     ) -> Result<Vec<String>, JournalError> {
         let mut lines = Vec::new();
+        self.ask(at, read, &mut lines)?;
+        Ok(lines)
+    }
+
+    /// Fetches as [`Capture::fetch`] does, call after call, until nothing
+    /// is pending or a transient failure ends a call; then names each head
+    /// still pending as not read. Returns the operator's lines.
+    pub(super) fn drain(
+        &mut self,
+        at: u64,
+        read: &mut Reader<'_>,
+    ) -> Result<Vec<String>, JournalError> {
+        let mut lines = Vec::new();
+        while !self.pending.is_empty() && self.ask(at, read, &mut lines)? {}
+        for (pr, head) in self.pending.keys() {
+            lines.push(format!(
+                "capture of #{pr} at {head} not read before the exit"
+            ));
+        }
+        Ok(lines)
+    }
+
+    /// One [`Capture::fetch`], its operator lines pushed onto `lines`;
+    /// false when a transient failure ended it.
+    fn ask(
+        &mut self,
+        at: u64,
+        read: &mut Reader<'_>,
+        lines: &mut Vec<String>,
+    ) -> Result<bool, JournalError> {
         let keys: Vec<(u64, Sha)> = match &self.last {
             Some(last) => self
                 .pending
@@ -214,13 +244,13 @@ impl Capture {
                 }
                 Err(ForgeError::Transient(e)) => {
                     lines.push(format!("capture of #{pr} at {head}: {e}; retrying"));
-                    break;
+                    return Ok(false);
                 }
             }
             self.pending.remove(&key);
             self.seen.insert(key);
         }
-        Ok(lines)
+        Ok(true)
     }
 
     /// Appends the record of pending `key`, fetched at `at`.

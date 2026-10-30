@@ -248,6 +248,8 @@ fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
                 eprintln!("dorfq: {error}; retrying");
             }
         }
+        let exiting = matches!(&ticked, Ok(report)
+            if exit_when_idle && report.idle && !(built.has_scheduled_events)());
         if let Some(writer) = &mut journal {
             let at = unix_now();
             let events = match writer.record(driver.ticks() - 1, at, &ticked) {
@@ -284,13 +286,34 @@ fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
                     observed: report.is_some() && !fatal,
                 });
             }
-        }
-        match ticked {
-            Ok(report) => {
-                if exit_when_idle && report.idle && !(built.has_scheduled_events)() {
-                    return ExitCode::SUCCESS;
+            // Last, so the journal line, the events, the status write and
+            // the export are ahead of any GitHub round trip. Only after a
+            // tick whose forge calls all succeeded: a failed one may have
+            // lost the repository or been told to pause. The idle exit reads
+            // every head still owed, since the segment that shows them may
+            // have just closed.
+            let captured = if exiting {
+                writer.drain_capture(at, built.capture.as_mut())
+            } else if ticked.is_ok() {
+                writer.capture(at, built.capture.as_mut())
+            } else {
+                Ok(Vec::new())
+            };
+            match captured {
+                Ok(lines) => {
+                    for line in lines {
+                        eprintln!("dorfq: {line}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("dorfq: {error}");
+                    return ExitCode::FAILURE;
                 }
             }
+        }
+        match ticked {
+            Ok(_) if exiting => return ExitCode::SUCCESS,
+            Ok(_) => {}
             Err(error) if error.is_fatal() => return ExitCode::FAILURE,
             Err(_) => outcome = Outcome::Transient,
         }

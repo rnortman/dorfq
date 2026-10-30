@@ -261,8 +261,6 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> JournalError + '_ {
 /// the fold produced for it.
 pub type Sink<'a> = &'a mut dyn FnMut(Option<&Observation>, &[Event]);
 
-// TODO(journal-capture-at-first-sight): each pull request head's changed
-// paths, with additions and deletions, recorded once beside the journal.
 /// Appends a running process's ticks to the journal at one path, rotating
 /// closed segments aside, and folds them into the event stream, appended to
 /// the events file when there is one and sighting heads for the capture
@@ -666,6 +664,21 @@ impl Writer {
     pub fn capture(&mut self, at: u64, read: &mut Reader<'_>) -> Result<Vec<String>, JournalError> {
         match &mut self.capture {
             Some(capture) => capture.fetch(at, read),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Reads, as [`Writer::capture`] does, every head still owed a record,
+    /// until none is left or a transient failure stops it; for a process
+    /// about to exit. Each head left unread gets a line of its own among
+    /// those returned. Does nothing without a capture file.
+    pub fn drain_capture(
+        &mut self,
+        at: u64,
+        read: &mut Reader<'_>,
+    ) -> Result<Vec<String>, JournalError> {
+        match &mut self.capture {
+            Some(capture) => capture.drain(at, read),
             None => Ok(Vec::new()),
         }
     }

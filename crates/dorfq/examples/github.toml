@@ -13,6 +13,10 @@
 # The events file: the journal's event stream, one JSON line per event,
 # rotated with it; needs journal. See docs/running-on-github.md.
 # events = "dorfq.events"
+# The capture file: each pull request head's changed files, read from GitHub
+# once when the queue first sees the head, rotated with the journal; needs
+# journal. See docs/running-on-github.md.
+# capture = "dorfq.capture"
 
 # Telemetry: the queue's gauges and its events pushed over OTLP/HTTP to a
 # collector, every interval_secs; needs journal. See docs/running-on-github.md.

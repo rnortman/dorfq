@@ -393,18 +393,7 @@ fn the_journal_verbs_read_a_runs_segments() {
         .output()
         .expect("spawn dorfq");
     assert!(output.status.success(), "dorfq run: {output:?}");
-    let mut closed: Vec<PathBuf> = fs::read_dir(&dir)
-        .expect("read dir")
-        .map(|e| e.expect("entry").path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("q.journal."))
-        })
-        .collect();
-    closed.sort();
-    let mut segments = closed;
-    segments.push(dir.join("q.journal"));
+    let segments = segments(&dir, "q.journal");
 
     let events = journal(&["events"], &segments);
     assert!(events.lines().all(|l| l.starts_with("{\"t\":")), "{events}");
@@ -412,9 +401,7 @@ fn the_journal_verbs_read_a_runs_segments() {
     // `dorfq journal events` prints over the segments.
     let mut written = String::new();
     for segment in &segments {
-        let name = segment.file_name().and_then(|n| n.to_str()).expect("UTF-8");
-        let beside = segment.with_file_name(name.replacen("q.journal", "q.events", 1));
-        written += &fs::read_to_string(&beside).expect("an events segment beside");
+        written += &beside(segment, "q.events");
     }
     assert_eq!(written, events);
     assert!(events.contains("\"kind\":\"arrive\""), "{events}");
@@ -434,6 +421,177 @@ fn the_journal_verbs_read_a_runs_segments() {
     assert!(report.starts_with("{\"schema\":4,"), "{report}");
     assert!(report.contains("\"name\":\"scenario\""), "{report}");
     assert!(report.contains("\"kind\":\"all-at-once\""), "{report}");
+}
+
+/// The files in `dir` named `prefix` or `prefix.<suffix>`: the closed ones
+/// in name order, then the current one.
+fn segments(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let closed = format!("{prefix}.");
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+        .expect("read dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&closed))
+        })
+        .collect();
+    paths.sort();
+    paths.push(dir.join(prefix));
+    paths
+}
+
+/// The contents of the file `what` pairs with the journal segment
+/// `segment`: `q.journal.<suffix>` with `q.events` gives `q.events.<suffix>`.
+fn beside(segment: &Path, what: &str) -> String {
+    let name = segment.file_name().and_then(|n| n.to_str()).expect("UTF-8");
+    fs::read_to_string(segment.with_file_name(name.replacen("q.journal", what, 1)))
+        .expect("a file beside the segment")
+}
+
+/// The `(pr, head)` of every line of `text` that `keep` accepts.
+fn keys(text: &str, keep: impl Fn(&Value) -> bool) -> Vec<(u64, String)> {
+    text.lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("a JSON line"))
+        .filter(|value| keep(value))
+        .map(|value| {
+            (
+                value["pr"].as_u64().expect("a pr"),
+                value["head"].as_str().expect("a head").to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The `(pr, head)` of every `arrive` and `repush` event in `text`.
+fn sighted(text: &str) -> Vec<(u64, String)> {
+    keys(text, |event| {
+        matches!(event["kind"].as_str(), Some("arrive" | "repush"))
+    })
+}
+
+#[test]
+fn a_journaled_run_captures_every_head_once() {
+    let dir = PathBuf::from(std::env::var("TEST_TMPDIR").expect("TEST_TMPDIR under bazel test"))
+        .join("capture-run");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create dir");
+    fs::write(
+        dir.join("scenario.toml"),
+        "ci_ticks = 2\n\n[[pr]]\nnumber = 1\n\n[[pr]]\nnumber = 2\nrepush_at = 1\n\n\
+         [[pr]]\nnumber = 3\n",
+    )
+    .expect("write scenario");
+    let config = dir.join("dorfq.toml");
+    fs::write(
+        &config,
+        "journal = \"q.journal\"\nevents = \"q.events\"\ncapture = \"q.capture\"\n\n\
+         [forge]\nkind = \"mock\"\nscenario = \"scenario.toml\"\n\n\
+         [scheduler]\nkind = \"all-at-once\"\n",
+    )
+    .expect("write config");
+    let run = || {
+        let output = Command::new(env!("DORFQ_BIN"))
+            .args(["run", "--config"])
+            .arg(&config)
+            .arg("--exit-when-idle")
+            .output()
+            .expect("spawn dorfq");
+        assert!(output.status.success(), "dorfq run: {output:?}");
+        let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+        assert!(!stderr.contains("capture of"), "stderr: {stderr:?}");
+    };
+
+    run();
+    let first = segments(&dir, "q.journal");
+    let mut heads = sighted(&journal(&["events"], &first));
+    heads.sort();
+    heads.dedup();
+    assert_eq!(
+        heads.iter().filter(|(pr, _)| *pr == 2).count(),
+        2,
+        "{heads:?}"
+    );
+    let mut recorded = Vec::new();
+    for path in segments(&dir, "q.capture") {
+        let text = fs::read_to_string(&path).expect("read capture");
+        for line in text.lines() {
+            let record: Value = serde_json::from_str(line).expect("a JSON record");
+            assert_eq!(record["capture"], 1, "{line}");
+            assert_eq!(record["files"].as_array().map(Vec::len), Some(1), "{line}");
+        }
+        recorded.extend(keys(&text, |_| true));
+    }
+    recorded.sort();
+    assert_eq!(recorded, heads, "each sighted head recorded exactly once");
+
+    // The idle exit rotated all three files, so the second run starts on
+    // empty ones: it records again only the heads it sees arrive, each in
+    // the capture file paired with the journal segment that shows it.
+    run();
+    let journals = segments(&dir, "q.journal");
+    assert!(journals.len() > first.len(), "{journals:?}");
+    let mut all = Vec::new();
+    for segment in &journals {
+        let mut shown = sighted(&beside(segment, "q.events"));
+        shown.sort();
+        shown.dedup();
+        let mut held = keys(&beside(segment, "q.capture"), |_| true);
+        held.sort();
+        assert_eq!(held, shown, "the capture file beside {segment:?}");
+        all.extend(held);
+    }
+    let mut every = sighted(&journal(&["events"], &journals));
+    every.sort();
+    every.dedup();
+    all.sort();
+    all.dedup();
+    assert_eq!(all, every, "deduped by key, one record per head");
+}
+
+#[test]
+fn an_idle_exit_reads_every_head_still_owed() {
+    // Forty pull requests arriving at once outlast the eight heads a tick
+    // reads before the run goes idle; the idle exit reads the rest.
+    let dir = PathBuf::from(std::env::var("TEST_TMPDIR").expect("TEST_TMPDIR under bazel test"))
+        .join("capture-drain");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create dir");
+    let mut scenario = String::from("ci_ticks = 1\n");
+    for number in 1..=40 {
+        scenario.push_str(&format!("\n[[pr]]\nnumber = {number}\n"));
+    }
+    fs::write(dir.join("scenario.toml"), scenario).expect("write scenario");
+    let config = dir.join("dorfq.toml");
+    fs::write(
+        &config,
+        "journal = \"q.journal\"\nevents = \"q.events\"\ncapture = \"q.capture\"\n\n\
+         [forge]\nkind = \"mock\"\nscenario = \"scenario.toml\"\n\n\
+         [scheduler]\nkind = \"all-at-once\"\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("DORFQ_BIN"))
+        .args(["run", "--config"])
+        .arg(&config)
+        .arg("--exit-when-idle")
+        .output()
+        .expect("spawn dorfq");
+    assert!(output.status.success(), "dorfq run: {output:?}");
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(!stderr.contains("capture of"), "stderr: {stderr:?}");
+    let mut heads = sighted(&journal(&["events"], &segments(&dir, "q.journal")));
+    heads.sort();
+    heads.dedup();
+    assert_eq!(heads.len(), 40, "{heads:?}");
+    let mut recorded = Vec::new();
+    for path in segments(&dir, "q.capture") {
+        recorded.extend(keys(
+            &fs::read_to_string(&path).expect("read capture"),
+            |_| true,
+        ));
+    }
+    recorded.sort();
+    assert_eq!(recorded, heads, "each sighted head recorded exactly once");
 }
 
 #[test]

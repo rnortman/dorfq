@@ -13,16 +13,17 @@ use std::sync::mpsc::{self, Receiver};
 
 use dorfq_core::{
     BatchId, BatchStart, EjectReason, Forge, ForgeError, NoticeReason, Observation, PrNumber,
-    Scheduler,
+    Scheduler, Sha,
 };
-use dorfq_forge_github::api::{ApiError, Auth, GitHubApi, RestClient};
+use dorfq_forge_github::api::{ApiError, Auth, ChangedFile, GitHubApi, RestClient};
 use dorfq_forge_github::app::AppKey;
 use dorfq_forge_github::webhook::{Hint, Listener};
-use dorfq_forge_github::{GitHubForge, Settings, system_clock};
+use dorfq_forge_github::{GitHubForge, HeadFiles, Settings, system_clock};
 use dorfq_forge_mock::{MockForge, Scenario, ScenarioError};
 use dorfq_scheduler::SchedulerConfig;
 
 use crate::config::{AuthConfig, ForgeConfig, WebhookConfig};
+use crate::journal::capture::Reader;
 
 /// A provider that could not be built.
 #[derive(Debug)]
@@ -117,6 +118,8 @@ pub struct BuiltForge {
     /// Reads what the forge knows that no observation carries: `Some` for
     /// the GitHub forge, `None` otherwise.
     pub gauges: Option<Box<dyn FnMut() -> ForgeGauges>>,
+    /// Reads what a pull request's head changes, for the capture file.
+    pub capture: Box<Reader<'static>>,
 }
 
 /// What the GitHub forge knows that no observation carries.
@@ -190,6 +193,7 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
                 wait: Box::new(|_| {}),
                 status: None,
                 gauges: None,
+                capture: Box::new(mock_head_files),
             })
         }
         ForgeConfig::GitHub {
@@ -247,13 +251,39 @@ fn github(
         let publishing = Rc::clone(&forge);
         Box::new(move |body| publishing.borrow_mut().publish_status(body)) as Box<dyn FnMut(String)>
     });
+    let capturing = Rc::clone(&forge);
+    let capture = Box::new(move |pr, head: &Sha| {
+        capturing
+            .borrow_mut()
+            .head_files(pr, head)
+            .map_err(ForgeError::from)
+    }) as Box<Reader<'static>>;
     Ok(BuiltForge {
         forge: Box::new(Shared(forge)),
         has_scheduled_events: Box::new(|| false),
         wait: Box::new(move |outcome| waiting.borrow_mut().wait(outcome == Outcome::Transient)),
         status,
         gauges: Some(gauges),
+        capture,
     })
+}
+
+/// The mock forge's answer for any pull request at any head: one file,
+/// `pr/<n>`, one line added, under an all-zero base.
+fn mock_head_files(pr: PrNumber, _: &Sha) -> Result<Result<HeadFiles, Sha>, ForgeError> {
+    Ok(Ok(HeadFiles {
+        base: Sha::parse(&"0".repeat(40)).expect("forty zeros are a sha"),
+        additions: 1,
+        deletions: 0,
+        changed_files: 1,
+        files: vec![ChangedFile {
+            path: format!("pr/{}", pr.0),
+            additions: 1,
+            deletions: 0,
+            status: "modified".to_owned(),
+            previous: None,
+        }],
+    }))
 }
 
 /// The webhook secret from the environment variable `webhook` names.
@@ -326,9 +356,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::SystemTime;
 
-    use dorfq_core::Sha;
     use dorfq_forge_github::api::{
-        ChangedFile, CheckResult, Commit, Compare, IssueDetail, Merge, OpenPr, PrDetail, RefEntry,
+        CheckResult, Commit, Compare, IssueDetail, Merge, MergeState, OpenPr, PrDetail, RefEntry,
         RefUpdate, RulesetId, RunId, WorkflowRun,
     };
 
@@ -515,6 +544,24 @@ mod tests {
         let mut built = forge(&ForgeConfig::Mock { scenario }).unwrap();
         assert!(built.status.is_none());
         assert!(built.gauges.is_none());
+        let head = Sha::parse(&"b".repeat(40)).unwrap();
+        let listing = (built.capture)(PrNumber(7), &head).unwrap().unwrap();
+        assert_eq!(
+            listing,
+            HeadFiles {
+                base: Sha::parse(&"0".repeat(40)).unwrap(),
+                additions: 1,
+                deletions: 0,
+                changed_files: 1,
+                files: vec![ChangedFile {
+                    path: "pr/7".to_owned(),
+                    additions: 1,
+                    deletions: 0,
+                    status: "modified".to_owned(),
+                    previous: None,
+                }],
+            }
+        );
         assert!((built.has_scheduled_events)());
         built.forge.observe().unwrap();
         assert!((built.has_scheduled_events)());
@@ -523,9 +570,11 @@ mod tests {
     }
 
     /// A repository whose trunk and label exist and that answers nothing
-    /// else: enough for the forge to start.
+    /// else but, when it holds one, one pull request's detail and files:
+    /// enough for the forge to start and for a capture read.
     struct StartableRepo {
         remaining: Option<u64>,
+        pr: Option<(PrDetail, Vec<ChangedFile>)>,
     }
 
     const NOT_AT_STARTUP: &str = "the forge asks only for the trunk and the label at startup";
@@ -568,10 +617,10 @@ mod tests {
             unreachable!("{NOT_AT_STARTUP}")
         }
         fn get_pr(&mut self, _: PrNumber) -> Result<PrDetail, ApiError> {
-            unreachable!("{NOT_AT_STARTUP}")
+            Ok(self.pr.clone().expect(NOT_AT_STARTUP).0)
         }
         fn pr_files(&mut self, _: PrNumber) -> Result<Vec<ChangedFile>, ApiError> {
-            unreachable!("{NOT_AT_STARTUP}")
+            Ok(self.pr.clone().expect(NOT_AT_STARTUP).1)
         }
         fn set_base(&mut self, _: PrNumber, _: &str) -> Result<(), ApiError> {
             unreachable!("{NOT_AT_STARTUP}")
@@ -636,6 +685,7 @@ mod tests {
             .unwrap();
         let api = StartableRepo {
             remaining: Some(4321),
+            pr: None,
         };
         let built = github(Box::new(api), settings, None).unwrap();
         assert!(built.status.is_none());
@@ -647,6 +697,74 @@ mod tests {
                 rate_limit_remaining: Some(4321),
             }
         );
+    }
+
+    #[test]
+    fn github_capture_reads_the_forge() {
+        let settings = github_app(PathBuf::from("unused.pem"))
+            .github_settings()
+            .unwrap();
+        let head = Sha::parse(&"c".repeat(40)).unwrap();
+        let base = Sha::parse(&"d".repeat(40)).unwrap();
+        let files = vec![ChangedFile {
+            path: "docs/new.md".to_owned(),
+            additions: 4,
+            deletions: 2,
+            status: "renamed".to_owned(),
+            previous: Some("docs/old.md".to_owned()),
+        }];
+        let detail = PrDetail {
+            open: true,
+            base: "main".to_owned(),
+            head: head.clone(),
+            head_branch: Some("topic".to_owned()),
+            title: "Rename a document".to_owned(),
+            labels: Vec::new(),
+            merge_state: MergeState::Clean,
+            draft: false,
+            merged: false,
+            base_sha: base.clone(),
+            additions: Some(4),
+            deletions: Some(2),
+            changed_files: None,
+        };
+        let api = StartableRepo {
+            remaining: None,
+            pr: Some((
+                PrDetail {
+                    changed_files: Some(1),
+                    ..detail.clone()
+                },
+                files.clone(),
+            )),
+        };
+        let mut built = github(Box::new(api), settings.clone(), None).unwrap();
+        assert_eq!(
+            (built.capture)(PrNumber(9), &head).unwrap(),
+            Ok(HeadFiles {
+                base,
+                additions: 4,
+                deletions: 2,
+                changed_files: 1,
+                files: files.clone(),
+            })
+        );
+        let moved = Sha::parse(&"e".repeat(40)).unwrap();
+        assert_eq!(
+            (built.capture)(PrNumber(9), &moved).unwrap(),
+            Err(head.clone())
+        );
+
+        let api = StartableRepo {
+            remaining: None,
+            pr: Some((detail, files)),
+        };
+        let mut built = github(Box::new(api), settings, None).unwrap();
+        let error = (built.capture)(PrNumber(9), &head).map(|_| ()).unwrap_err();
+        let ForgeError::Permanent(error) = error else {
+            panic!("a response without a count is permanent: {error:?}");
+        };
+        assert_eq!(error.to_string(), "GET /pulls/9: no changed_files field");
     }
 
     #[test]

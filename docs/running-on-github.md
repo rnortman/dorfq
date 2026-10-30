@@ -509,7 +509,7 @@ rule renames the files it rotates, and its names collide with dorfq's own
 `.1`, `.2` suffixes; do not point one at the journal.
 
 An upgrade that changes the journal's format closes a segment written in the
-old format as a rotation would, with the events file, opens fresh ones, and
+old format as a rotation would, with the events and capture files, opens fresh ones, and
 says so on stderr; the run does not stop. The new build's `dorfq journal`
 still reads the old segment. A segment in a format newer than the build reading it is refused,
 naming the formats that build reads.
@@ -566,6 +566,106 @@ as it treats `<path>.*`.
 The journal holds pull request numbers, commit shas, check names, batch ids,
 the reasons the queue gave and its scheduler settings: no titles, no logins,
 nothing from the credential.
+
+### The capture file
+
+Set `capture = "<path>"` beside `journal`, resolved the same way, and the
+queue records what each pull request head changes, read from GitHub when
+the queue first sees the head: one JSON object per line, keyed by the pull
+request's number and the head's sha. A head is first seen at its `arrive`
+or `repush` event. `capture` without `journal` is refused at load, and a
+`capture` path that is the journal's or the events file's own file stops
+the run at start. The file has no header; each line carries its format
+number, `capture`, now `1`:
+
+```json
+{"capture":1,"pr":42,"head":"<40 hex>","t":1730000000,"at":1730000003,"base":"<40 hex>","additions":120,"deletions":7,"changed_files":3,"files":[{"path":"crates/x/src/lib.rs","additions":100,"deletions":7,"status":"modified"},{"path":"docs/new.md","additions":20,"deletions":0,"status":"renamed","previous":"docs/old.md"}]}
+{"capture":1,"pr":43,"head":"<40 hex>","t":1730000000,"at":1730000003,"error":"GET /pulls/43: HTTP 404: Not Found"}
+```
+
+`pr` and `head` are the key. `t` is the forge time of the event that first
+showed the head, so a record joins the `arrive` or `repush` at the same
+`t`; `at` is the host time of the tick that read it, the `at` of that
+tick's journal line, so every record a tick writes carries the same `at`.
+`base`, `additions`, `deletions` and `changed_files` are what
+`GET /pulls/{n}` reported at the read: the
+base branch's sha and the pull request's totals. `files` is
+`GET /pulls/{n}/files`, in the order GitHub lists it; `status` is GitHub's
+word (`added`, `removed`, `modified`, `renamed`, `copied`, `changed`,
+`unchanged`), and `previous`, present only on a renamed or copied file, is
+the path before. GitHub lists at most 3,000 files: a `changed_files` above
+the length of `files` means the listing was cut there. A record holds
+paths, counts, shas and times: no titles, no logins.
+
+Before listing the files the queue reads the pull request and checks that
+its head is still the head first seen; the listing names no sha, so it
+would otherwise be another head's. A head found moved gets no record and
+one line on stderr; the journal's `repush` of the new head records the
+move, and the new head gets its own record. The moved head is read again
+only when its segment shows it arriving again: a `repush` back to it, or a
+restart's replay of its `arrive` or `repush`. A push between the check and
+the listing, milliseconds apart, puts the new head's files under the old
+key; the new head's own record, with the same files under another key, is
+the tell.
+
+A read GitHub refuses for good — a pull request it no longer serves, or a
+response without one of the three totals — is recorded with `error` in
+place of `base` … `files`, the failure's text, and a line on stderr, and is
+not asked again in that file. A read that fails transiently, a rate limit
+included, leaves the head owed, prints a line on stderr ending `retrying`,
+and ends that tick's reading; the next tick starts with the head after it,
+so a head that keeps failing never holds back the others. A rate limit's
+pause is waited out before the next tick, as for every other read. The
+queue reads at most eight heads a tick, after the tick's journal line,
+events, status write and export, and only after a tick whose own reads and
+writes all succeeded: a tick that failed, permanently or transiently, reads
+none, so a lost permission or a rate limit the tick ran into costs no
+capture request and no record. The rest wait for the next tick, so a
+backlog — `capture` first set against a journal that already has a
+segment, or a restart onto a segment opened by a 64 MiB rotation — drains
+over the following ticks. The heads the current segment showed arriving
+before the start and the capture file lacks are read at the first ticks
+after it, so a crash between a head's sighting and its record loses
+nothing.
+
+The capture file rotates with the journal exactly as the events file does:
+closed as `<capture>.<opened>` beside `<path>.<opened>` under the same
+suffix, and opened fresh and empty. A head is recorded at most once per
+capture file, and the file is fresh whenever its journal segment is, so
+the heads a fresh segment shows arriving are read again into the fresh
+file. In practice: a restart onto a segment opened by a 64 MiB rotation, or
+after a format change, reads the still-queued heads again; a pull request
+queued again with the same head after an idle rotation is read again; a
+head first seen in a tick that rotates, or still owed across a rotation, is
+recorded in the next file; and a head still owed when an idle rotation
+ends its pull request's segment is lost if the process then stops, except
+at the exit `--exit-when-idle` makes: that exit first reads every head
+still owed, past the eight a tick, until none is left or a read fails
+transiently, and prints a line for each head it leaves unread. A
+reader of several capture files dedups by `(pr, head)`. A last line cut
+off by a crash is cut back at the next start, with a line on stderr, and
+its head read again; a line without `pr` and `head` stops the run at
+start, naming the path and the line. A failure to write or rename the
+capture file stops the queue. Retention is yours, as for the events file.
+
+Each head costs `1 + ceil(files / 100)` requests, at most eight heads a
+tick, and nothing otherwise in a running process. After a restart, each
+head of the current segment that was found moved and so has no record
+costs one `GET /pulls/{n}`, at each restart until the segment rotates,
+within the same eight a tick. Every head the segment shows superseded — a
+`repush` of the same pull request followed it, as for every head of a
+landed pull request but the last — is such a head. The mock forge answers
+every read with one file, `pr/<n>`, one line added, under an all-zero base.
+
+The stderr lines, none for a record of files; a tick prints at most one
+per head, and the exit's line for a head it leaves unread may follow that
+head's `retrying`:
+
+- `capture of #<pr> at <head>: <error>; retrying`
+- `capture of #<pr> at <head> recorded as failed: <error>`
+- `capture of #<pr> at <head> not read: the head moved to <now>`
+- `capture of #<pr> at <head> not read before the exit`, at the
+  `--exit-when-idle` exit only
 
 ## Reading the journal
 
@@ -762,6 +862,12 @@ zero is never confused with absent; a metric or point is absent only when
 its value is unknown: a percentile with no samples, `dorfq_tick_age_seconds`
 before the first observation, the two GitHub-only gauges under the mock
 forge, and the rate limit before the first repository request.
+
+With `capture` set, the capture file spends `1 + ceil(files / 100)`
+requests of the rate limit per new pull request head, at most eight heads
+a tick, and nothing otherwise while the process runs; a restart re-asks
+the current segment's heads found moved, see [the capture
+file](#the-capture-file).
 
 A metric's time is the host time of the export that carries it. The queue's
 figures change only when it ticks, so between ticks each export repeats
