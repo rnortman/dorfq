@@ -68,9 +68,11 @@ pub struct LogRecord {
 }
 
 /// The OTLP/HTTP encoding of a request body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Encoding {
     /// `application/x-protobuf`: the encoding every OTLP/HTTP receiver accepts.
+    #[default]
     Protobuf,
     /// `application/json`.
     Json,

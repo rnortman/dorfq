@@ -791,7 +791,8 @@ never cut.
 ## Telemetry
 
 The queue can push its gauges and its events to an OpenTelemetry collector
-over OTLP/HTTP, as JSON:
+over OTLP/HTTP, as protobuf (the encoding every OTLP/HTTP collector accepts)
+or as JSON:
 
 ```toml
 journal = "dorfq.journal"
@@ -799,6 +800,7 @@ journal = "dorfq.journal"
 [telemetry]
 otlp_endpoint = "http://127.0.0.1:4318"
 interval_secs = 60
+encoding = "protobuf"
 authorization_env = "DORFQ_OTLP_AUTHORIZATION"
 ```
 
@@ -807,6 +809,10 @@ authorization_env = "DORFQ_OTLP_AUTHORIZATION"
   `<otlp_endpoint>/v1/logs`. A path is kept (`https://host/otlp` posts to
   `https://host/otlp/v1/metrics`), and a trailing `/` is dropped.
 - `interval_secs` is the time between exports, from 1 to 86400 (a day).
+- `encoding`, optional, is `protobuf` (the default; bodies are posted as
+  `application/x-protobuf`) or `json` (`application/json`). Protobuf is the
+  encoding the OTLP/HTTP specification requires every collector to accept;
+  `json` is for a collector that only takes OTLP/JSON.
 - `authorization_env`, optional, names the environment variable holding the
   `Authorization` header's whole value: `Basic <base64>` for Grafana Cloud,
   `Bearer <token>` elsewhere. Absent, no header is sent. Over `http://` the
@@ -822,7 +828,9 @@ http:// or https:// URL`, `… has no host` or `… has an invalid port`;
 `telemetry.otlp_endpoint carries credentials; use authorization_env` or
 `telemetry.otlp_endpoint has a query or fragment` (an endpoint that could
 hold a secret is not repeated); `telemetry.interval_secs is 0` or `… is above 86400`;
-`telemetry.authorization_env is empty`. At start, before the forge is
+`telemetry.authorization_env is empty`. `encoding` set to anything else is
+refused by the parser: ``unknown variant `xml`, expected `protobuf` or
+`json` ``. At start, before the forge is
 reached, the variable `authorization_env` names must be set:
 `telemetry.authorization_env <var> is unset, empty or not UTF-8`, or
 `… holds a value that is not a valid HTTP header value` for one with a
@@ -899,7 +907,10 @@ starts failing, `dorfq: telemetry: export to /v1/logs failed: <error>;
 retrying every 60s`, with a refused answer's status and its first 200 bytes
 on one line, and once when it recovers, `dorfq: telemetry: export to
 /v1/logs resumed after <n> failed requests`. A collector that takes metrics
-and refuses logs is reported for `/v1/logs` alone, once.
+and refuses logs is reported for `/v1/logs` alone, once. A refusal whose body
+is not text (a protobuf `Status`, for instance) is noted as `HTTP <status>:
+<type> body omitted`, its media type (its first 200 characters) in place
+of its bytes; one with an empty media type is quoted as one with none.
 
 Up to 10,000 events wait for delivery. Past that the oldest are dropped and
 counted in `dorfq_telemetry_events_dropped_total`, with one line, `dorfq:

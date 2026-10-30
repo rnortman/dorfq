@@ -23,6 +23,7 @@
 # [telemetry]
 # otlp_endpoint = "http://127.0.0.1:4318"          # the collector's OTLP/HTTP base; /v1/metrics and /v1/logs are appended
 # interval_secs = 60
+# encoding = "protobuf"                            # or "json", for a collector that takes only OTLP/JSON
 # authorization_env = "DORFQ_OTLP_AUTHORIZATION"   # the environment variable holding the Authorization header's value, if the collector needs one
 
 [forge]

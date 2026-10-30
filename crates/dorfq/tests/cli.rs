@@ -646,7 +646,8 @@ struct Received {
 }
 
 /// A loopback OTLP/HTTP collector: accepts on `127.0.0.1` until stopped,
-/// answers every request `200` with an empty JSON object, and records it.
+/// answers every request `200` with an empty response in the request's
+/// encoding — `{}` for JSON, no bytes for protobuf — and records it.
 struct Collector {
     port: u16,
     stop: Arc<AtomicBool>,
@@ -723,17 +724,23 @@ fn serve(mut stream: TcpStream, received: &Mutex<Vec<Received>>) {
                 header("content-length").map_or(0, |v| v.parse().expect("a length"));
             if buffer.len() >= head + length {
                 assert_eq!(request.method, Some("POST"));
+                let content_type = header("content-type").unwrap_or_default();
+                let answer = if content_type == "application/json" {
+                    "{}"
+                } else {
+                    ""
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{answer}",
+                    answer.len()
+                );
                 received.lock().expect("the record").push(Received {
                     path: request.path.expect("a path").to_owned(),
-                    content_type: header("content-type").unwrap_or_default(),
+                    content_type,
                     body: buffer[head..head + length].to_vec(),
                 });
                 buffer.drain(..head + length);
-                stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
-                    )
-                    .expect("answer");
+                stream.write_all(response.as_bytes()).expect("answer");
                 continue;
             }
         }
@@ -753,45 +760,359 @@ fn with_telemetry(config: &Path, port: u16, extra: &str) {
     fs::write(config, text).expect("write config");
 }
 
-/// The metric named `name` in an OTLP/JSON metrics request.
-fn metric<'a>(body: &'a Value, name: &str) -> Option<&'a Value> {
-    body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
-        .as_array()
-        .expect("metrics")
-        .iter()
-        .find(|m| m["name"] == name)
+/// A protobuf field's payload, by wire type.
+#[derive(Debug)]
+enum Payload {
+    /// Wire type 0.
+    Varint(u64),
+    /// Wire type 1.
+    Fixed64(u64),
+    /// Wire type 2.
+    Len(Vec<u8>),
 }
 
-/// The `asInt` values of a gauge's points.
-fn ints(metric: &Value) -> Vec<u64> {
-    metric["gauge"]["dataPoints"]
-        .as_array()
-        .expect("points")
+/// One field of a protobuf message.
+struct Field {
+    number: u32,
+    payload: Payload,
+}
+
+/// Every field of one protobuf message, in wire order; panics on a
+/// malformed buffer and on wire types 3, 4 and 5, which OTLP as dorfq
+/// writes it never uses. Knows nothing of OTLP: the decoders below carry
+/// the field numbers, from the `.proto`.
+fn fields(bytes: &[u8]) -> Vec<Field> {
+    let mut at = 0;
+    let varint = |at: &mut usize| {
+        let mut v = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = *bytes.get(*at).expect("a varint ends before the buffer");
+            *at += 1;
+            v |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return v;
+            }
+        }
+        panic!("a varint longer than ten bytes");
+    };
+    let take = |at: &mut usize, len: usize| {
+        let end = at.checked_add(len).filter(|end| *end <= bytes.len());
+        let taken = &bytes[*at..end.expect("a payload ends before the buffer")];
+        *at += len;
+        taken
+    };
+    let mut fields = Vec::new();
+    while at < bytes.len() {
+        let key = varint(&mut at);
+        let number = u32::try_from(key >> 3).expect("a field number fits 32 bits");
+        let payload = match key & 7 {
+            0 => Payload::Varint(varint(&mut at)),
+            1 => Payload::Fixed64(u64::from_le_bytes(
+                take(&mut at, 8).try_into().expect("eight bytes"),
+            )),
+            2 => {
+                let len = usize::try_from(varint(&mut at)).expect("a length fits");
+                Payload::Len(take(&mut at, len).to_vec())
+            }
+            other => panic!("field {number}: unhandled wire type {other}"),
+        };
+        fields.push(Field { number, payload });
+    }
+    fields
+}
+
+/// Every field numbered `number` of `message`, in wire order.
+fn all(message: &[Field], number: u32) -> Vec<&Payload> {
+    message
         .iter()
-        .map(|p| {
-            p["asInt"]
-                .as_str()
-                .expect("asInt is a string")
-                .parse()
-                .expect("an integer")
+        .filter(|field| field.number == number)
+        .map(|field| &field.payload)
+        .collect()
+}
+
+/// The one field numbered `number` of `message`; panics on none or several.
+fn one(message: &[Field], number: u32) -> &Payload {
+    let all = all(message, number);
+    assert_eq!(all.len(), 1, "exactly one field {number}");
+    all[0]
+}
+
+impl Payload {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Payload::Len(bytes) => bytes,
+            other => panic!("expected a length-delimited payload, got {other:?}"),
+        }
+    }
+
+    /// A length-delimited payload read as an embedded message.
+    fn message(&self) -> Vec<Field> {
+        fields(self.bytes())
+    }
+
+    /// A length-delimited payload read as UTF-8.
+    fn string(&self) -> &str {
+        std::str::from_utf8(self.bytes()).expect("a string is UTF-8")
+    }
+
+    /// An eight-byte payload read as an `sfixed64`.
+    fn sfixed64(&self) -> i64 {
+        match self {
+            Payload::Fixed64(v) => *v as i64,
+            other => panic!("expected eight bytes, got {other:?}"),
+        }
+    }
+
+    /// A varint payload read as an `int64`.
+    fn int64(&self) -> i64 {
+        match self {
+            Payload::Varint(v) => *v as i64,
+            other => panic!("expected a varint, got {other:?}"),
+        }
+    }
+}
+
+/// An attribute's value, in either encoding.
+#[derive(Debug)]
+enum AttrView {
+    Str(String),
+    Int(i64),
+}
+
+/// A metrics request, in either encoding.
+struct MetricsView {
+    resource: Vec<(String, AttrView)>,
+    metrics: Vec<MetricView>,
+}
+
+/// One metric of a [`MetricsView`], gauge or sum.
+struct MetricView {
+    name: String,
+    points: Vec<PointView>,
+}
+
+/// One data point of a [`MetricView`]; `as_int` is absent for a double.
+struct PointView {
+    attributes: Vec<(String, AttrView)>,
+    as_int: Option<i64>,
+}
+
+/// One log record of a logs request, in either encoding.
+struct RecordView {
+    body: String,
+    attributes: Vec<(String, AttrView)>,
+}
+
+const JSON: &str = "application/json";
+const PROTOBUF: &str = "application/x-protobuf";
+
+/// The string value of the attribute `key` among `attributes`.
+fn str_attribute<'a>(attributes: &'a [(String, AttrView)], key: &str) -> Option<&'a str> {
+    attributes
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| match v {
+            AttrView::Str(s) => s.as_str(),
+            AttrView::Int(i) => panic!("{key} is the integer {i}"),
+        })
+}
+
+/// The integer value of the attribute `key` among `attributes`.
+fn int_attribute(attributes: &[(String, AttrView)], key: &str) -> Option<i64> {
+    attributes
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| match v {
+            AttrView::Int(i) => *i,
+            AttrView::Str(s) => panic!("{key} is the string {s:?}"),
+        })
+}
+
+impl MetricsView {
+    /// The metric named `name`.
+    fn metric(&self, name: &str) -> Option<&MetricView> {
+        self.metrics.iter().find(|m| m.name == name)
+    }
+}
+
+impl MetricView {
+    /// The `as_int` values of the points, each required.
+    fn ints(&self) -> Vec<i64> {
+        self.points
+            .iter()
+            .map(|p| p.as_int.expect("an integer point"))
+            .collect()
+    }
+}
+
+/// OTLP/JSON `attributes`, absent read as none.
+fn json_attributes(attributes: &Value) -> Vec<(String, AttrView)> {
+    let Some(attributes) = attributes.as_array() else {
+        return Vec::new();
+    };
+    attributes
+        .iter()
+        .map(|a| {
+            let key = a["key"].as_str().expect("a key").to_owned();
+            let value = &a["value"];
+            let value = match (value["stringValue"].as_str(), value["intValue"].as_str()) {
+                (Some(s), None) => AttrView::Str(s.to_owned()),
+                (None, Some(i)) => AttrView::Int(i.parse().expect("an integer")),
+                _ => panic!("an unexpected value: {value}"),
+            };
+            (key, value)
         })
         .collect()
 }
 
-/// The string value of the attribute `key` among `attributes`.
-fn attribute<'a>(attributes: &'a Value, key: &str) -> Option<&'a str> {
-    attributes
-        .as_array()?
-        .iter()
-        .find(|a| a["key"] == key)
-        .and_then(|a| a["value"]["stringValue"].as_str())
+/// Protobuf `KeyValue`s.
+fn protobuf_attributes(key_values: Vec<&Payload>) -> Vec<(String, AttrView)> {
+    key_values
+        .into_iter()
+        .map(|key_value| {
+            let key_value = key_value.message();
+            // KeyValue: key = 1, value = 2.
+            let key = one(&key_value, 1).string().to_owned();
+            let any = one(&key_value, 2).message();
+            // AnyValue: string_value = 1, int_value = 3.
+            let value = match any.as_slice() {
+                [Field { number: 1, payload }] => AttrView::Str(payload.string().to_owned()),
+                [Field { number: 3, payload }] => AttrView::Int(payload.int64()),
+                _ => panic!("{key}: an unexpected AnyValue"),
+            };
+            (key, value)
+        })
+        .collect()
 }
 
-#[test]
-fn a_run_with_telemetry_pushes_its_gauges_and_every_event() {
+/// A `/v1/metrics` request read by its content type.
+fn metrics_view(received: &Received) -> MetricsView {
+    match received.content_type.as_str() {
+        JSON => {
+            let body: Value = serde_json::from_slice(&received.body).expect("a JSON body");
+            let resource_metrics = &body["resourceMetrics"][0];
+            let metrics = resource_metrics["scopeMetrics"][0]["metrics"]
+                .as_array()
+                .expect("metrics")
+                .iter()
+                .map(|m| {
+                    let data = if m["gauge"].is_object() {
+                        &m["gauge"]
+                    } else {
+                        &m["sum"]
+                    };
+                    MetricView {
+                        name: m["name"].as_str().expect("a name").to_owned(),
+                        points: data["dataPoints"]
+                            .as_array()
+                            .expect("points")
+                            .iter()
+                            .map(|p| PointView {
+                                attributes: json_attributes(&p["attributes"]),
+                                as_int: p["asInt"].as_str().map(|i| i.parse().expect("an integer")),
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+            MetricsView {
+                resource: json_attributes(&resource_metrics["resource"]["attributes"]),
+                metrics,
+            }
+        }
+        PROTOBUF => {
+            let request = fields(&received.body);
+            // ExportMetricsServiceRequest: resource_metrics = 1.
+            let resource_metrics = one(&request, 1).message();
+            // ResourceMetrics: resource = 1, scope_metrics = 2.
+            let resource = one(&resource_metrics, 1).message();
+            let scope_metrics = one(&resource_metrics, 2).message();
+            // ScopeMetrics: metrics = 2.
+            let metrics = all(&scope_metrics, 2)
+                .into_iter()
+                .map(|metric| {
+                    let metric = metric.message();
+                    // Metric: name = 1, gauge = 5, sum = 7.
+                    let data = [all(&metric, 5), all(&metric, 7)].concat();
+                    assert_eq!(data.len(), 1, "one of gauge or sum");
+                    // Gauge, Sum: data_points = 1.
+                    let points = all(&data[0].message(), 1)
+                        .into_iter()
+                        .map(|point| {
+                            let point = point.message();
+                            // NumberDataPoint: as_int = 6, attributes = 7.
+                            PointView {
+                                attributes: protobuf_attributes(all(&point, 7)),
+                                as_int: all(&point, 6).first().map(|p| p.sfixed64()),
+                            }
+                        })
+                        .collect();
+                    MetricView {
+                        name: one(&metric, 1).string().to_owned(),
+                        points,
+                    }
+                })
+                .collect();
+            MetricsView {
+                // Resource: attributes = 1.
+                resource: protobuf_attributes(all(&resource, 1)),
+                metrics,
+            }
+        }
+        other => panic!("an unexpected content type {other:?}"),
+    }
+}
+
+/// A `/v1/logs` request's records, read by its content type.
+fn logs_view(received: &Received) -> Vec<RecordView> {
+    match received.content_type.as_str() {
+        JSON => {
+            let body: Value = serde_json::from_slice(&received.body).expect("a JSON body");
+            body["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+                .as_array()
+                .expect("log records")
+                .iter()
+                .map(|r| RecordView {
+                    body: r["body"]["stringValue"]
+                        .as_str()
+                        .expect("a string body")
+                        .to_owned(),
+                    attributes: json_attributes(&r["attributes"]),
+                })
+                .collect()
+        }
+        PROTOBUF => {
+            let request = fields(&received.body);
+            // ExportLogsServiceRequest: resource_logs = 1.
+            let resource_logs = one(&request, 1).message();
+            // ResourceLogs: scope_logs = 2.
+            let scope_logs = one(&resource_logs, 2).message();
+            // ScopeLogs: log_records = 2.
+            all(&scope_logs, 2)
+                .into_iter()
+                .map(|record| {
+                    let record = record.message();
+                    // LogRecord: body = 5, attributes = 6; AnyValue:
+                    // string_value = 1.
+                    let body = one(&record, 5).message();
+                    RecordView {
+                        body: one(&body, 1).string().to_owned(),
+                        attributes: protobuf_attributes(all(&record, 6)),
+                    }
+                })
+                .collect()
+        }
+        other => panic!("an unexpected content type {other:?}"),
+    }
+}
+
+/// Runs `dorfq run --exit-when-idle` against a collector, with `extra` in
+/// its `[telemetry]` table, and checks that every request is posted as
+/// `content_type` and carries the queue's gauges and every event.
+fn assert_a_run_pushes_its_gauges_and_every_event(name: &str, extra: &str, content_type: &str) {
     let collector = Collector::start();
-    let (config, dir) = journaled_config("telemetry-run");
-    with_telemetry(&config, collector.port, "");
+    let (config, dir) = journaled_config(name);
+    with_telemetry(&config, collector.port, extra);
     let output = Command::new(env!("DORFQ_BIN"))
         .args(["run", "--config"])
         .arg(&config)
@@ -806,40 +1127,41 @@ fn a_run_with_telemetry_pushes_its_gauges_and_every_event() {
             "{}",
             request.path
         );
-        assert_eq!(request.content_type, "application/json");
+        assert_eq!(request.content_type, content_type);
     }
-    let bodies = |path: &str| -> Vec<Value> {
-        received
-            .iter()
-            .filter(|r| r.path == path)
-            .map(|r| serde_json::from_slice(&r.body).expect("a JSON body"))
-            .collect()
-    };
-    let metrics = bodies("/v1/metrics");
-    let logs = bodies("/v1/logs");
+    let metrics: Vec<MetricsView> = received
+        .iter()
+        .filter(|r| r.path == "/v1/metrics")
+        .map(metrics_view)
+        .collect();
+    let records: Vec<RecordView> = received
+        .iter()
+        .filter(|r| r.path == "/v1/logs")
+        .flat_map(logs_view)
+        .collect();
     assert!(
-        !metrics.is_empty() && !logs.is_empty(),
+        !metrics.is_empty() && !records.is_empty(),
         "{} requests",
         received.len()
     );
 
     let last = metrics.last().expect("a metrics body");
-    let resource = &last["resourceMetrics"][0]["resource"]["attributes"];
-    assert_eq!(attribute(resource, "service.name"), Some("dorfq"));
+    assert_eq!(str_attribute(&last.resource, "service.name"), Some("dorfq"));
     assert_eq!(
-        attribute(resource, "service.version"),
+        str_attribute(&last.resource, "service.version"),
         Some(env!("CARGO_PKG_VERSION"))
     );
-    let queue = metric(last, "dorfq_queue_prs").expect("dorfq_queue_prs");
-    assert_eq!(ints(queue), [0, 0, 0]);
-    for point in queue["gauge"]["dataPoints"].as_array().expect("points") {
+    let queue = last.metric("dorfq_queue_prs").expect("dorfq_queue_prs");
+    assert_eq!(queue.ints(), [0, 0, 0]);
+    for point in &queue.points {
         assert!(
-            attribute(&point["attributes"], "status").is_some(),
-            "{point}"
+            str_attribute(&point.attributes, "status").is_some(),
+            "{:?}",
+            point.attributes
         );
     }
-    let batches = metric(last, "dorfq_batches").expect("dorfq_batches");
-    assert_eq!(ints(batches).len(), 6);
+    let batches = last.metric("dorfq_batches").expect("dorfq_batches");
+    assert_eq!(batches.ints().len(), 6);
 
     // The idle tick that ended the run rotated the events file with the
     // journal: the closed segment, then the current one.
@@ -870,30 +1192,40 @@ fn a_run_with_telemetry_pushes_its_gauges_and_every_event() {
         .sum();
     let ejected = parsed.iter().filter(|e| e["kind"] == "eject").count();
     assert!(landed > 0 && ejected > 0, "{events}");
-    let landed_prs = metric(last, "dorfq_window_landed_prs").expect("landed");
-    assert_eq!(ints(landed_prs), [landed as u64]);
-    let ejected_prs = metric(last, "dorfq_window_ejected_prs").expect("ejected");
-    assert_eq!(ints(ejected_prs), [ejected as u64]);
-    assert!(metric(last, "dorfq_tick_age_seconds").is_some());
-    assert!(metric(last, "dorfq_queue_blocked_prs").is_none());
-    assert!(metric(last, "dorfq_api_rate_limit_remaining").is_none());
+    let landed_prs = last.metric("dorfq_window_landed_prs").expect("landed");
+    assert_eq!(landed_prs.ints(), [landed as i64]);
+    assert_eq!(
+        int_attribute(&landed_prs.points[0].attributes, "window_seconds"),
+        Some(86_400)
+    );
+    let ejected_prs = last.metric("dorfq_window_ejected_prs").expect("ejected");
+    assert_eq!(ejected_prs.ints(), [ejected as i64]);
+    assert!(last.metric("dorfq_tick_age_seconds").is_some());
+    assert!(last.metric("dorfq_queue_blocked_prs").is_none());
+    assert!(last.metric("dorfq_api_rate_limit_remaining").is_none());
 
-    let records: Vec<&Value> = logs
-        .iter()
-        .flat_map(|body| {
-            body["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
-                .as_array()
-                .expect("log records")
-        })
-        .collect();
     assert_eq!(records.len(), lines.len());
     for ((record, line), event) in records.iter().zip(&lines).zip(&parsed) {
-        assert_eq!(record["body"]["stringValue"], *line);
+        assert_eq!(record.body, *line);
         assert_eq!(
-            attribute(&record["attributes"], "kind"),
+            str_attribute(&record.attributes, "kind"),
             event["kind"].as_str()
         );
     }
+}
+
+#[test]
+fn a_run_with_telemetry_pushes_its_gauges_and_every_event() {
+    assert_a_run_pushes_its_gauges_and_every_event("telemetry-run", "", PROTOBUF);
+}
+
+#[test]
+fn a_run_with_json_telemetry_pushes_the_same_gauges_and_events() {
+    assert_a_run_pushes_its_gauges_and_every_event(
+        "telemetry-run-json",
+        "encoding = \"json\"\n",
+        JSON,
+    );
 }
 
 /// The process is handed the collector's address through every standard

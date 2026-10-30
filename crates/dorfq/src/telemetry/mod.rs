@@ -27,7 +27,9 @@ use crate::journal::status::{Document, Figures, WINDOW};
 use crate::journal::summary::HOUR;
 use crate::providers::ForgeGauges;
 use crate::unix_now;
-use otlp::{Attr, Data, Encoding, LogRecord, Metric, Number, Point, Resource};
+use otlp::{Attr, Data, LogRecord, Metric, Number, Point, Resource};
+
+pub use otlp::Encoding;
 
 /// The instrumentation scope's name.
 pub const SCOPE: &str = "dorfq";
@@ -372,9 +374,9 @@ pub struct Tick {
     pub observed: bool,
 }
 
-/// Sends one request body to `path` (`/v1/metrics` or `/v1/logs`);
-/// `Err` is the failure's description.
-pub type Sink = Box<dyn FnMut(&str, &[u8]) -> Result<(), String> + Send>;
+/// Sends one request body, in the given encoding, to `path` (`/v1/metrics`
+/// or `/v1/logs`); `Err` is the failure's description.
+pub type Sink = Box<dyn FnMut(&str, Encoding, &[u8]) -> Result<(), String> + Send>;
 
 /// The exporter thread's handle. Dropping it hands the thread nothing more
 /// and waits for the export in flight, if any, then for one last export:
@@ -388,12 +390,17 @@ impl Exporter {
     /// Starts the thread, which exports every `interval` and once more when
     /// the exporter is dropped; `started_at` is the host time the sums
     /// start.
-    pub fn start(interval: Duration, started_at: u64, mut sink: Sink) -> Exporter {
+    pub fn start(
+        interval: Duration,
+        started_at: u64,
+        encoding: Encoding,
+        mut sink: Sink,
+    ) -> Exporter {
         let (ticks, received) = mpsc::channel::<Tick>();
         let thread = thread::Builder::new()
             .name("telemetry".to_owned())
             .spawn(move || {
-                let mut pump = Pump::new(interval, started_at);
+                let mut pump = Pump::new(interval, started_at, encoding);
                 let mut next_due = Instant::now() + interval;
                 loop {
                     let wait = next_due.saturating_duration_since(Instant::now());
@@ -447,6 +454,8 @@ impl Drop for Exporter {
 /// it has not delivered, and its own counts.
 struct Pump {
     interval: Duration,
+    /// The encoding of every request body.
+    encoding: Encoding,
     /// Each event with the host time of the tick that produced it.
     pending: VecDeque<(u64, Event)>,
     latest: Option<Snapshot>,
@@ -459,9 +468,10 @@ struct Pump {
 }
 
 impl Pump {
-    fn new(interval: Duration, started_at: u64) -> Pump {
+    fn new(interval: Duration, started_at: u64, encoding: Encoding) -> Pump {
         Pump {
             interval,
+            encoding,
             pending: VecDeque::new(),
             latest: None,
             last_observed_at: None,
@@ -511,12 +521,12 @@ impl Pump {
         if let Some(latest) = &self.latest {
             let tick_age = self.last_observed_at.map(|t| at.saturating_sub(t));
             let body = otlp::metrics_request(
-                Encoding::Json,
+                self.encoding,
                 &resource,
                 SCOPE,
                 &metrics(latest, tick_age, &self.counters, at),
             );
-            let result = sink("/v1/metrics", &body);
+            let result = sink("/v1/metrics", self.encoding, &body);
             self.count("/v1/metrics", result, notes);
         }
         while !self.pending.is_empty() {
@@ -526,8 +536,8 @@ impl Pump {
                 .range(..chunk)
                 .map(|(observed_at, event)| record(event, *observed_at))
                 .collect();
-            let body = otlp::logs_request(Encoding::Json, &resource, SCOPE, &records);
-            let result = sink("/v1/logs", &body);
+            let body = otlp::logs_request(self.encoding, &resource, SCOPE, &records);
+            let result = sink("/v1/logs", self.encoding, &body);
             if !self.count("/v1/logs", result, notes) {
                 break;
             }
@@ -625,10 +635,11 @@ impl fmt::Display for AuthorizationError {
 
 impl std::error::Error for AuthorizationError {}
 
-/// A [`Sink`] that POSTs each body to the configured collector as
-/// [`Encoding::Json`]'s content type, with the `Authorization` header when
+/// A [`Sink`] that POSTs each body to the configured collector as its
+/// encoding's content type, with the `Authorization` header when
 /// one is configured. A 2xx is delivered; any other status, or no response,
-/// is the failure's description.
+/// is the failure's description: the status, and the start of the body
+/// when it is text, or its media type when it is not.
 pub fn http_sink(config: &TelemetryConfig) -> Result<Sink, AuthorizationError> {
     let authorization = config
         .authorization_env
@@ -661,10 +672,10 @@ fn post_to(endpoint: String, authorization: Option<HeaderValue>) -> Sink {
         .user_agent(crate::user_agent())
         .build()
         .into();
-    Box::new(move |path: &str, body: &[u8]| {
+    Box::new(move |path: &str, encoding: Encoding, body: &[u8]| {
         let mut request = agent
             .post(format!("{endpoint}{path}"))
-            .header("Content-Type", Encoding::Json.content_type());
+            .header("Content-Type", encoding.content_type());
         if let Some(authorization) = &authorization {
             request = request.header("Authorization", authorization.clone());
         }
@@ -673,13 +684,33 @@ fn post_to(endpoint: String, authorization: Option<HeaderValue>) -> Sink {
         if status.is_success() {
             return Ok(());
         }
+        // Media types are case-insensitive, and ureq keeps any space
+        // before a `;`.
+        let media_type = response
+            .body()
+            .mime_type()
+            .map(|media_type| {
+                one_line(&media_type.to_ascii_lowercase())
+                    .chars()
+                    .take(HINT_BYTES)
+                    .collect::<String>()
+            })
+            .filter(|media_type| !media_type.is_empty());
+        if let Some(media_type) = media_type
+            && !is_text(&media_type)
+        {
+            return Err(format!(
+                "HTTP {}: {media_type} body omitted",
+                status.as_u16()
+            ));
+        }
         let mut head = Vec::new();
         // The body is only a hint for the operator; an unreadable one is
         // left out.
         let _ = response
             .body_mut()
             .as_reader()
-            .take(200)
+            .take(HINT_BYTES as u64)
             .read_to_end(&mut head);
         Err(format!(
             "HTTP {}: {}",
@@ -687,6 +718,18 @@ fn post_to(endpoint: String, authorization: Option<HeaderValue>) -> Sink {
             one_line(&String::from_utf8_lossy(&head))
         ))
     })
+}
+
+/// The most bytes of a refusal's body, or characters of its media type,
+/// that its note carries.
+const HINT_BYTES: usize = 200;
+
+/// Whether a response body of the normalised `media_type` is quoted in a
+/// refusal's note; any other is binary, a protobuf `Status` for one.
+fn is_text(media_type: &str) -> bool {
+    media_type.starts_with("text/")
+        || media_type == "application/json"
+        || media_type == "application/problem+json"
 }
 
 /// `text` with every run of whitespace and control characters made one

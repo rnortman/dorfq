@@ -164,6 +164,7 @@ fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
             Ok(sink) => Some(telemetry::Exporter::start(
                 Duration::from_secs(settings.interval_secs),
                 started,
+                settings.encoding,
                 sink,
             )),
             Err(error) => {

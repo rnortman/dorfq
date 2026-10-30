@@ -1015,12 +1015,13 @@ fn record_carries_the_event_line_and_its_numbers() {
 type Requests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 /// A sink that records every request and refuses each while `refusing` is
-/// set.
+/// set. Every exporter it serves encodes JSON.
 fn recording(refusing: &Arc<AtomicBool>) -> (Sink, Requests) {
     let requests = Requests::default();
     let kept = Arc::clone(&requests);
     let refusing = Arc::clone(refusing);
-    let sink = Box::new(move |path: &str, body: &[u8]| {
+    let sink = Box::new(move |path: &str, encoding: Encoding, body: &[u8]| {
+        assert_eq!(encoding, Encoding::Json, "{path}");
         kept.lock().unwrap().push((path.to_owned(), body.to_vec()));
         if refusing.load(Ordering::SeqCst) {
             Err("refused".to_owned())
@@ -1098,7 +1099,7 @@ fn lines(notes: &[u8]) -> Vec<String> {
 #[test]
 fn the_exporter_exports_on_its_interval_while_the_queue_idles() {
     let (sink, requests) = recording(&Arc::default());
-    let exporter = Exporter::start(Duration::from_millis(50), unix_now(), sink);
+    let exporter = Exporter::start(Duration::from_millis(50), unix_now(), Encoding::Json, sink);
     exporter.tick(tick(
         unix_now(),
         Vec::new(),
@@ -1143,7 +1144,7 @@ fn the_exporter_exports_on_its_interval_while_the_queue_idles() {
 #[test]
 fn nothing_is_sent_before_a_snapshot_or_an_event() {
     let (sink, requests) = recording(&Arc::default());
-    let exporter = Exporter::start(Duration::from_millis(10), 0, sink);
+    let exporter = Exporter::start(Duration::from_millis(10), 0, Encoding::Json, sink);
     exporter.tick(Tick {
         at: 1,
         events: Vec::new(),
@@ -1158,7 +1159,7 @@ fn nothing_is_sent_before_a_snapshot_or_an_event() {
 #[test]
 fn dropping_the_exporter_exports_what_is_pending() {
     let (sink, requests) = recording(&Arc::default());
-    let exporter = Exporter::start(Duration::from_secs(3600), 0, sink);
+    let exporter = Exporter::start(Duration::from_secs(3600), 0, Encoding::Json, sink);
     exporter.tick(tick(7, ci_events(2), None));
     drop(exporter);
     let requests = requests.lock().unwrap();
@@ -1170,7 +1171,7 @@ fn dropping_the_exporter_exports_what_is_pending() {
 #[test]
 fn a_tick_with_events_and_no_snapshot_sends_logs_only() {
     let (mut sink, requests) = recording(&Arc::default());
-    let mut pump = Pump::new(Duration::from_secs(60), 0);
+    let mut pump = Pump::new(Duration::from_secs(60), 0, Encoding::Json);
     let mut notes = Vec::new();
     pump.take(tick(7, ci_events(3), None), &mut notes);
     pump.export(8, &mut sink, &mut notes);
@@ -1186,7 +1187,7 @@ fn a_tick_with_events_and_no_snapshot_sends_logs_only() {
 fn a_failed_export_is_counted_said_once_and_its_events_kept() {
     let refusing = Arc::new(AtomicBool::new(true));
     let (mut sink, requests) = recording(&refusing);
-    let mut pump = Pump::new(Duration::from_secs(60), 0);
+    let mut pump = Pump::new(Duration::from_secs(60), 0, Encoding::Json);
     let mut notes = Vec::new();
     pump.take(
         tick(7, ci_events(2), Some(snapshot(&document(), 1_000, None))),
@@ -1230,11 +1231,11 @@ fn a_failed_export_is_counted_said_once_and_its_events_kept() {
 
 #[test]
 fn a_path_refused_while_the_other_delivers_is_said_once() {
-    let mut sink: Sink = Box::new(|path: &str, _: &[u8]| match path {
+    let mut sink: Sink = Box::new(|path: &str, _: Encoding, _: &[u8]| match path {
         "/v1/logs" => Err("HTTP 404: ".to_owned()),
         _ => Ok(()),
     });
-    let mut pump = Pump::new(Duration::from_secs(60), 0);
+    let mut pump = Pump::new(Duration::from_secs(60), 0, Encoding::Json);
     let mut notes = Vec::new();
     let buffer = u64::try_from(EVENT_BUFFER).unwrap();
     pump.take(
@@ -1264,7 +1265,7 @@ fn a_path_refused_while_the_other_delivers_is_said_once() {
 #[test]
 fn drops_without_a_failure_are_said_when_the_events_go_out() {
     let (mut sink, _requests) = recording(&Arc::default());
-    let mut pump = Pump::new(Duration::from_secs(60), 0);
+    let mut pump = Pump::new(Duration::from_secs(60), 0, Encoding::Json);
     let mut notes = Vec::new();
     let buffer = u64::try_from(EVENT_BUFFER).unwrap();
     pump.take(tick(7, ci_events(buffer + 2), None), &mut notes);
@@ -1288,7 +1289,7 @@ fn drops_without_a_failure_are_said_when_the_events_go_out() {
 fn the_buffer_keeps_the_newest_events_and_counts_the_dropped() {
     let refusing = Arc::new(AtomicBool::new(true));
     let (mut sink, requests) = recording(&refusing);
-    let mut pump = Pump::new(Duration::from_secs(60), 0);
+    let mut pump = Pump::new(Duration::from_secs(60), 0, Encoding::Json);
     let mut notes = Vec::new();
     let buffer = u64::try_from(EVENT_BUFFER).unwrap();
     pump.take(
@@ -1335,7 +1336,7 @@ fn the_buffer_keeps_the_newest_events_and_counts_the_dropped() {
 #[test]
 fn pending_events_go_out_in_chunks() {
     let (mut sink, requests) = recording(&Arc::default());
-    let mut pump = Pump::new(Duration::from_secs(60), 0);
+    let mut pump = Pump::new(Duration::from_secs(60), 0, Encoding::Json);
     let mut notes = Vec::new();
     pump.take(tick(7, ci_events(2_500), None), &mut notes);
     pump.export(8, &mut sink, &mut notes);
@@ -1353,7 +1354,7 @@ fn pending_events_go_out_in_chunks() {
 fn a_refused_chunk_stops_the_export_and_keeps_the_rest() {
     let refusing = Arc::new(AtomicBool::new(true));
     let (mut sink, requests) = recording(&refusing);
-    let mut pump = Pump::new(Duration::from_secs(60), 0);
+    let mut pump = Pump::new(Duration::from_secs(60), 0, Encoding::Json);
     let mut notes = Vec::new();
     pump.take(tick(7, ci_events(2_500), None), &mut notes);
     pump.export(8, &mut sink, &mut notes);
@@ -1364,7 +1365,7 @@ fn a_refused_chunk_stops_the_export_and_keeps_the_rest() {
 #[test]
 fn tick_age_measures_from_the_last_observing_tick() {
     let (mut sink, requests) = recording(&Arc::default());
-    let mut pump = Pump::new(Duration::from_secs(60), 0);
+    let mut pump = Pump::new(Duration::from_secs(60), 0, Encoding::Json);
     let mut notes = Vec::new();
     pump.take(
         tick(100, Vec::new(), Some(snapshot(&document(), 1_000, None))),
@@ -1392,6 +1393,7 @@ fn http_sink_refuses_an_authorization_variable_that_is_unset() {
     let config = TelemetryConfig {
         otlp_endpoint: "http://127.0.0.1:4318".to_owned(),
         interval_secs: 60,
+        encoding: Encoding::Protobuf,
         authorization_env: Some("DORFQ_TEST_OTLP_AUTHORIZATION_NEVER_SET".to_owned()),
     };
     let error = http_sink(&config).err().unwrap();
@@ -1418,7 +1420,9 @@ fn an_authorization_value_no_header_can_carry_is_refused_without_echoing_it() {
 
 /// Serves one connection on a loopback port: reads one request, answers
 /// `response`, and yields the request's head and body.
-fn serve_once(response: &'static str) -> (String, thread::JoinHandle<(String, Vec<u8>)>) {
+fn serve_once(
+    response: impl AsRef<[u8]> + Send + 'static,
+) -> (String, thread::JoinHandle<(String, Vec<u8>)>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = thread::spawn(move || {
@@ -1447,7 +1451,7 @@ fn serve_once(response: &'static str) -> (String, thread::JoinHandle<(String, Ve
             assert!(n > 0, "the request ended inside its body");
             received.extend_from_slice(&buffer[..n]);
         }
-        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(response.as_ref()).unwrap();
         (head, received[head_end..].to_vec())
     });
     (endpoint, server)
@@ -1459,7 +1463,7 @@ fn the_http_sink_posts_json_with_the_authorization_header() {
         serve_once("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
     let authorization = authorization_header("AUTH", "Basic dTpw").unwrap();
     let mut sink = post_to(format!("{endpoint}/otlp"), Some(authorization));
-    assert_eq!(sink("/v1/logs", b"{\"a\":1}"), Ok(()));
+    assert_eq!(sink("/v1/logs", Encoding::Json, b"{\"a\":1}"), Ok(()));
     let (head, body) = server.join().unwrap();
     let head = head.to_ascii_lowercase();
     assert!(
@@ -1475,6 +1479,104 @@ fn the_http_sink_posts_json_with_the_authorization_header() {
 }
 
 #[test]
+fn the_http_sink_posts_protobuf_with_its_content_type() {
+    let (endpoint, server) =
+        serve_once("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let mut sink = post_to(endpoint, None);
+    assert_eq!(
+        sink("/v1/metrics", Encoding::Protobuf, &[0x0a, 0x00]),
+        Ok(())
+    );
+    let (head, body) = server.join().unwrap();
+    let head = head.to_ascii_lowercase();
+    assert!(
+        head.contains("\r\ncontent-type: application/x-protobuf\r\n"),
+        "{head}"
+    );
+    assert_eq!(body, [0x0a, 0x00]);
+}
+
+/// A 400 refusal of `content_type` whose body is `body`.
+fn refusal(content_type: &str, body: &[u8]) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+#[test]
+fn the_http_sink_omits_a_refusal_body_that_is_not_text() {
+    // A `google.rpc.Status` with `code = 3` and `message = "bad\n"`.
+    let status = b"\x08\x03\x12\x04bad\n";
+    for content_type in ["application/x-protobuf", "Application/X-Protobuf ; x=y"] {
+        let (endpoint, server) = serve_once(refusal(content_type, status));
+        let mut sink = post_to(endpoint, None);
+        assert_eq!(
+            sink("/v1/metrics", Encoding::Protobuf, &[0x0a, 0x00]),
+            Err("HTTP 400: application/x-protobuf body omitted".to_owned())
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn the_http_sink_quotes_a_json_refusal_body_whatever_its_parameters() {
+    for content_type in [
+        "application/json; charset=utf-8",
+        "application/json ; charset=utf-8",
+        "Application/JSON",
+    ] {
+        let (endpoint, server) =
+            serve_once(refusal(content_type, br#"{"code":3,"message":"bad"}"#));
+        let mut sink = post_to(endpoint, None);
+        assert_eq!(
+            sink("/v1/metrics", Encoding::Json, b"{}"),
+            Err(r#"HTTP 400: {"code":3,"message":"bad"}"#.to_owned()),
+            "{content_type}"
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn the_http_sink_quotes_a_text_refusal_body_and_one_with_an_empty_type() {
+    for content_type in [
+        "text/html; charset=utf-8",
+        "Text/Plain",
+        "application/problem+json",
+        "",
+        "; charset=utf-8",
+    ] {
+        let (endpoint, server) = serve_once(refusal(content_type, b"bad\nrequest"));
+        let mut sink = post_to(endpoint, None);
+        assert_eq!(
+            sink("/v1/metrics", Encoding::Json, b"{}"),
+            Err("HTTP 400: bad request".to_owned()),
+            "{content_type:?}"
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn the_http_sink_cuts_a_long_media_type_to_200_characters() {
+    let content_type = format!("application/{}", "x".repeat(1_000));
+    let (endpoint, server) = serve_once(refusal(&content_type, b"\x08\x03"));
+    let mut sink = post_to(endpoint, None);
+    assert_eq!(
+        sink("/v1/metrics", Encoding::Protobuf, &[0x0a, 0x00]),
+        Err(format!(
+            "HTTP 400: application/{} body omitted",
+            "x".repeat(188)
+        ))
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn the_http_sink_reports_a_refusal_with_its_status_and_body_on_one_line() {
     let page = format!("<html>\r\n<title>busy</title>\r\n{}", "x".repeat(300));
     let response: &'static str = format!(
@@ -1485,7 +1587,7 @@ fn the_http_sink_reports_a_refusal_with_its_status_and_body_on_one_line() {
     let (endpoint, server) = serve_once(response);
     let mut sink = post_to(endpoint, None);
     let expected = format!("HTTP 503: <html> <title>busy</title> {}", "x".repeat(171));
-    assert_eq!(sink("/v1/metrics", b"{}"), Err(expected));
+    assert_eq!(sink("/v1/metrics", Encoding::Json, b"{}"), Err(expected));
     server.join().unwrap();
 }
 
@@ -1497,7 +1599,7 @@ fn the_http_sink_does_not_follow_a_redirect() {
     let mut sink = post_to(endpoint, None);
     // A followed redirect would reach a closed port and fail otherwise.
     assert_eq!(
-        sink("/v1/metrics", b"{}"),
+        sink("/v1/metrics", Encoding::Json, b"{}"),
         Err("HTTP 302: moved".to_owned())
     );
     server.join().unwrap();
@@ -1510,6 +1612,6 @@ fn the_http_sink_reports_a_collector_that_is_not_there() {
         format!("http://{}", listener.local_addr().unwrap())
     };
     let mut sink = post_to(endpoint, None);
-    let error = sink("/v1/metrics", b"{}").unwrap_err();
+    let error = sink("/v1/metrics", Encoding::Json, b"{}").unwrap_err();
     assert!(!error.starts_with("HTTP "), "{error}");
 }

@@ -14,6 +14,8 @@ use dorfq_scheduler::SchedulerConfig;
 use serde::Deserialize;
 use ureq::http::Uri;
 
+use crate::telemetry::Encoding;
+
 /// A loaded configuration, with every path resolved and the scheduler's
 /// parameters validated.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -53,6 +55,10 @@ pub struct TelemetryConfig {
     pub otlp_endpoint: String,
     /// Seconds between exports; 1 to [`MAX_INTERVAL_SECS`].
     pub interval_secs: u64,
+    /// The encoding of every request body: `protobuf` (the default, the one
+    /// every OTLP/HTTP collector accepts) or `json`.
+    #[serde(default)]
+    pub encoding: Encoding,
     /// The environment variable holding the `Authorization` header's
     /// value, whole (`Basic …`, `Bearer …`); absent, no header is sent.
     /// Never the value.
@@ -530,6 +536,7 @@ kind = "all-at-once"
         let expected = TelemetryConfig {
             otlp_endpoint: "http://127.0.0.1:4318".to_owned(),
             interval_secs: 60,
+            encoding: Encoding::Protobuf,
             authorization_env: None,
         };
         assert_eq!(telemetry_of(&with_telemetry(VALID, body)), expected);
@@ -542,6 +549,17 @@ kind = "all-at-once"
             telemetry_of(&authorised).authorization_env.as_deref(),
             Some("DORFQ_OTLP_AUTHORIZATION")
         );
+    }
+
+    #[test]
+    fn telemetry_encoding_is_protobuf_or_json() {
+        let body = "otlp_endpoint = \"http://127.0.0.1:4318\"\ninterval_secs = 60\n";
+        let json = with_telemetry(VALID, &format!("{body}encoding = \"json\"\n"));
+        assert_eq!(telemetry_of(&json).encoding, Encoding::Json);
+        let xml = with_telemetry(VALID, &format!("{body}encoding = \"xml\"\n"));
+        let error = Config::parse(&xml, Path::new("conf")).unwrap_err();
+        assert!(error.contains("unknown variant `xml`"), "{error}");
+        assert!(error.contains("expected `protobuf` or `json`"), "{error}");
     }
 
     #[test]
