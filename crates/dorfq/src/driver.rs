@@ -35,6 +35,14 @@ impl DriverError {
             DriverError::Scheduler(_) => true,
         }
     }
+
+    /// What the tick saw and decided, when it got as far as a plan.
+    pub fn report(&self) -> Option<&TickReport> {
+        match self {
+            DriverError::Effect { report, .. } => Some(report),
+            DriverError::Observe(_) | DriverError::Scheduler(_) => None,
+        }
+    }
 }
 
 impl fmt::Display for DriverError {
@@ -148,7 +156,9 @@ impl TickReport {
     }
 }
 
-fn status(s: &PrStatus) -> String {
+/// A pull request's status as the tick line words it: `ready`,
+/// `waiting:<holds>`, `conflicting:<with>`.
+pub(crate) fn status(s: &PrStatus) -> String {
     match s {
         PrStatus::Ready => "ready".to_owned(),
         PrStatus::Waiting(holds) => {

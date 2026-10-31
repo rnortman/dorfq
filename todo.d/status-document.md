@@ -1,12 +1,13 @@
-A live status for a queue's users. Today the only view of a real queue is
-the report document `dorfq journal report` builds offline. Build one
-document from the pool as it stands now plus a window of recent events,
-render it to a configured GitHub issue that the queue edits in place, and
-publish the same document to a branch that the simulation page reads in a
-live mode. Done means the issue shows the queue, the batches in flight and
-the last hours' landings and ejections within a tick of their happening,
-and the page opens the published document and follows it. Deferred because
-it is design work: the document's shape beside the report's, the window,
-the issue's write rate against the API budget, and the page's live mode.
-The `TODO(status-document)` comment sits above `document` in
-`crates/dorfq/src/journal/report.rs`.
+Publish the live status document for the simulation page. The queue keeps
+a `Document` (the pool now, when each pull request and batch entered its
+state, and a 24-hour window of events and figures) and renders it to the
+status issue; nothing publishes it as data. Write the document as JSON to a
+branch the queue owns, and give the simulation page a live mode that opens
+the published document and follows it. Done means the page, pointed at a
+running queue's repository, shows the same queue, batches and window the
+status issue does and updates as the queue writes. Deferred because it
+waits on decisions: where the page is hosted, how a browser reads a private
+repository without a token of its own, whether the document lives on a
+queue-owned ref under `refs/dorfq/`, and which JavaScript test toolchain the
+build brings in. The `TODO(status-document)` comment sits above `Document`
+in `crates/dorfq/src/journal/status.rs`.

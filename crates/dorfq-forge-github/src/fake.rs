@@ -14,8 +14,8 @@ use std::time::SystemTime;
 use dorfq_core::{PrNumber, Sha};
 
 use crate::api::{
-    ApiError, CheckResult, Commit, Compare, CompareStatus, GitHubApi, Merge, MergeState, OpenPr,
-    PrDetail, RefEntry, RefUpdate, RulesetId, RunId, WorkflowRun,
+    ApiError, ChangedFile, CheckResult, Commit, Compare, CompareStatus, GitHubApi, IssueDetail,
+    Merge, MergeState, OpenPr, PrDetail, RefEntry, RefUpdate, RulesetId, RunId, WorkflowRun,
 };
 use crate::branch;
 
@@ -24,6 +24,9 @@ use crate::branch;
 pub enum Failure {
     Transient,
     Permanent,
+    /// A rate-limited answer: transient, recording a pause until this time
+    /// for the next [`GitHubApi::rate_limit_pause`].
+    RateLimited(SystemTime),
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +41,13 @@ pub struct FakePr {
     pub merge_state: MergeState,
     pub draft: bool,
     pub merged: bool,
+    pub base_sha: Sha,
+    /// `None` stands for a response without the field.
+    pub additions: Option<u64>,
+    /// `None` stands for a response without the field.
+    pub deletions: Option<u64>,
+    /// `None` stands for a response without the field.
+    pub changed_files: Option<u64>,
 }
 
 /// An Actions workflow run.
@@ -56,6 +66,12 @@ pub struct State {
     /// Check results per commit, newest first.
     pub checks: BTreeMap<Sha, Vec<CheckResult>>,
     pub comments: BTreeMap<u64, Vec<String>>,
+    /// The files each pull request changes, in listing order; none when
+    /// unset.
+    pub files: BTreeMap<u64, Vec<ChangedFile>>,
+    /// Plain issues by number, with their bodies; a body written to a pull
+    /// request's number is kept here too.
+    pub issues: BTreeMap<u64, String>,
     pub labels: BTreeSet<String>,
     /// Heads that conflict with trunk whatever they are merged onto.
     pub conflicts_with_trunk: BTreeSet<Sha>,
@@ -94,6 +110,8 @@ pub struct State {
     /// The pause the next [`GitHubApi::rate_limit_pause`] reports, as a
     /// rate-limited response would have recorded it; taken by that call.
     pub rate_limit_pause: Option<SystemTime>,
+    /// What [`GitHubApi::rate_limit_remaining`] reports.
+    pub rate_limit_remaining: Option<u64>,
     /// Every call, as `"<method> <arguments>"`.
     pub calls: Vec<String>,
     /// Failures to inject: method, a substring of the call's arguments,
@@ -192,9 +210,24 @@ impl FakeGitHub {
                 merge_state: MergeState::Clean,
                 draft: false,
                 merged: false,
+                base_sha: parent.clone(),
+                additions: Some(0),
+                deletions: Some(0),
+                changed_files: Some(0),
             },
         );
         head
+    }
+
+    /// Sets the files pull request `number` changes, and its counts to
+    /// match them.
+    pub fn set_files(&self, number: u64, files: Vec<ChangedFile>) {
+        let mut state = self.state();
+        let pr = state.prs.get_mut(&number).expect("pull request exists");
+        pr.additions = Some(files.iter().map(|f| f.additions).sum());
+        pr.deletions = Some(files.iter().map(|f| f.deletions).sum());
+        pr.changed_files = Some(u64::try_from(files.len()).expect("a fake listing fits u64"));
+        state.files.insert(number, files);
     }
 
     /// Moves pull request `number`'s head, and its head branch with it.
@@ -315,6 +348,7 @@ impl FakeGitHub {
             "merge",
             "remove_label",
             "create_comment",
+            "set_issue_body",
             "set_base",
             "create_ruleset",
             "update_ruleset",
@@ -338,6 +372,12 @@ impl FakeGitHub {
             }
             Some(Failure::Permanent) => {
                 Err(ApiError::Permanent(format!("{method}: injected").into()))
+            }
+            Some(Failure::RateLimited(until)) => {
+                state.rate_limit_pause = Some(until);
+                Err(ApiError::Transient(
+                    format!("{method}: injected (rate limited)").into(),
+                ))
             }
         }
     }
@@ -591,7 +631,21 @@ impl GitHubApi for FakeGitHub {
             },
             draft: pr.draft,
             merged: pr.merged,
+            base_sha: pr.base_sha.clone(),
+            additions: pr.additions,
+            deletions: pr.deletions,
+            changed_files: pr.changed_files,
         })
+    }
+
+    fn pr_files(&mut self, number: PrNumber) -> Result<Vec<ChangedFile>, ApiError> {
+        self.enter("pr_files", number.0.to_string())?;
+        Ok(self
+            .state()
+            .files
+            .get(&number.0)
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn set_base(&mut self, number: PrNumber, base: &str) -> Result<(), ApiError> {
@@ -660,6 +714,30 @@ impl GitHubApi for FakeGitHub {
             .entry(number.0)
             .or_default()
             .push(body.to_owned());
+        Ok(())
+    }
+
+    fn get_issue(&mut self, number: u64) -> Result<Option<IssueDetail>, ApiError> {
+        self.enter("get_issue", number.to_string())?;
+        let state = self.state();
+        Ok(if state.prs.contains_key(&number) {
+            Some(IssueDetail { pull_request: true })
+        } else if state.issues.contains_key(&number) {
+            Some(IssueDetail {
+                pull_request: false,
+            })
+        } else {
+            None
+        })
+    }
+
+    fn set_issue_body(&mut self, number: u64, body: &str) -> Result<(), ApiError> {
+        self.enter("set_issue_body", number.to_string())?;
+        let mut state = self.state();
+        if !state.prs.contains_key(&number) && !state.issues.contains_key(&number) {
+            return Err(permanent(format!("set_issue_body {number}: no such issue")));
+        }
+        state.issues.insert(number, body.to_owned());
         Ok(())
     }
 
@@ -757,6 +835,10 @@ impl GitHubApi for FakeGitHub {
     fn rate_limit_pause(&mut self) -> Option<SystemTime> {
         self.state().rate_limit_pause.take()
     }
+
+    fn rate_limit_remaining(&self) -> Option<u64> {
+        self.state().rate_limit_remaining
+    }
 }
 
 mod tests {
@@ -776,5 +858,13 @@ mod tests {
         assert_eq!(fake.compare(&trunk_now, &ahead).unwrap().merge_base, fork);
         assert_eq!(fake.compare(&trunk, &trunk_now).unwrap().merge_base, trunk);
         assert_eq!(fake.compare(&head, &ahead).unwrap().merge_base, head);
+    }
+
+    #[test]
+    fn rate_limit_remaining_is_what_the_state_holds() {
+        let fake = FakeGitHub::new();
+        assert_eq!(fake.rate_limit_remaining(), None);
+        fake.state().rate_limit_remaining = Some(12);
+        assert_eq!(fake.rate_limit_remaining(), Some(12));
     }
 }

@@ -3,13 +3,14 @@
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use dorfq::config::Config;
 use dorfq::driver::{Driver, DriverError, TickReport};
-use dorfq::journal::{self, Header};
+use dorfq::journal::{self, Header, status};
 use dorfq::providers::{self, Outcome};
+use dorfq::{telemetry, unix_now};
 use dorfq_core::Observation;
 
 #[derive(Parser)]
@@ -94,10 +95,7 @@ fn read_journal(verb: Verb) -> ExitCode {
     }
     let events = journal::events::derive(&read.entries);
     let text = match &verb {
-        Verb::Events { .. } => events
-            .iter()
-            .map(|event| serde_json::to_string(event).expect("an event serialises") + "\n")
-            .collect(),
+        Verb::Events { .. } => events.iter().map(journal::events::line).collect(),
         Verb::Metrics { json, .. } => {
             let summary = journal::summary::summarise(&events);
             if *json {
@@ -146,7 +144,11 @@ fn read_journal(verb: Verb) -> ExitCode {
 /// plans something, or observes something other than the last one printed
 /// did, the time aside; a tick whose plan an effect error cut short is
 /// printed by the same rule, before the error. With a journal configured,
-/// every tick is journaled, a fatal one before the exit.
+/// every tick is journaled, a fatal one before the exit; with a status
+/// issue as well, each tick that changes the status document hands the
+/// forge its new body; with `[telemetry]`, each tick's events and gauges are
+/// handed to the exporter, which pushes them on its interval and once more
+/// at exit.
 fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
     let config = match Config::load(config) {
         Ok(config) => config,
@@ -155,11 +157,45 @@ fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let started = unix_now();
+    let exporter = match &config.telemetry {
+        None => None,
+        Some(settings) => match telemetry::http_sink(settings) {
+            Ok(sink) => Some(telemetry::Exporter::start(
+                Duration::from_secs(settings.interval_secs),
+                started,
+                settings.encoding,
+                sink,
+            )),
+            Err(error) => {
+                eprintln!("dorfq: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let status_issue = config
+        .forge
+        .github_settings()
+        .and_then(|settings| settings.status_issue);
+    // The status structure exists before the forge, so the journal's seed
+    // can feed it; the status issue and the telemetry read it, and the
+    // configuration refuses either without `journal`.
+    let mut live = (status_issue.is_some() || exporter.is_some()).then(status::Live::new);
     let mut journal = match &config.journal {
         None => None,
         Some(path) => {
-            let header = Header::start(config.forge.kind(), &config.scheduler, unix_now());
-            match journal::Writer::open(path, header) {
+            let header = Header::start(config.forge.kind(), &config.scheduler, started);
+            let seed: journal::Sink<'_> = match &mut live {
+                Some(live) => &mut |observation, events| live.seed(observation, events),
+                None => &mut |_, _| {},
+            };
+            match journal::Writer::open(
+                path,
+                header,
+                config.events.as_deref(),
+                config.capture.as_deref(),
+                seed,
+            ) {
                 Ok((writer, notes)) => {
                     for note in notes {
                         eprintln!("dorfq: {note}");
@@ -180,6 +216,13 @@ fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let mut publish = status_issue.map(|_| {
+        built
+            .status
+            .take()
+            .expect("a GitHub forge with status_issue hands over a status handle")
+    });
+    let mut forge_gauges = built.gauges.take();
     // TODO(journal-recovery): replay the current segment's observations
     // through this scheduler before the first live tick.
     let mut scheduler = providers::scheduler(&config.scheduler);
@@ -187,36 +230,91 @@ fn run(config: &Path, exit_when_idle: bool) -> ExitCode {
     let mut printed: Option<Observation> = None;
     let mut outcome = Outcome::Done;
     loop {
+        // TODO(correctness-signal-stop-skips-final-export-events-never-delivered):
+        // return on SIGTERM or SIGINT, so the exporter's drop delivers what
+        // is pending; a signal now ends the process without it.
         (built.wait)(outcome);
         outcome = Outcome::Done;
         let ticked = driver.tick();
         // The outcome is printed before it is journaled, so a journal that
         // cannot be written loses nothing from stdout and stderr.
-        match &ticked {
-            Ok(report) => print_report(report, &mut printed),
-            Err(error) => {
-                if let DriverError::Effect { report, .. } = error {
-                    print_report(report, &mut printed);
-                }
-                if error.is_fatal() {
-                    eprintln!("dorfq: {error}");
-                } else {
-                    eprintln!("dorfq: {error}; retrying");
-                }
+        let report = ticked.as_ref().map_or_else(DriverError::report, Some);
+        if let Some(report) = report {
+            print_report(report, &mut printed);
+        }
+        if let Err(error) = &ticked {
+            if error.is_fatal() {
+                eprintln!("dorfq: {error}");
+            } else {
+                eprintln!("dorfq: {error}; retrying");
             }
         }
-        if let Some(writer) = &mut journal
-            && let Err(error) = writer.record(driver.ticks() - 1, unix_now(), &ticked)
-        {
-            eprintln!("dorfq: {error}");
-            return ExitCode::FAILURE;
+        let exiting = matches!(&ticked, Ok(report)
+            if exit_when_idle && report.idle && !(built.has_scheduled_events)());
+        if let Some(writer) = &mut journal {
+            let at = unix_now();
+            let events = match writer.record(driver.ticks() - 1, at, &ticked) {
+                Ok(events) => events,
+                Err(error) => {
+                    eprintln!("dorfq: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            // A fatal tick exits without a status write: the body stays as
+            // last written, saying when it last changed. Its events still
+            // reach the exporter, with no gauges.
+            let fatal = ticked.as_ref().is_err_and(DriverError::is_fatal);
+            let mut snapshot = None;
+            if let Some(live) = live.as_mut().filter(|_| !fatal) {
+                live.tick(report.map(|r| &r.observation), &events);
+                if let Some(document) = live.document() {
+                    if let Some(publish) = &mut publish
+                        && let Some(body) = live.changed(&document, dorfq::version(), started)
+                    {
+                        publish(body);
+                    }
+                    if exporter.is_some() {
+                        let forge = forge_gauges.as_mut().map(|gauges| gauges());
+                        snapshot = Some(telemetry::snapshot(&document, live.now(), forge));
+                    }
+                }
+            }
+            if let Some(exporter) = &exporter {
+                exporter.tick(telemetry::Tick {
+                    at,
+                    events,
+                    snapshot,
+                    observed: report.is_some() && !fatal,
+                });
+            }
+            // Last, so the journal line, the events, the status write and
+            // the export are ahead of any GitHub round trip. Only after a
+            // tick whose forge calls all succeeded: a failed one may have
+            // lost the repository or been told to pause. The idle exit reads
+            // every head still owed, since the segment that shows them may
+            // have just closed.
+            let captured = if exiting {
+                writer.drain_capture(at, built.capture.as_mut())
+            } else if ticked.is_ok() {
+                writer.capture(at, built.capture.as_mut())
+            } else {
+                Ok(Vec::new())
+            };
+            match captured {
+                Ok(lines) => {
+                    for line in lines {
+                        eprintln!("dorfq: {line}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("dorfq: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
         match ticked {
-            Ok(report) => {
-                if exit_when_idle && report.idle && !(built.has_scheduled_events)() {
-                    return ExitCode::SUCCESS;
-                }
-            }
+            Ok(_) if exiting => return ExitCode::SUCCESS,
+            Ok(_) => {}
             Err(error) if error.is_fatal() => return ExitCode::FAILURE,
             Err(_) => outcome = Outcome::Transient,
         }
@@ -229,12 +327,4 @@ fn print_report(report: &TickReport, printed: &mut Option<Observation>) {
         println!("{report}");
         *printed = Some(report.observation.clone());
     }
-}
-
-/// The host clock, Unix seconds.
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the host clock is after 1970")
-        .as_secs()
 }

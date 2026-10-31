@@ -192,6 +192,7 @@ impl Target {
                 pr: Duration::from_secs(1),
                 batch: Duration::from_secs(1),
             },
+            status_issue: None,
         };
         GitHubForge::new(
             Box::new(self.client()),

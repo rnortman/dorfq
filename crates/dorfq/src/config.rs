@@ -1,5 +1,5 @@
-//! The configuration file: which forge, which scheduler, and where the
-//! journal goes.
+//! The configuration file: which forge, which scheduler, where the journal
+//! goes, and where telemetry goes.
 
 use std::error::Error;
 use std::fmt;
@@ -12,6 +12,9 @@ use dorfq_forge_github::refresh::Refresh;
 use dorfq_forge_github::{Ci, Settings};
 use dorfq_scheduler::SchedulerConfig;
 use serde::Deserialize;
+use ureq::http::Uri;
+
+use crate::telemetry::Encoding;
 
 /// A loaded configuration, with every path resolved and the scheduler's
 /// parameters validated.
@@ -21,12 +24,109 @@ pub struct Config {
     /// The tick journal's path; absent, no journal is written. Relative
     /// paths are resolved against the configuration file's directory at
     /// load.
-    // TODO(telemetry-export): the event stream written live beside the
-    // journal, and the summary and events pushed over OTLP/HTTP.
     #[serde(default)]
     pub journal: Option<PathBuf>,
+    /// The events file's path, beside the journal and rotated with it;
+    /// absent, no events file is written. Needs `journal`. Relative paths
+    /// are resolved as `journal`'s.
+    #[serde(default)]
+    pub events: Option<PathBuf>,
+    /// The capture file's path, beside the journal and rotated with it: each
+    /// pull request head's changed files, read from the forge at first
+    /// sight; absent, nothing is captured. Needs `journal`. Relative paths
+    /// are resolved as `journal`'s.
+    #[serde(default)]
+    pub capture: Option<PathBuf>,
+    /// Where the queue pushes its gauges and events; absent, nothing is
+    /// pushed. Needs `journal`.
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
     pub forge: ForgeConfig,
     pub scheduler: SchedulerConfig,
+}
+
+/// Where the queue pushes its telemetry over OTLP/HTTP.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// Where metrics requests are posted: the complete OTLP/HTTP URL,
+    /// `http://` or `https://`, used as given.
+    pub metrics_endpoint: String,
+    /// Where logs requests are posted, likewise.
+    pub logs_endpoint: String,
+    /// Seconds between exports; 1 to [`MAX_INTERVAL_SECS`].
+    pub interval_secs: u64,
+    /// The encoding of every request body: `protobuf` (the default, the one
+    /// every OTLP/HTTP collector accepts) or `json`.
+    #[serde(default)]
+    pub encoding: Encoding,
+    /// The environment variable holding the `Authorization` header's
+    /// value, whole (`Basic …`, `Bearer …`); absent, no header is sent.
+    /// Never the value.
+    #[serde(default)]
+    pub authorization_env: Option<String>,
+}
+
+/// The longest `interval_secs`, a day. The exporter's clock is an
+/// `Instant`, which panics on an interval it cannot add.
+pub const MAX_INTERVAL_SECS: u64 = 86_400;
+
+impl TelemetryConfig {
+    fn validate(&self) -> Result<(), String> {
+        check_endpoint("telemetry.metrics_endpoint", &self.metrics_endpoint)?;
+        check_endpoint("telemetry.logs_endpoint", &self.logs_endpoint)?;
+        if self.interval_secs == 0 {
+            return Err("telemetry.interval_secs is 0".to_owned());
+        }
+        if self.interval_secs > MAX_INTERVAL_SECS {
+            return Err(format!(
+                "telemetry.interval_secs is above {MAX_INTERVAL_SECS}"
+            ));
+        }
+        if self.authorization_env.as_deref() == Some("") {
+            return Err("telemetry.authorization_env is empty".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Checks that `endpoint`, the value of the key `key`, is an `http://` or
+/// `https://` URL with a host, no credentials, no query and no fragment.
+fn check_endpoint(key: &str, endpoint: &str) -> Result<(), String> {
+    // Credentials or a token may sit after an `@`, a `?` or a `#`, so such
+    // an endpoint is never written into the message.
+    let shown = if endpoint.contains(['@', '?', '#']) {
+        String::new()
+    } else {
+        format!(" {endpoint:?}")
+    };
+    let problem = |reason: &str| format!("{key}{shown} {reason}");
+    let uri: Uri = endpoint
+        .parse()
+        .map_err(|error| problem(&format!("is not a URL: {error}")))?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return Err(problem("is not an http:// or https:// URL"));
+    }
+    let (Some(authority), Some(host)) = (uri.authority(), uri.host()) else {
+        return Err(problem("has no host"));
+    };
+    if host.is_empty() {
+        return Err(problem("has no host"));
+    }
+    if authority.as_str().contains('@') {
+        return Err(problem("carries credentials; use authorization_env"));
+    }
+    // Without credentials the authority is the host and, when it is longer,
+    // a `:` and the port.
+    if authority.as_str().len() > host.len() && uri.port_u16().is_none() {
+        return Err(problem("has an invalid port"));
+    }
+    // `Uri` keeps a query but discards a fragment, so both are read off the
+    // text.
+    if endpoint.contains(['?', '#']) {
+        return Err(problem("has a query or fragment"));
+    }
+    Ok(())
 }
 
 /// The forge to build.
@@ -76,6 +176,10 @@ pub enum ForgeConfig {
         /// intervals are the only clock.
         #[serde(default)]
         webhook: Option<WebhookConfig>,
+        /// The number of an issue whose body the queue keeps as its status;
+        /// absent, no issue is edited. Needs `journal`.
+        #[serde(default)]
+        status_issue: Option<u64>,
         /// The credential the forge runs under.
         auth: AuthConfig,
     },
@@ -192,8 +296,31 @@ impl Config {
             .scheduler
             .validate()
             .map_err(|e| format!("scheduler: {e}"))?;
-        if let Some(journal) = &mut config.journal {
-            *journal = dir.join(journal.as_path());
+        if config.events.is_some() && config.journal.is_none() {
+            return Err("events needs journal".to_owned());
+        }
+        if config.capture.is_some() && config.journal.is_none() {
+            return Err("capture needs journal".to_owned());
+        }
+        if let ForgeConfig::GitHub {
+            status_issue: Some(_),
+            ..
+        } = config.forge
+            && config.journal.is_none()
+        {
+            return Err("forge.status_issue needs journal".to_owned());
+        }
+        if let Some(telemetry) = &config.telemetry {
+            if config.journal.is_none() {
+                return Err("telemetry needs journal".to_owned());
+            }
+            telemetry.validate()?;
+        }
+        for path in [&mut config.journal, &mut config.events, &mut config.capture]
+            .into_iter()
+            .flatten()
+        {
+            *path = dir.join(path.as_path());
         }
         match &mut config.forge {
             ForgeConfig::Mock { scenario } => {
@@ -270,6 +397,7 @@ impl ForgeConfig {
             lock_heads,
             ci,
             refresh,
+            status_issue,
             ..
         } = self
         else {
@@ -287,6 +415,7 @@ impl ForgeConfig {
                 pr: Duration::from_secs(refresh.pr_secs),
                 batch: Duration::from_secs(refresh.batch_secs),
             },
+            status_issue: *status_issue,
         })
     }
 }
@@ -311,6 +440,9 @@ kind = "all-at-once"
             config,
             Config {
                 journal: None,
+                events: None,
+                capture: None,
+                telemetry: None,
                 forge: ForgeConfig::Mock {
                     scenario: PathBuf::from("conf/scenario.toml"),
                 },
@@ -334,6 +466,239 @@ kind = "all-at-once"
             journal("/var/lib/q.journal"),
             Some(PathBuf::from("/var/lib/q.journal"))
         );
+    }
+
+    #[test]
+    fn a_relative_events_path_is_resolved_and_an_absolute_one_kept() {
+        let events = |path: &str| {
+            Config::parse(
+                &format!("journal = \"q.journal\"\nevents = {path:?}\n{VALID}"),
+                Path::new("conf"),
+            )
+            .unwrap()
+            .events
+        };
+        assert_eq!(events("q.events"), Some(PathBuf::from("conf/q.events")));
+        assert_eq!(
+            events("/var/lib/q.events"),
+            Some(PathBuf::from("/var/lib/q.events"))
+        );
+    }
+
+    #[test]
+    fn events_without_a_journal_is_rejected_naming_both() {
+        let error = Config::parse(
+            &format!("events = \"q.events\"\n{VALID}"),
+            Path::new("conf"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "events needs journal");
+    }
+
+    #[test]
+    fn a_relative_capture_path_is_resolved_and_an_absolute_one_kept() {
+        let capture = |path: &str| {
+            Config::parse(
+                &format!("journal = \"q.journal\"\ncapture = {path:?}\n{VALID}"),
+                Path::new("conf"),
+            )
+            .unwrap()
+            .capture
+        };
+        assert_eq!(capture("q.capture"), Some(PathBuf::from("conf/q.capture")));
+        assert_eq!(
+            capture("/var/lib/q.capture"),
+            Some(PathBuf::from("/var/lib/q.capture"))
+        );
+    }
+
+    #[test]
+    fn capture_without_a_journal_is_rejected_naming_both() {
+        let error = Config::parse(
+            &format!("capture = \"q.capture\"\n{VALID}"),
+            Path::new("conf"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "capture needs journal");
+    }
+
+    /// [`VALID`] with a journal and a `[telemetry]` table holding `body`.
+    fn with_telemetry(base: &str, body: &str) -> String {
+        format!("journal = \"q.journal\"\n{base}\n[telemetry]\n{body}")
+    }
+
+    /// Both endpoint keys, on one local collector.
+    const ENDPOINTS: &str = "metrics_endpoint = \"http://127.0.0.1:4318/v1/metrics\"\n\
+                             logs_endpoint = \"http://127.0.0.1:4318/v1/logs\"\n";
+
+    fn telemetry_of(text: &str) -> TelemetryConfig {
+        Config::parse(text, Path::new("conf"))
+            .unwrap()
+            .telemetry
+            .unwrap()
+    }
+
+    #[test]
+    fn telemetry_parses_under_either_forge_and_is_absent_unless_set() {
+        assert_eq!(Config::parse(VALID, Path::new("")).unwrap().telemetry, None);
+        let body = &format!("{ENDPOINTS}interval_secs = 60\n");
+        let expected = TelemetryConfig {
+            metrics_endpoint: "http://127.0.0.1:4318/v1/metrics".to_owned(),
+            logs_endpoint: "http://127.0.0.1:4318/v1/logs".to_owned(),
+            interval_secs: 60,
+            encoding: Encoding::Protobuf,
+            authorization_env: None,
+        };
+        assert_eq!(telemetry_of(&with_telemetry(VALID, body)), expected);
+        assert_eq!(telemetry_of(&with_telemetry(GITHUB, body)), expected);
+        let authorised = with_telemetry(
+            GITHUB,
+            &format!("{body}authorization_env = \"DORFQ_OTLP_AUTHORIZATION\"\n"),
+        );
+        assert_eq!(
+            telemetry_of(&authorised).authorization_env.as_deref(),
+            Some("DORFQ_OTLP_AUTHORIZATION")
+        );
+    }
+
+    #[test]
+    fn telemetry_encoding_is_protobuf_or_json() {
+        let body = format!("{ENDPOINTS}interval_secs = 60\n");
+        let json = with_telemetry(VALID, &format!("{body}encoding = \"json\"\n"));
+        assert_eq!(telemetry_of(&json).encoding, Encoding::Json);
+        let xml = with_telemetry(VALID, &format!("{body}encoding = \"xml\"\n"));
+        let error = Config::parse(&xml, Path::new("conf")).unwrap_err();
+        assert!(error.contains("unknown variant `xml`"), "{error}");
+        assert!(error.contains("expected `protobuf` or `json`"), "{error}");
+    }
+
+    /// A `[telemetry]` body with `endpoint` under `key` and a valid URL
+    /// under the other endpoint key.
+    fn one_endpoint(key: &str, endpoint: &str) -> String {
+        let other = if key == "metrics_endpoint" {
+            "logs_endpoint = \"http://host/v1/logs\""
+        } else {
+            "metrics_endpoint = \"http://host/v1/metrics\""
+        };
+        format!("{key} = {endpoint:?}\n{other}\ninterval_secs = 60\n")
+    }
+
+    #[test]
+    fn telemetry_endpoints_are_kept_as_given() {
+        for given in [
+            "https://otlp.example/otlp/v1/metrics/",
+            "http://collector:4318//",
+            "http://[::1]:4318/v1/logs",
+        ] {
+            let metrics = telemetry_of(&with_telemetry(
+                VALID,
+                &one_endpoint("metrics_endpoint", given),
+            ));
+            assert_eq!(metrics.metrics_endpoint, given);
+            let logs = telemetry_of(&with_telemetry(
+                VALID,
+                &one_endpoint("logs_endpoint", given),
+            ));
+            assert_eq!(logs.logs_endpoint, given);
+        }
+    }
+
+    #[test]
+    fn telemetry_without_a_journal_is_rejected_naming_both() {
+        let text = format!("{VALID}\n[telemetry]\n{ENDPOINTS}interval_secs = 60\n");
+        assert_eq!(rejected(&text), "telemetry needs journal");
+    }
+
+    #[test]
+    fn telemetry_endpoint_that_is_no_usable_url_is_rejected_saying_why() {
+        for (endpoint, reason) in [
+            ("http://ho st", "is not a URL: "),
+            ("ftp://host", "is not an http:// or https:// URL"),
+            ("host:4318", "is not an http:// or https:// URL"),
+            ("http://:4318", "has no host"),
+            ("http://host:99999", "has an invalid port"),
+            ("http://host:", "has an invalid port"),
+        ] {
+            for key in ["metrics_endpoint", "logs_endpoint"] {
+                let message = rejected(&with_telemetry(VALID, &one_endpoint(key, endpoint)));
+                let prefix = format!("telemetry.{key} {endpoint:?} {reason}");
+                assert!(message.starts_with(&prefix), "{endpoint}: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn telemetry_endpoint_that_may_carry_a_secret_is_rejected_without_echoing_it() {
+        for (endpoint, reason) in [
+            (
+                "http://u:secret@host",
+                "carries credentials; use authorization_env",
+            ),
+            ("ftp://u:secret@host", "is not an http:// or https:// URL"),
+            ("http://u:sec ret@host", "is not a URL: "),
+            ("http://host/?api-key=secret", "has a query or fragment"),
+            ("http://host/#secret", "has a query or fragment"),
+        ] {
+            for key in ["metrics_endpoint", "logs_endpoint"] {
+                let message = rejected(&with_telemetry(VALID, &one_endpoint(key, endpoint)));
+                let prefix = format!("telemetry.{key} {reason}");
+                assert!(message.starts_with(&prefix), "{endpoint}: {message}");
+                assert!(!message.contains("secret"), "{endpoint}: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn telemetry_interval_out_of_range_and_empty_variable_are_rejected() {
+        let endpoint = ENDPOINTS;
+        assert_eq!(
+            rejected(&with_telemetry(
+                VALID,
+                &format!("{endpoint}interval_secs = 0\n")
+            )),
+            "telemetry.interval_secs is 0"
+        );
+        for interval in [MAX_INTERVAL_SECS + 1, i64::MAX as u64] {
+            assert_eq!(
+                rejected(&with_telemetry(
+                    VALID,
+                    &format!("{endpoint}interval_secs = {interval}\n")
+                )),
+                "telemetry.interval_secs is above 86400"
+            );
+        }
+        let at_most = format!("{endpoint}interval_secs = {MAX_INTERVAL_SECS}\n");
+        let config = Config::parse(&with_telemetry(VALID, &at_most), Path::new("")).unwrap();
+        assert_eq!(
+            config.telemetry.map(|t| t.interval_secs),
+            Some(MAX_INTERVAL_SECS)
+        );
+        assert_eq!(
+            rejected(&with_telemetry(
+                VALID,
+                &format!("{endpoint}interval_secs = 1\nauthorization_env = \"\"\n")
+            )),
+            "telemetry.authorization_env is empty"
+        );
+    }
+
+    #[test]
+    fn telemetry_unknown_or_missing_field_is_rejected_naming_it() {
+        let message = rejected(&with_telemetry(
+            VALID,
+            &format!("{ENDPOINTS}interval_sec = 60\n"),
+        ));
+        assert!(message.contains("interval_sec"), "{message}");
+        let message = rejected(&with_telemetry(
+            VALID,
+            "metrics_endpoint = \"http://host/v1/metrics\"\ninterval_secs = 60\n",
+        ));
+        assert!(message.contains("logs_endpoint"), "{message}");
+        let message = rejected(&with_telemetry(
+            VALID,
+            "logs_endpoint = \"http://host/v1/logs\"\ninterval_secs = 60\n",
+        ));
+        assert!(message.contains("metrics_endpoint"), "{message}");
     }
 
     #[test]
@@ -454,11 +819,69 @@ kind = "all-at-once"
                     batch_secs: 30,
                 },
                 webhook: None,
+                status_issue: None,
                 auth: AuthConfig::Token {
                     env: "DORFQ_GITHUB_TOKEN".to_owned(),
                 },
             }
         );
+    }
+
+    /// [`GITHUB`] with `status_issue = {number}` under `[forge]`, and a
+    /// journal when `journal` is set.
+    fn github_with_status_issue(number: &str, journal: bool) -> String {
+        let text = GITHUB.replace(
+            "checks = [\"check\"]\n",
+            &format!("checks = [\"check\"]\nstatus_issue = {number}\n"),
+        );
+        if journal {
+            format!("journal = \"q.journal\"\n{text}")
+        } else {
+            text
+        }
+    }
+
+    #[test]
+    fn github_status_issue_is_absent_unless_set_and_passed_through() {
+        let status_issue = |text: &str| {
+            Config::parse(text, Path::new("conf"))
+                .unwrap()
+                .forge
+                .github_settings()
+                .unwrap()
+                .status_issue
+        };
+        assert_eq!(status_issue(GITHUB), None);
+        assert_eq!(
+            status_issue(&github_with_status_issue("12", true)),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn github_status_issue_without_a_journal_is_rejected_naming_both() {
+        assert_eq!(
+            rejected(&github_with_status_issue("12", false)),
+            "forge.status_issue needs journal"
+        );
+    }
+
+    #[test]
+    fn github_status_issue_zero_is_rejected() {
+        assert_eq!(
+            rejected(&github_with_status_issue("0", true)),
+            "forge.status_issue is 0"
+        );
+    }
+
+    #[test]
+    fn a_status_issue_under_the_mock_is_rejected_naming_it() {
+        let text = VALID.replace(
+            "scenario = \"scenario.toml\"\n",
+            "scenario = \"scenario.toml\"\nstatus_issue = 12\n",
+        );
+        let message = rejected(&format!("journal = \"q.journal\"\n{text}"));
+        assert!(message.contains("status_issue"), "{message}");
     }
 
     /// [`GITHUB`] with a `[forge.webhook]` table holding `body`.

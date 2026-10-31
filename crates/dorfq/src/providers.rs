@@ -13,16 +13,17 @@ use std::sync::mpsc::{self, Receiver};
 
 use dorfq_core::{
     BatchId, BatchStart, EjectReason, Forge, ForgeError, NoticeReason, Observation, PrNumber,
-    Scheduler,
+    Scheduler, Sha,
 };
-use dorfq_forge_github::api::{ApiError, Auth, RestClient};
+use dorfq_forge_github::api::{ApiError, Auth, ChangedFile, GitHubApi, RestClient};
 use dorfq_forge_github::app::AppKey;
 use dorfq_forge_github::webhook::{Hint, Listener};
-use dorfq_forge_github::{GitHubForge, Settings, system_clock};
+use dorfq_forge_github::{GitHubForge, HeadFiles, Settings, system_clock};
 use dorfq_forge_mock::{MockForge, Scenario, ScenarioError};
 use dorfq_scheduler::SchedulerConfig;
 
 use crate::config::{AuthConfig, ForgeConfig, WebhookConfig};
+use crate::journal::capture::Reader;
 
 /// A provider that could not be built.
 #[derive(Debug)]
@@ -111,6 +112,23 @@ pub struct BuiltForge {
     pub has_scheduled_events: Box<dyn Fn() -> bool>,
     /// Blocks until the next tick is due, given how the last one ended.
     pub wait: Box<dyn FnMut(Outcome)>,
+    /// Hands the forge a new status body to write to the status issue:
+    /// `Some` for the GitHub forge with `status_issue` set, `None` otherwise.
+    pub status: Option<Box<dyn FnMut(String)>>,
+    /// Reads what the forge knows that no observation carries: `Some` for
+    /// the GitHub forge, `None` otherwise.
+    pub gauges: Option<Box<dyn FnMut() -> ForgeGauges>>,
+    /// Reads what a pull request's head changes, for the capture file.
+    pub capture: Box<Reader<'static>>,
+}
+
+/// What the GitHub forge knows that no observation carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForgeGauges {
+    /// Labelled but not enqueued at the latest observation.
+    pub blocked_prs: u64,
+    /// The last `x-ratelimit-remaining` GitHub reported; `None` when unknown.
+    pub rate_limit_remaining: Option<u64>,
 }
 
 /// How a tick ended, for [`BuiltForge::wait`].
@@ -173,6 +191,9 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
                 forge: Box::new(forge),
                 has_scheduled_events: Box::new(move || mock.borrow().awaiting_arrivals()),
                 wait: Box::new(|_| {}),
+                status: None,
+                gauges: None,
+                capture: Box::new(mock_head_files),
             })
         }
         ForgeConfig::GitHub {
@@ -185,8 +206,7 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
         } => {
             let secret = webhook.as_ref().map(webhook_secret).transpose()?;
             let auth = github_auth(auth)?;
-            let user_agent = format!("dorfq/{}", crate::version());
-            let client = RestClient::new(api_base, owner, repo, auth, &user_agent);
+            let client = RestClient::new(api_base, owner, repo, auth, &crate::user_agent());
             let settings = config
                 .github_settings()
                 .expect("a GitHub forge configuration has GitHub settings");
@@ -197,25 +217,73 @@ pub fn forge(config: &ForgeConfig) -> Result<BuiltForge, ProviderError> {
                 }
                 None => None,
             };
-            let forge = GitHubForge::new(
-                Box::new(client),
-                settings,
-                Box::new(system_clock),
-                Box::new(io::stdout()),
-                hints,
-            )
-            .map_err(ProviderError::GitHub)?;
-            let forge = Rc::new(RefCell::new(forge));
-            let waiting = Rc::clone(&forge);
-            Ok(BuiltForge {
-                forge: Box::new(Shared(forge)),
-                has_scheduled_events: Box::new(|| false),
-                wait: Box::new(move |outcome| {
-                    waiting.borrow_mut().wait(outcome == Outcome::Transient)
-                }),
-            })
+            github(Box::new(client), settings, hints)
         }
     }
+}
+
+/// Builds the GitHub forge over `api` and the handles on it.
+fn github(
+    api: Box<dyn GitHubApi>,
+    settings: Settings,
+    hints: Option<Receiver<Hint>>,
+) -> Result<BuiltForge, ProviderError> {
+    let status_issue = settings.status_issue;
+    let forge = GitHubForge::new(
+        api,
+        settings,
+        Box::new(system_clock),
+        Box::new(io::stdout()),
+        hints,
+    )
+    .map_err(ProviderError::GitHub)?;
+    let forge = Rc::new(RefCell::new(forge));
+    let waiting = Rc::clone(&forge);
+    let reading = Rc::clone(&forge);
+    let gauges = Box::new(move || {
+        let forge = reading.borrow();
+        ForgeGauges {
+            blocked_prs: forge.blocked_prs() as u64,
+            rate_limit_remaining: forge.rate_limit_remaining(),
+        }
+    }) as Box<dyn FnMut() -> ForgeGauges>;
+    let status = status_issue.map(|_| {
+        let publishing = Rc::clone(&forge);
+        Box::new(move |body| publishing.borrow_mut().publish_status(body)) as Box<dyn FnMut(String)>
+    });
+    let capturing = Rc::clone(&forge);
+    let capture = Box::new(move |pr, head: &Sha| {
+        capturing
+            .borrow_mut()
+            .head_files(pr, head)
+            .map_err(ForgeError::from)
+    }) as Box<Reader<'static>>;
+    Ok(BuiltForge {
+        forge: Box::new(Shared(forge)),
+        has_scheduled_events: Box::new(|| false),
+        wait: Box::new(move |outcome| waiting.borrow_mut().wait(outcome == Outcome::Transient)),
+        status,
+        gauges: Some(gauges),
+        capture,
+    })
+}
+
+/// The mock forge's answer for any pull request at any head: one file,
+/// `pr/<n>`, one line added, under an all-zero base.
+fn mock_head_files(pr: PrNumber, _: &Sha) -> Result<Result<HeadFiles, Sha>, ForgeError> {
+    Ok(Ok(HeadFiles {
+        base: Sha::parse(&"0".repeat(40)).expect("forty zeros are a sha"),
+        additions: 1,
+        deletions: 0,
+        changed_files: 1,
+        files: vec![ChangedFile {
+            path: format!("pr/{}", pr.0),
+            additions: 1,
+            deletions: 0,
+            status: "modified".to_owned(),
+            previous: None,
+        }],
+    }))
 }
 
 /// The webhook secret from the environment variable `webhook` names.
@@ -227,7 +295,7 @@ fn webhook_secret(webhook: &WebhookConfig) -> Result<String, ProviderError> {
 
 /// The value of environment variable `var`; `None` when it is unset, empty
 /// or not UTF-8.
-fn env_secret(var: &str) -> Option<String> {
+pub(crate) fn env_secret(var: &str) -> Option<String> {
     env::var(var).ok().filter(|value| !value.is_empty())
 }
 
@@ -285,6 +353,14 @@ pub fn scheduler(config: &SchedulerConfig) -> Box<dyn Scheduler> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::time::SystemTime;
+
+    use dorfq_forge_github::api::{
+        CheckResult, Commit, Compare, IssueDetail, Merge, MergeState, OpenPr, PrDetail, RefEntry,
+        RefUpdate, RulesetId, RunId, WorkflowRun,
+    };
+
     use super::*;
     use crate::config::RefreshConfig;
 
@@ -323,6 +399,7 @@ mod tests {
                 batch_secs: 30,
             },
             webhook: None,
+            status_issue: None,
             auth: AuthConfig::Token {
                 env: var.to_owned(),
             },
@@ -401,6 +478,7 @@ mod tests {
                 batch_secs: 30,
             },
             webhook: None,
+            status_issue: None,
             auth: AuthConfig::App {
                 client_id: "Iv23liTEST".to_owned(),
                 private_key_file,
@@ -464,11 +542,229 @@ mod tests {
         )
         .unwrap();
         let mut built = forge(&ForgeConfig::Mock { scenario }).unwrap();
+        assert!(built.status.is_none());
+        assert!(built.gauges.is_none());
+        let head = Sha::parse(&"b".repeat(40)).unwrap();
+        let listing = (built.capture)(PrNumber(7), &head).unwrap().unwrap();
+        assert_eq!(
+            listing,
+            HeadFiles {
+                base: Sha::parse(&"0".repeat(40)).unwrap(),
+                additions: 1,
+                deletions: 0,
+                changed_files: 1,
+                files: vec![ChangedFile {
+                    path: "pr/7".to_owned(),
+                    additions: 1,
+                    deletions: 0,
+                    status: "modified".to_owned(),
+                    previous: None,
+                }],
+            }
+        );
         assert!((built.has_scheduled_events)());
         built.forge.observe().unwrap();
         assert!((built.has_scheduled_events)());
         built.forge.observe().unwrap();
         assert!(!(built.has_scheduled_events)());
+    }
+
+    /// A repository whose trunk and label exist and that answers nothing
+    /// else but, when it holds one, one pull request's detail and files:
+    /// enough for the forge to start and for a capture read.
+    struct StartableRepo {
+        remaining: Option<u64>,
+        pr: Option<(PrDetail, Vec<ChangedFile>)>,
+    }
+
+    const NOT_AT_STARTUP: &str = "the forge asks only for the trunk and the label at startup";
+
+    impl GitHubApi for StartableRepo {
+        fn get_ref(&mut self, _: &str) -> Result<Option<Sha>, ApiError> {
+            Ok(Some(Sha::parse(&"a".repeat(40)).unwrap()))
+        }
+        fn list_refs(&mut self, _: &str) -> Result<Vec<RefEntry>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn create_ref(&mut self, _: &str, _: &Sha) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn update_ref(&mut self, _: &str, _: &Sha, _: bool) -> Result<RefUpdate, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn delete_ref(&mut self, _: &str) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn get_commit(&mut self, _: &Sha) -> Result<Commit, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn create_commit(&mut self, _: &str, _: &Sha, _: &[Sha]) -> Result<Sha, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn merge(&mut self, _: &str, _: &Sha, _: &str) -> Result<Merge, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn is_ancestor(&mut self, _: &Sha, _: &Sha) -> Result<bool, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn compare(&mut self, _: &Sha, _: &Sha) -> Result<Compare, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn list_labelled(&mut self, _: &str) -> Result<Vec<PrNumber>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn open_pr_with_head(&mut self, _: &str) -> Result<Option<OpenPr>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn get_pr(&mut self, _: PrNumber) -> Result<PrDetail, ApiError> {
+            Ok(self.pr.clone().expect(NOT_AT_STARTUP).0)
+        }
+        fn pr_files(&mut self, _: PrNumber) -> Result<Vec<ChangedFile>, ApiError> {
+            Ok(self.pr.clone().expect(NOT_AT_STARTUP).1)
+        }
+        fn set_base(&mut self, _: PrNumber, _: &str) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn merged_pr_heads(&mut self, _: &str, _: &str) -> Result<Vec<Sha>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn checks(&mut self, _: &Sha) -> Result<Vec<CheckResult>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn remove_label(&mut self, _: PrNumber, _: &str) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn list_comments(&mut self, _: PrNumber) -> Result<Vec<String>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn create_comment(&mut self, _: PrNumber, _: &str) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn get_issue(&mut self, _: u64) -> Result<Option<IssueDetail>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn set_issue_body(&mut self, _: u64, _: &str) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn label_exists(&mut self, _: &str) -> Result<bool, ApiError> {
+            Ok(true)
+        }
+        fn find_ruleset(
+            &mut self,
+            _: &str,
+        ) -> Result<Option<(RulesetId, BTreeSet<String>)>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn create_ruleset(&mut self, _: &str, _: &BTreeSet<String>) -> Result<RulesetId, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn update_ruleset(&mut self, _: RulesetId, _: &BTreeSet<String>) -> Result<bool, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn delete_ruleset(&mut self, _: RulesetId) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn list_runs(&mut self, _: &Sha) -> Result<Vec<WorkflowRun>, ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn cancel_run(&mut self, _: RunId) -> Result<(), ApiError> {
+            unreachable!("{NOT_AT_STARTUP}")
+        }
+        fn rate_limit_pause(&mut self) -> Option<SystemTime> {
+            None
+        }
+        fn rate_limit_remaining(&self) -> Option<u64> {
+            self.remaining
+        }
+    }
+
+    #[test]
+    fn github_gauges_read_the_forge() {
+        let settings = github_app(PathBuf::from("unused.pem"))
+            .github_settings()
+            .unwrap();
+        let api = StartableRepo {
+            remaining: Some(4321),
+            pr: None,
+        };
+        let built = github(Box::new(api), settings, None).unwrap();
+        assert!(built.status.is_none());
+        let mut gauges = built.gauges.expect("the GitHub forge has gauges");
+        assert_eq!(
+            gauges(),
+            ForgeGauges {
+                blocked_prs: 0,
+                rate_limit_remaining: Some(4321),
+            }
+        );
+    }
+
+    #[test]
+    fn github_capture_reads_the_forge() {
+        let settings = github_app(PathBuf::from("unused.pem"))
+            .github_settings()
+            .unwrap();
+        let head = Sha::parse(&"c".repeat(40)).unwrap();
+        let base = Sha::parse(&"d".repeat(40)).unwrap();
+        let files = vec![ChangedFile {
+            path: "docs/new.md".to_owned(),
+            additions: 4,
+            deletions: 2,
+            status: "renamed".to_owned(),
+            previous: Some("docs/old.md".to_owned()),
+        }];
+        let detail = PrDetail {
+            open: true,
+            base: "main".to_owned(),
+            head: head.clone(),
+            head_branch: Some("topic".to_owned()),
+            title: "Rename a document".to_owned(),
+            labels: Vec::new(),
+            merge_state: MergeState::Clean,
+            draft: false,
+            merged: false,
+            base_sha: base.clone(),
+            additions: Some(4),
+            deletions: Some(2),
+            changed_files: None,
+        };
+        let api = StartableRepo {
+            remaining: None,
+            pr: Some((
+                PrDetail {
+                    changed_files: Some(1),
+                    ..detail.clone()
+                },
+                files.clone(),
+            )),
+        };
+        let mut built = github(Box::new(api), settings.clone(), None).unwrap();
+        assert_eq!(
+            (built.capture)(PrNumber(9), &head).unwrap(),
+            Ok(HeadFiles {
+                base,
+                additions: 4,
+                deletions: 2,
+                changed_files: 1,
+                files: files.clone(),
+            })
+        );
+        let moved = Sha::parse(&"e".repeat(40)).unwrap();
+        assert_eq!(
+            (built.capture)(PrNumber(9), &moved).unwrap(),
+            Err(head.clone())
+        );
+
+        let api = StartableRepo {
+            remaining: None,
+            pr: Some((detail, files)),
+        };
+        let mut built = github(Box::new(api), settings, None).unwrap();
+        let error = (built.capture)(PrNumber(9), &head).map(|_| ()).unwrap_err();
+        let ForgeError::Permanent(error) = error else {
+            panic!("a response without a count is permanent: {error:?}");
+        };
+        assert_eq!(error.to_string(), "GET /pulls/9: no changed_files field");
     }
 
     #[test]

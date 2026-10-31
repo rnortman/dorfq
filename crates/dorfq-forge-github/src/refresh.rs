@@ -196,14 +196,16 @@ impl Schedule {
         self.paused_until
     }
 
+    /// `at`, or the pause's end if that is later.
+    pub fn after_pause(&self, at: Timestamp) -> Timestamp {
+        self.paused_until.map_or(at, |until| at.max(until))
+    }
+
     /// The earliest deadline, or the pause's end if that is later; `None`
     /// when nothing is tracked.
     pub fn next_deadline(&self) -> Option<Timestamp> {
         let earliest = self.deadlines.values().min().copied()?;
-        Some(
-            self.paused_until
-                .map_or(earliest, |until| earliest.max(until)),
-        )
+        Some(self.after_pause(earliest))
     }
 }
 

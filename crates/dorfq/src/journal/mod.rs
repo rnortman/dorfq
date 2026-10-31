@@ -10,7 +10,8 @@
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use dorfq_core::{Observation, Timestamp};
@@ -19,9 +20,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::driver::{DriverError, TickReport};
+use capture::{Capture, Reader};
+use events::{Event, Fold};
 
+pub mod capture;
 pub mod events;
 pub mod report;
+pub mod status;
 pub mod summary;
 
 /// The format number this build writes.
@@ -250,10 +255,16 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> JournalError + '_ {
     }
 }
 
-// TODO(journal-capture-at-first-sight): each pull request head's changed
-// paths, with additions and deletions, recorded once beside the journal.
+/// A consumer of the current segment's replay at start, and of each live
+/// tick: the tick's observation when its line carried one (`None` for a
+/// `same` line, an error without a report, and a header), and the events
+/// the fold produced for it.
+pub type Sink<'a> = &'a mut dyn FnMut(Option<&Observation>, &[Event]);
+
 /// Appends a running process's ticks to the journal at one path, rotating
-/// closed segments aside.
+/// closed segments aside, and folds them into the event stream, appended to
+/// the events file when there is one and sighting heads for the capture
+/// file when there is one.
 pub struct Writer {
     path: PathBuf,
     file: File,
@@ -270,6 +281,149 @@ pub struct Writer {
     last: Option<Observation>,
     /// Whether a non-idle `report` was written since the last header.
     busy: bool,
+    /// The event stream of every line read at open and written since.
+    fold: Fold,
+    /// The events file, rotated with the journal.
+    events: Option<EventsFile>,
+    /// The capture file, rotated with the journal.
+    capture: Option<Capture>,
+}
+
+/// The file the events of each tick are appended to.
+struct EventsFile {
+    path: PathBuf,
+    file: File,
+}
+
+impl EventsFile {
+    /// Opens the events file at `path` as [`open_beside`] does.
+    fn open(
+        path: &Path,
+        others: &[(&str, &Path, &File)],
+        notes: &mut Vec<String>,
+    ) -> Result<EventsFile, JournalError> {
+        Ok(EventsFile {
+            path: path.to_owned(),
+            file: open_beside(path, "events", others, notes)?,
+        })
+    }
+
+    /// Appends one line per event, as `dorfq journal events` prints it.
+    fn append(&mut self, events: &[Event]) -> Result<(), JournalError> {
+        let text: String = events.iter().map(events::line).collect();
+        append(&mut self.file, &self.path, text.as_bytes())
+    }
+}
+
+/// Opens the file at `path` that sits beside the journal as `what`,
+/// creating it. A path naming one of the open files in `others`, each with
+/// what it is and its path, is refused before the file is read or cut; then
+/// an unterminated last line is cut off with a note.
+fn open_beside(
+    path: &Path,
+    what: &str,
+    others: &[(&str, &Path, &File)],
+    notes: &mut Vec<String>,
+) -> Result<File, JournalError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(io_error(path))?;
+    for (other_what, other, other_file) in others {
+        if same_file(other_file, other, &file, path)? {
+            return Err(JournalError::Io {
+                path: path.to_owned(),
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{what} names {other_what}, {}", other.display()),
+                ),
+            });
+        }
+    }
+    let found = survey(&mut file).map_err(io_error(path))?;
+    cut_unterminated(&file, path, &found, what, notes)?;
+    Ok(file)
+}
+
+/// Cuts `file` at `path` back to its last complete line when `found` has an
+/// unterminated one, with a note naming the file as `what`.
+fn cut_unterminated(
+    file: &File,
+    path: &Path,
+    found: &Found,
+    what: &str,
+    notes: &mut Vec<String>,
+) -> Result<(), JournalError> {
+    if found.len > found.complete {
+        file.set_len(found.complete).map_err(io_error(path))?;
+        notes.push(format!(
+            "{what} {}: cut off unterminated line {}",
+            path.display(),
+            found.lines + 1
+        ));
+    }
+    Ok(())
+}
+
+/// Appends `text` to `file` at `path` and flushes it.
+fn append(file: &mut File, path: &Path, text: &[u8]) -> Result<(), JournalError> {
+    file.write_all(text).map_err(io_error(path))?;
+    file.flush().map_err(io_error(path))
+}
+
+/// Renames each file in `paths` to `<path>.<opened>`, or each to that with
+/// the first `.1`, `.2`, … suffix free for all of them, so the closed
+/// files' names pair; returns the names in `paths`' order.
+fn close(paths: &[&Path], opened: u64) -> Result<Vec<PathBuf>, JournalError> {
+    let mut suffix = format!(".{opened}");
+    let mut n = 0;
+    // Creating a name claims it, so no other writer's segment is replaced by
+    // the rename onto it. A claim that cannot be had for every file is
+    // released and the next suffix tried.
+    let names = 'claim: loop {
+        let mut names: Vec<PathBuf> = Vec::new();
+        for path in paths {
+            let name = PathBuf::from(format!("{}{suffix}", path.display()));
+            match OpenOptions::new().write(true).create_new(true).open(&name) {
+                Ok(_) => names.push(name),
+                Err(error) => {
+                    for claimed in &names {
+                        fs::remove_file(claimed).map_err(io_error(claimed))?;
+                    }
+                    if error.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(io_error(&name)(error));
+                    }
+                    n += 1;
+                    suffix = format!(".{opened}.{n}");
+                    continue 'claim;
+                }
+            }
+        }
+        break names;
+    };
+    for (path, name) in paths.iter().zip(&names) {
+        fs::rename(path, name).map_err(io_error(path))?;
+    }
+    Ok(names)
+}
+
+/// Whether the open files `a` at `a_path` and `b` at `b_path` are one file,
+/// under two names or one.
+fn same_file(a: &File, a_path: &Path, b: &File, b_path: &Path) -> Result<bool, JournalError> {
+    let a = a.metadata().map_err(io_error(a_path))?;
+    let b = b.metadata().map_err(io_error(b_path))?;
+    Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
+}
+
+/// Opens a fresh, empty file at `path`.
+fn create_fresh(path: &Path) -> Result<File, JournalError> {
+    OpenOptions::new()
+        .append(true)
+        .create_new(true)
+        .open(path)
+        .map_err(io_error(path))
 }
 
 /// The state of a file found at the journal's path.
@@ -329,14 +483,28 @@ fn header_stamp(line: &[u8]) -> Option<(u64, u64)> {
 
 impl Writer {
     /// Opens the journal at `path` for a process starting with `header`
-    /// (`cause` `start`): creates the file or appends to it, then writes the
-    /// header. Returns the writer and what the operator should be told.
+    /// (`cause` `start`): creates the file or appends to it, opens the
+    /// events file at `events` and the capture file at `capture` when
+    /// given, replays the current segment into the fold, the capture's
+    /// sightings and `seed` entry by entry, then writes the header. Returns
+    /// the writer and what the operator should be told.
     ///
     /// An unterminated last line, which a crash mid-write leaves, is cut
-    /// off. A segment of a format this build does not write is closed as a
-    /// rotation closes one and a fresh segment opened. A file whose first
-    /// line is not a journal header is refused and left as it is.
-    pub fn open(path: &Path, header: Header) -> Result<(Writer, Vec<String>), JournalError> {
+    /// off, in the journal, the events file and the capture file. A segment
+    /// of a format this build does not write is closed, with the events and
+    /// capture files, as a rotation closes them, and all opened fresh. A
+    /// file whose first line is not a journal header is refused and left as
+    /// it is, an events or capture path naming the journal's own file or
+    /// the events file is refused, a capture line without its key is
+    /// refused naming the line, and a segment with a line that does not
+    /// read is refused naming the line.
+    pub fn open(
+        path: &Path,
+        header: Header,
+        events: Option<&Path>,
+        capture: Option<&Path>,
+        seed: Sink<'_>,
+    ) -> Result<(Writer, Vec<String>), JournalError> {
         let mut notes = Vec::new();
         let mut file = OpenOptions::new()
             .read(true)
@@ -356,23 +524,17 @@ impl Writer {
         } else {
             None
         };
-        if found.len > found.complete {
-            // With no complete line, only a fragment of a header is ours.
-            if found.lines == 0
-                && !found
-                    .first
-                    .as_deref()
-                    .is_some_and(|f| f.starts_with(b"{\"journal\":"))
-            {
-                return Err(not_a_journal());
-            }
-            file.set_len(found.complete).map_err(io_error(path))?;
-            notes.push(format!(
-                "journal {}: cut off unterminated line {}",
-                path.display(),
-                found.lines + 1
-            ));
+        // With no complete line, only a fragment of a header is ours.
+        if found.len > found.complete
+            && found.lines == 0
+            && !found
+                .first
+                .as_deref()
+                .is_some_and(|f| f.starts_with(b"{\"journal\":"))
+        {
+            return Err(not_a_journal());
         }
+        cut_unterminated(&file, path, &found, "journal", &mut notes)?;
         let mut writer = Writer {
             path: path.to_owned(),
             file,
@@ -382,13 +544,31 @@ impl Writer {
             header,
             last: None,
             busy: false,
+            fold: Fold::default(),
+            events: None,
+            capture: None,
         };
+        writer.events = events
+            .map(|events| {
+                EventsFile::open(
+                    events,
+                    &[("the journal's own file", path, &writer.file)],
+                    &mut notes,
+                )
+            })
+            .transpose()?;
+        if let Some(capture) = capture {
+            let mut others = vec![("the journal's own file", path, &writer.file)];
+            if let Some(events) = &writer.events {
+                others.push(("the events file", events.path.as_path(), &events.file));
+            }
+            writer.capture = Some(Capture::open(capture, &others, &mut notes)?);
+        }
         match stamp {
             Some((FORMAT, opened)) => writer.first_opened = opened,
             Some((format, opened)) => {
                 writer.first_opened = opened;
-                let name = writer.close()?;
-                writer.reopen()?;
+                let name = writer.rotate_files()?;
                 notes.push(format!(
                     "journal at {} is format {format}, this build writes {FORMAT}: closed it as {}",
                     path.display(),
@@ -397,49 +577,132 @@ impl Writer {
             }
             None => {}
         }
+        for entry in self::entries(path)? {
+            let entry = entry?;
+            writer.fold.entry(&entry);
+            let observation = match &entry {
+                Entry::Tick(Line {
+                    kind: LineKind::Report { report, .. },
+                    ..
+                }) => Some(&report.observation),
+                Entry::Tick(_) | Entry::Header(_) => None,
+            };
+            let events = writer.fold.take();
+            if let Some(capture) = &mut writer.capture {
+                capture.sight(&events);
+            }
+            seed(observation, &events);
+        }
         writer.write_header(Cause::Start, writer.header.opened)?;
         Ok((writer, notes))
     }
 
-    /// Writes tick `tick`'s line, ending at host time `at`, then rotates
-    /// when the tick is idle after a busy stretch or the segment is full.
+    /// Writes tick `tick`'s line, ending at host time `at`, folds it and
+    /// appends its events to the events file and sights their heads for the
+    /// capture file, then rotates when the tick is idle after a busy stretch
+    /// or the segment is full. Returns the tick's events.
     pub fn record(
         &mut self,
         tick: u64,
         at: u64,
         outcome: &Result<TickReport, DriverError>,
-    ) -> Result<(), JournalError> {
+    ) -> Result<Vec<Event>, JournalError> {
         let failure = outcome.as_ref().err().map(|error| Failure {
             message: error.to_string(),
             fatal: error.is_fatal(),
         });
-        let report = match outcome {
-            Ok(report) => Some(report),
-            Err(DriverError::Effect { report, .. }) => Some(&**report),
-            Err(_) => None,
-        };
+        let report = outcome.as_ref().map_or_else(DriverError::report, Some);
         let idle_after_busy = report.is_some_and(|r| r.idle) && self.busy;
-        let line = match (report, &failure) {
+        match (report, &failure) {
             (Some(report), None) if self.last.as_ref().is_some_and(|last| report.repeats(last)) => {
-                Wire::borrowing(tick, at, None, Some(report.observation.now), None)
+                let now = report.observation.now;
+                self.write(&Wire::borrowing(tick, at, None, Some(now), None))?;
+                self.fold.same(now, at, tick);
             }
             (Some(report), failure) => {
                 self.last = Some(report.observation.clone());
                 self.busy |= !report.idle;
-                Wire::borrowing(tick, at, Some(report), None, failure.as_ref())
+                self.write(&Wire::borrowing(
+                    tick,
+                    at,
+                    Some(report),
+                    None,
+                    failure.as_ref(),
+                ))?;
+                self.fold
+                    .observe(&report.observation, &report.plan, at, tick);
+                if let Some(failure) = failure {
+                    self.fold.error(failure, at);
+                }
             }
-            (None, Some(failure)) => Wire::borrowing(tick, at, None, None, Some(failure)),
+            (None, Some(failure)) => {
+                self.write(&Wire::borrowing(tick, at, None, None, Some(failure)))?;
+                self.fold.error(failure, at);
+            }
             (None, None) => unreachable!("an outcome is a report or an error"),
-        };
-        self.write(&line)?;
+        }
+        let events = self.fold.take();
+        if let Some(file) = &mut self.events {
+            file.append(&events)?;
+        }
+        if let Some(capture) = &mut self.capture {
+            capture.sight(&events);
+        }
         // The idle tick ends the closed segment, so the departures it
         // reports stay with the lifetimes they end.
         if idle_after_busy || self.bytes > self.limit {
-            self.close()?;
-            self.reopen()?;
+            self.rotate_files()?;
             self.write_header(Cause::Rotate, at)?;
         }
-        Ok(())
+        Ok(events)
+    }
+
+    /// Reads up to a bounded number of heads sighted and not yet recorded
+    /// through `read`, and records them in the capture file at host time
+    /// `at`; returns what the operator should be told. Does nothing without
+    /// a capture file.
+    pub fn capture(&mut self, at: u64, read: &mut Reader<'_>) -> Result<Vec<String>, JournalError> {
+        match &mut self.capture {
+            Some(capture) => capture.fetch(at, read),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Reads, as [`Writer::capture`] does, every head still owed a record,
+    /// until none is left or a transient failure stops it; for a process
+    /// about to exit. Each head left unread gets a line of its own among
+    /// those returned. Does nothing without a capture file.
+    pub fn drain_capture(
+        &mut self,
+        at: u64,
+        read: &mut Reader<'_>,
+    ) -> Result<Vec<String>, JournalError> {
+        match &mut self.capture {
+            Some(capture) => capture.drain(at, read),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Closes the journal segment, the events file and the capture file
+    /// together under the segment's name, then opens each fresh and empty.
+    /// Returns the closed segment's name.
+    fn rotate_files(&mut self) -> Result<PathBuf, JournalError> {
+        let mut paths = vec![self.path.as_path()];
+        if let Some(file) = &self.events {
+            paths.push(&file.path);
+        }
+        if let Some(capture) = &self.capture {
+            paths.push(capture.path());
+        }
+        let name = close(&paths, self.first_opened)?.remove(0);
+        self.reopen()?;
+        if let Some(file) = &mut self.events {
+            file.file = create_fresh(&file.path)?;
+        }
+        if let Some(capture) = &mut self.capture {
+            capture.fresh()?;
+        }
+        Ok(name)
     }
 
     fn write_header(&mut self, cause: Cause, opened: u64) -> Result<(), JournalError> {
@@ -451,7 +714,9 @@ impl Writer {
         self.last = None;
         self.busy = false;
         let header = self.header.clone();
-        self.write(&header)
+        self.write(&header)?;
+        self.fold.header(&header);
+        Ok(())
     }
 
     fn write(&mut self, line: &impl Serialize) -> Result<(), JournalError> {
@@ -460,41 +725,14 @@ impl Writer {
             error: e.into(),
         })?;
         text.push(b'\n');
-        self.file.write_all(&text).map_err(io_error(&self.path))?;
-        self.file.flush().map_err(io_error(&self.path))?;
+        append(&mut self.file, &self.path, &text)?;
         self.bytes += text.len() as u64;
         Ok(())
     }
 
-    /// Renames the current segment to `<path>.<first opened>`, or that with
-    /// the first free `.1`, `.2`, … suffix; returns the name.
-    fn close(&mut self) -> Result<PathBuf, JournalError> {
-        let base = format!("{}.{}", self.path.display(), self.first_opened);
-        let mut name = PathBuf::from(&base);
-        let mut n = 0;
-        // Creating the name claims it, so no other writer's segment is
-        // replaced by the rename onto it.
-        loop {
-            match OpenOptions::new().write(true).create_new(true).open(&name) {
-                Ok(_) => break,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    n += 1;
-                    name = PathBuf::from(format!("{base}.{n}"));
-                }
-                Err(error) => return Err(io_error(&name)(error)),
-            }
-        }
-        fs::rename(&self.path, &name).map_err(io_error(&self.path))?;
-        Ok(name)
-    }
-
     /// Opens a fresh, empty segment at the path.
     fn reopen(&mut self) -> Result<(), JournalError> {
-        self.file = OpenOptions::new()
-            .append(true)
-            .create_new(true)
-            .open(&self.path)
-            .map_err(io_error(&self.path))?;
+        self.file = create_fresh(&self.path)?;
         self.bytes = 0;
         Ok(())
     }
@@ -518,8 +756,6 @@ pub struct Read {
 /// entries. Each header's format selects how the lines after it are read.
 /// A file's unterminated last line, the live segment's tick in progress, is
 /// skipped with a note.
-// TODO(efficiency-journal-readers-materialise-every-segment): yield entries
-// per line instead of collecting every segment.
 pub fn read(paths: &[PathBuf]) -> Result<Read, JournalError> {
     let mut read = Read {
         entries: Vec::new(),
@@ -538,63 +774,121 @@ struct Peek {
 }
 
 fn read_segment(path: &Path, read: &mut Read) -> Result<(), JournalError> {
-    let text = fs::read(path).map_err(io_error(path))?;
-    let error = |line: usize, message: String| JournalError::Line {
+    let mut entries = entries(path)?;
+    // TODO(efficiency-journal-readers-materialise-every-segment): consume
+    // the entries as they are read instead of collecting every segment.
+    for entry in &mut entries {
+        read.entries.push(entry?);
+    }
+    read.notes.append(&mut entries.notes);
+    Ok(())
+}
+
+/// The entries of the segment at `path`, read one line at a time. Each
+/// header's format selects how the lines after it are read. An unterminated
+/// last line ends the entries with a note; a line that does not read is an
+/// error, after which there are no more.
+pub fn entries(path: &Path) -> Result<Entries, JournalError> {
+    let file = File::open(path).map_err(io_error(path))?;
+    Ok(Entries {
         path: path.to_owned(),
-        line,
-        message,
-    };
-    let mut format: Option<u64> = None;
-    let mut rest = &text[..];
-    let mut number = 0;
-    while !rest.is_empty() {
-        number += 1;
-        let Some(end) = rest.iter().position(|&b| b == b'\n') else {
-            read.notes.push(format!(
-                "{}:{number}: skipped an unterminated last line",
-                path.display()
+        reader: BufReader::new(file),
+        format: None,
+        number: 0,
+        ended: false,
+        notes: Vec::new(),
+    })
+}
+
+/// The entries of one segment, in order; see [`entries`].
+pub struct Entries {
+    path: PathBuf,
+    reader: BufReader<File>,
+    /// The format of the last header read.
+    format: Option<u64>,
+    /// The number of the last line read.
+    number: usize,
+    ended: bool,
+    /// What the reader should be told: the unterminated last line skipped.
+    pub notes: Vec<String>,
+}
+
+impl Entries {
+    fn error(&self, message: String) -> JournalError {
+        JournalError::Line {
+            path: self.path.clone(),
+            line: self.number,
+            message,
+        }
+    }
+
+    /// The next line's entry, `None` at the end.
+    fn read(&mut self) -> Result<Option<Entry>, JournalError> {
+        let mut line = Vec::new();
+        self.reader
+            .read_until(b'\n', &mut line)
+            .map_err(io_error(&self.path))?;
+        if line.is_empty() {
+            return Ok(None);
+        }
+        self.number += 1;
+        if line.pop() != Some(b'\n') {
+            self.notes.push(format!(
+                "{}:{}: skipped an unterminated last line",
+                self.path.display(),
+                self.number
             ));
-            break;
-        };
-        let line = &rest[..end];
-        rest = &rest[end + 1..];
-        let peek: Peek = serde_json::from_slice(line).map_err(|e| {
+            return Ok(None);
+        }
+        let peek: Peek = serde_json::from_slice(&line).map_err(|e| {
             let what = if e.is_data() {
                 "not a journal line"
             } else {
                 "not JSON"
             };
-            error(number, format!("{what}: {e}"))
+            self.error(format!("{what}: {e}"))
         })?;
         if let Some(journal) = peek.journal {
             let journal = journal
                 .as_u64()
                 .filter(|j| READS.contains(j))
                 .ok_or_else(|| {
-                    error(
-                        number,
-                        format!("journal format {journal} is not one this build reads ({READS:?})"),
-                    )
+                    self.error(format!(
+                        "journal format {journal} is not one this build reads ({READS:?})"
+                    ))
                 })?;
             let header = match journal {
-                1 => serde_json::from_slice::<Header>(line),
+                1 => serde_json::from_slice::<Header>(&line),
                 _ => unreachable!("READS lists the formats matched here"),
             }
-            .map_err(|e| error(number, format!("not a format-{journal} header: {e}")))?;
-            format = Some(journal);
-            read.entries.push(Entry::Header(header));
+            .map_err(|e| self.error(format!("not a format-{journal} header: {e}")))?;
+            self.format = Some(journal);
+            Ok(Some(Entry::Header(header)))
         } else {
-            let format =
-                format.ok_or_else(|| error(number, "the first line is not a header".to_owned()))?;
+            let format = self
+                .format
+                .ok_or_else(|| self.error("the first line is not a header".to_owned()))?;
             let line = match format {
-                1 => serde_json::from_slice::<Line>(line),
+                1 => serde_json::from_slice::<Line>(&line),
                 _ => unreachable!("READS lists the formats matched here"),
             }
-            .map_err(|e| error(number, format!("not a format-{format} tick line: {e}")))?;
-            read.entries.push(Entry::Tick(line));
+            .map_err(|e| self.error(format!("not a format-{format} tick line: {e}")))?;
+            Ok(Some(Entry::Tick(line)))
         }
     }
-    Ok(())
+}
+
+impl Iterator for Entries {
+    type Item = Result<Entry, JournalError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ended {
+            return None;
+        }
+        let next = self.read().transpose();
+        self.ended = !matches!(next, Some(Ok(_)));
+        next
+    }
 }
 
 #[cfg(test)]

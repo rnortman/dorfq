@@ -8,6 +8,7 @@ pub mod config;
 pub mod driver;
 pub mod journal;
 pub mod providers;
+pub mod telemetry;
 
 #[cfg(test)]
 mod e2e_tests;
@@ -15,6 +16,19 @@ mod e2e_tests;
 /// The version of this crate, as the build stamped it.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// The `User-Agent` this crate's HTTP clients send: `dorfq/<version>`.
+pub fn user_agent() -> String {
+    format!("dorfq/{}", version())
+}
+
+/// The host clock, Unix seconds.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the host clock is after 1970")
+        .as_secs()
 }
 
 #[cfg(test)]

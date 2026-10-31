@@ -30,7 +30,7 @@ Either credential needs these repository permissions:
 
 - Contents: read/write
 - Pull requests: read/write
-- Issues: read
+- Issues: read/write — only with `status_issue`; read otherwise
 - Checks: read
 - Metadata: read
 - Workflows: read/write
@@ -43,6 +43,12 @@ the queue makes both for every queued pull request that touches CI; without
 it the first such batch stops the queue. Checks is what GitHub's permission
 reference names for listing a commit's check runs, which the queue does each
 time it reads a pull request or a testing batch.
+
+With `status_issue` set the queue edits one issue's body with Issues: write
+(see *The status issue* below). It writes that body once at start, so a
+credential without the permission stops the queue at start with GitHub's
+answer: `cannot start the GitHub forge: permanent GitHub error: PATCH
+/issues/<n>: HTTP 403: …`.
 
 With `lock_heads = true` the queue owns a repository ruleset,
 `dorfq/locked-heads`, that locks the head branch of every pull request in a
@@ -204,7 +210,8 @@ change explains. `eject_above` is the belief at which a failed run's
 culprit is ejected; `notify_above`, at most `eject_above`, the belief at
 which its author is told it is probably broken without an ejection, and at
 which each of two pull requests that fail only together is told so,
-naming the other.
+naming the other. A `[telemetry]` table pushes the queue's gauges and
+events to an OpenTelemetry collector; [Telemetry](#telemetry) describes it.
 
 Run it wherever outbound HTTPS is available:
 
@@ -324,7 +331,7 @@ captures both under the shipped units). In order, a delivery leaves:
   `due now` or `due in <n> s` when it was read less than five seconds ago,
   or that a commit matched nothing the queue holds;
 - when a rate-limit pause, a backoff after a failure, the retry of a
-  comment post that failed, or the five-second floor holds the next tick
+  comment post or status edit that failed, or the five-second floor holds the next tick
   past the hints, `next tick in <n> s` and why;
 - when a hinted pull request the queue did not hold is read and found not
   open or not labelled, `read; not open and labelled "<label>"; not queued`;
@@ -363,7 +370,9 @@ What each line, or its absence, means:
   retried: each failed attempt writes `kept the comment for message to pr
   <n>: …; retrying` on stderr with GitHub's error, and after a hint `next
   tick in <n> s: retrying a comment post` says when the next attempt is. A
-  post GitHub refused for good is `dropped the comment for …` on stderr.
+  post GitHub answered with a rate-limit pause is kept the same way, but the
+  tick's effects wait for the pause (see *While it runs*). A post GitHub
+  refused for good is `dropped the comment for …` on stderr.
 
 ### The reverse proxy
 
@@ -435,6 +444,19 @@ them.
   likely cause of a failed batch, or that it and another queued pull request
   probably fail only together. The pull request stays queued. Rebasing and letting
   its own checks run again is the fastest way to settle it either way.
+- While a rate-limit pause GitHub announced is in force, the queue writes
+  nothing: no merge, branch update, comment or status edit. A comment post,
+  or with a status issue a status edit, answered with a pause is kept
+  (`kept the …` on stderr). When that tick's plan has an effect that
+  writes, it fails at its first write: after the tick line, stderr carries
+  `dorfq: transient forge error: rate limited until unix time <t>; nothing
+  is written before then; retrying`, and the tick's journal line carries
+  that error. A notice is kept instead, with `kept the comment for …` on
+  stderr, and posted when the pause ends. A hint that arrives during the
+  pause writes `next tick in <n> s: rate-limit pause`. The kept comment and
+  body go out at the first tick after the pause, and that tick plans again.
+  A landing interrupted by a pause is finished at the next tick, so a
+  stacked pull request it had moved onto trunk stays there until then.
 - A queue that stops with "batch <id>'s tip is its base" is tracking a batch
   that an earlier build published at its own base, because every member was
   already in trunk. Stop the queue, delete `refs/dorfq/batches/<id>` and the
@@ -454,13 +476,18 @@ error when a tick failed, including the fatal one the process exits on.
 Each line is flushed before the queue waits, so a crash loses at most the
 tick in progress. Without the key nothing is written.
 
-Nothing reads the journal at start. A restart builds the scheduler fresh, as
-it does without a journal, and appends to the file: each process begins its
-lines with a header naming the dorfq version, the forge and the
-`[scheduler]` settings it ran with. A last line cut off by a crash is cut
-back at the next start, with a line on stderr saying so. A file at the path
-that dorfq did not write stops the run at start, before any API call, and is
-left as it was; point `journal` elsewhere.
+At start the queue reads the current segment once, line by line, so that
+the event stream it derives as it runs, and the status issue, continue from
+what the segment recorded. The scheduler is still built fresh, as it is without a journal:
+nothing it decided is recovered. A restart appends to the file: each
+process begins its lines with a header naming the dorfq version, the forge
+and the `[scheduler]` settings it ran with. A last line cut off by a crash is
+cut back at the next start, with a line on stderr saying so. A file at the
+path that dorfq did not write stops the run at start, before any API call,
+and is left as it was; point `journal` elsewhere. A segment with a line that
+does not read stops the run at start the same way, naming the path and the
+line, as `dorfq journal` refuses it; point `journal` elsewhere or repair the
+file.
 
 The current file is one *segment*. A segment is closed and a fresh one
 opened at the same path when the queue goes idle after work — the tick that
@@ -482,14 +509,163 @@ rule renames the files it rotates, and its names collide with dorfq's own
 `.1`, `.2` suffixes; do not point one at the journal.
 
 An upgrade that changes the journal's format closes a segment written in the
-old format as a rotation would, opens a fresh one, and says so on stderr;
-the run does not stop. The new build's `dorfq journal` still reads the old
-segment. A segment in a format newer than the build reading it is refused,
+old format as a rotation would, with the events and capture files, opens fresh ones, and
+says so on stderr; the run does not stop. The new build's `dorfq journal`
+still reads the old segment. A segment in a format newer than the build reading it is refused,
 naming the formats that build reads.
+
+### The events file
+
+Set `events = "<path>"` beside `journal`, resolved the same way, and the
+queue also writes the event stream as it runs: each tick's events, one JSON
+object per line, exactly the lines `dorfq journal events` prints. `events`
+without `journal` is refused at load, and an `events` path that is the
+journal's own file, under any name, stops the run at start. Each tick's events are appended and
+flushed after its journal line, before the queue waits; the file has no
+header. It rotates with the journal: when a journal segment is closed as
+`<path>.<opened>`, the events file is closed as `<events>.<opened>` with the
+same `<opened>`, and a fresh one is opened empty. When either name is
+taken, both get the first `.1`, `.2` suffix free for both, so the names
+always pair. A tailing reader sees appends, then a rename at rotation.
+
+The events segments, concatenated in order, are `dorfq journal events` over
+the journal segments read together. One events segment is not by itself the
+stream of the journal segment beside it: it continues the one before, as a
+journal segment does, so a pull request queued across a rotation has its
+`arrive` in an earlier events segment, while `dorfq journal events` over the
+later journal segment alone would say it arrived there. The file begins
+where `events` was first set; what the journal recorded before is only in
+the journal.
+
+A process continues the stream from the current segment alone. When it
+starts on a segment that has no observation yet — the queue stopped after a
+rotation and before its next tick — what came before the rotation is not
+read: after an idle rotation nothing is queued and the stream continues
+exactly, but after a 64 MiB rotation the pull requests still queued arrive
+again, the batches it adopts start again, and those gone meanwhile get no
+`lost`, as `dorfq journal events` over that segment alone says. The segment
+opened fresh after a format change starts the stream the same way. Across
+such a restart the events segments and `dorfq journal events` over the
+journal segments read together differ; the journal is the record.
+
+An event is written once it has a time. The error of a tick that failed
+after a start or a rotation and before the next observation, and the
+`restart` it follows, take the time
+of the next observation, so they appear when a process next observes — the
+one after a restart, if this one exits first. Until then the
+events file lacks them; `dorfq journal events` over the journal places them
+at the last observation's time. An events file whose last line was cut off
+by a crash is cut back at the next start, with a line on stderr. A failure to
+write or rename the events file stops the queue, as a journal failure does.
+The tick's journal line is written first, so the events of the tick that
+failed, or those after the last line written, are only in the journal: no
+later process writes them, and `dorfq journal events` is the authority.
+Retention is yours, as for the journal: the same job can treat `<events>.*`
+as it treats `<path>.*`.
 
 The journal holds pull request numbers, commit shas, check names, batch ids,
 the reasons the queue gave and its scheduler settings: no titles, no logins,
 nothing from the credential.
+
+### The capture file
+
+Set `capture = "<path>"` beside `journal`, resolved the same way, and the
+queue records what each pull request head changes, read from GitHub when
+the queue first sees the head: one JSON object per line, keyed by the pull
+request's number and the head's sha. A head is first seen at its `arrive`
+or `repush` event. `capture` without `journal` is refused at load, and a
+`capture` path that is the journal's or the events file's own file stops
+the run at start. The file has no header; each line carries its format
+number, `capture`, now `1`:
+
+```json
+{"capture":1,"pr":42,"head":"<40 hex>","t":1730000000,"at":1730000003,"base":"<40 hex>","additions":120,"deletions":7,"changed_files":3,"files":[{"path":"crates/x/src/lib.rs","additions":100,"deletions":7,"status":"modified"},{"path":"docs/new.md","additions":20,"deletions":0,"status":"renamed","previous":"docs/old.md"}]}
+{"capture":1,"pr":43,"head":"<40 hex>","t":1730000000,"at":1730000003,"error":"GET /pulls/43: HTTP 404: Not Found"}
+```
+
+`pr` and `head` are the key. `t` is the forge time of the event that first
+showed the head, so a record joins the `arrive` or `repush` at the same
+`t`; `at` is the host time of the tick that read it, the `at` of that
+tick's journal line, so every record a tick writes carries the same `at`.
+`base`, `additions`, `deletions` and `changed_files` are what
+`GET /pulls/{n}` reported at the read: the
+base branch's sha and the pull request's totals. `files` is
+`GET /pulls/{n}/files`, in the order GitHub lists it; `status` is GitHub's
+word (`added`, `removed`, `modified`, `renamed`, `copied`, `changed`,
+`unchanged`), and `previous`, present only on a renamed or copied file, is
+the path before. GitHub lists at most 3,000 files: a `changed_files` above
+the length of `files` means the listing was cut there. A record holds
+paths, counts, shas and times: no titles, no logins.
+
+Before listing the files the queue reads the pull request and checks that
+its head is still the head first seen; the listing names no sha, so it
+would otherwise be another head's. A head found moved gets no record and
+one line on stderr; the journal's `repush` of the new head records the
+move, and the new head gets its own record. The moved head is read again
+only when its segment shows it arriving again: a `repush` back to it, or a
+restart's replay of its `arrive` or `repush`. A push between the check and
+the listing, milliseconds apart, puts the new head's files under the old
+key; the new head's own record, with the same files under another key, is
+the tell.
+
+A read GitHub refuses for good — a pull request it no longer serves, or a
+response without one of the three totals — is recorded with `error` in
+place of `base` … `files`, the failure's text, and a line on stderr, and is
+not asked again in that file. A read that fails transiently, a rate limit
+included, leaves the head owed, prints a line on stderr ending `retrying`,
+and ends that tick's reading; the next tick starts with the head after it,
+so a head that keeps failing never holds back the others. A rate limit's
+pause is waited out before the next tick, as for every other read. The
+queue reads at most eight heads a tick, after the tick's journal line,
+events, status write and export, and only after a tick whose own reads and
+writes all succeeded: a tick that failed, permanently or transiently, reads
+none, so a lost permission or a rate limit the tick ran into costs no
+capture request and no record. The rest wait for the next tick, so a
+backlog — `capture` first set against a journal that already has a
+segment, or a restart onto a segment opened by a 64 MiB rotation — drains
+over the following ticks. The heads the current segment showed arriving
+before the start and the capture file lacks are read at the first ticks
+after it, so a crash between a head's sighting and its record loses
+nothing.
+
+The capture file rotates with the journal exactly as the events file does:
+closed as `<capture>.<opened>` beside `<path>.<opened>` under the same
+suffix, and opened fresh and empty. A head is recorded at most once per
+capture file, and the file is fresh whenever its journal segment is, so
+the heads a fresh segment shows arriving are read again into the fresh
+file. In practice: a restart onto a segment opened by a 64 MiB rotation, or
+after a format change, reads the still-queued heads again; a pull request
+queued again with the same head after an idle rotation is read again; a
+head first seen in a tick that rotates, or still owed across a rotation, is
+recorded in the next file; and a head still owed when an idle rotation
+ends its pull request's segment is lost if the process then stops, except
+at the exit `--exit-when-idle` makes: that exit first reads every head
+still owed, past the eight a tick, until none is left or a read fails
+transiently, and prints a line for each head it leaves unread. A
+reader of several capture files dedups by `(pr, head)`. A last line cut
+off by a crash is cut back at the next start, with a line on stderr, and
+its head read again; a line without `pr` and `head` stops the run at
+start, naming the path and the line. A failure to write or rename the
+capture file stops the queue. Retention is yours, as for the events file.
+
+Each head costs `1 + ceil(files / 100)` requests, at most eight heads a
+tick, and nothing otherwise in a running process. After a restart, each
+head of the current segment that was found moved and so has no record
+costs one `GET /pulls/{n}`, at each restart until the segment rotates,
+within the same eight a tick. Every head the segment shows superseded — a
+`repush` of the same pull request followed it, as for every head of a
+landed pull request but the last — is such a head. The mock forge answers
+every read with one file, `pr/<n>`, one line added, under an all-zero base.
+
+The stderr lines, none for a record of files; a tick prints at most one
+per head, and the exit's line for a head it leaves unread may follow that
+head's `retrying`:
+
+- `capture of #<pr> at <head>: <error>; retrying`
+- `capture of #<pr> at <head> recorded as failed: <error>`
+- `capture of #<pr> at <head> not read: the head moved to <now>`
+- `capture of #<pr> at <head> not read before the exit`, at the
+  `--exit-when-idle` exit only
 
 ## Reading the journal
 
@@ -523,6 +699,255 @@ A segment that is not a journal, or a line that does not read, stops the
 command with exit 1 and `dorfq: <path>:<line>: …` on stderr. The current
 segment's last line may be a tick still being written; it is skipped, with a
 line on stderr.
+
+## The status issue
+
+The queue can keep one issue's body as its status, for anyone who can read
+the repository's issues. Create an issue — any title; the title is yours —
+and set its number under `[forge]`:
+
+```toml
+journal = "dorfq.journal"
+
+[forge]
+# ...
+status_issue = 12
+```
+
+`status_issue` needs `journal`: the body is drawn from the event stream the
+queue derives as it journals. It is refused at load without `journal`, as 0,
+and under the mock forge. The credential needs Issues: read/write. At start
+the queue reads the issue and stops, naming it, if there is no such issue or
+the number is a pull request's; it then writes a starting body saying the
+queue has started and has not observed the repository yet. A failure of
+either stops the queue at start with GitHub's answer, before the first tick.
+
+The body begins with the marker line `<!-- dorfq: status -->` and shows:
+
+- one line: the dorfq version, when this process started, when the body last
+  changed, and how many pull requests are queued and batches in flight;
+- **Queue**: each queued pull request, oldest arrival first, linked by
+  number, the pull request it is stacked on, its status as the tick line
+  words it (`ready`, `waiting:<holds>`, `conflicting:<with>`), how long it
+  has been in that status, how long it has been queued and the batch
+  holding it;
+- **Batches in flight**: each batch, what it was built on, its members, its
+  state and how long it has run;
+- **Last 24 hours**: landings, ejections, refusals and runs passed, failed
+  and cancelled; the median and 95th percentile of batch run time and of the
+  time from arrival to landing; and the events a reader cares about, newest
+  first — landings, ejections and their reasons, failed runs, refused
+  landings, notices, pull requests merged outside the queue, withdrawn, left
+  or lost, batches that could not be built or were cancelled, trunk moved by
+  another hand, restarts and errors. A figure counts what ended in the last
+  24 hours of the forge's clock.
+
+Times are UTC, the date left out on the day of the last change. No titles,
+no logins and nothing from the credential are written: GitHub shows a
+linked pull request's title on hover.
+
+The body is rewritten only when what it shows changes — an arrival, a push,
+a status change, a batch starting, a verdict, a landing, an ejection, a
+notice, an error, an event leaving the 24-hour window — and at most once in
+30 seconds: a change inside that interval is written at the first tick after
+it, and only the newest body is written. Nothing is written during a
+rate-limit pause GitHub announced; the newest body goes out at the first
+tick after the pause ends. The queue owns the body: an edit by hand is
+overwritten at the next change. Edit the title instead.
+
+A failed edit never stops the queue. A transient failure keeps the body and
+retries it with the comment outbox's backoff, 5 seconds doubling to a
+minute, a newer body taking its place: `dorfq: kept the status body for
+issue #<n>: <error>; retrying` on stderr; the queue wakes for the retry,
+and a hint arriving before it writes `next tick in <n> s: writing the status
+issue`. Any other failure —
+the issue deleted or transferred, issues disabled, the body refused — drops
+the body: `dorfq: dropped the status body for issue #<n>: <error>`; the next
+change tries again.
+
+The body says when it last changed, not whether the queue is running: a
+queue that stopped leaves its last body in place. A fatal error is not
+written to it — the error is in the journal and on stderr, and the next
+process's body shows it — and a change held by the 30-second limit when the
+queue stops is never written. A quiet queue changes
+nothing, so a body hours old is not by itself a sign the queue has stopped.
+
+After a restart the body continues from what the current journal segment
+recorded: each queued pull request keeps its arrival and the time it entered
+its status, each batch its start, and the window the events since the
+segment began. The segment begins at the last time the queue went idle, or
+at the last 64 MiB rotation, so a restart forgets what happened before
+that; while that is inside the window the body says `the record begins
+<time>; earlier events are in the closed journal segments`, and `dorfq
+journal` over the closed segments has the rest. After a 64 MiB rotation a
+pull request queued across it reads as queued from the rotation.
+
+GitHub accepts a body of at most 65,536 characters, and the queue keeps its
+own under 60,000. A body over that loses, in order, the oldest rows of the
+event table, then the event table itself (the figure lines stay), then the
+queue table's newest rows, replaced by `… and N more`. The batches table is
+never cut.
+
+## Telemetry
+
+The queue can push its gauges and its events to an OpenTelemetry collector
+over OTLP/HTTP, as protobuf (the encoding every OTLP/HTTP collector accepts)
+or as JSON:
+
+```toml
+journal = "dorfq.journal"
+
+[telemetry]
+metrics_endpoint = "http://127.0.0.1:4318/v1/metrics"
+logs_endpoint = "http://127.0.0.1:4318/v1/logs"
+interval_secs = 60
+encoding = "protobuf"
+authorization_env = "DORFQ_OTLP_AUTHORIZATION"
+```
+
+- `metrics_endpoint` and `logs_endpoint` are the complete URLs the metrics
+  and the logs requests are posted to, `http://` or `https://`, used as
+  given: nothing is appended. The OpenTelemetry Collector takes both on one
+  port, `http://host:4318/v1/metrics` and `http://host:4318/v1/logs`; a
+  collector that serves the two signals from different ports or paths
+  (VictoriaMetrics at `/opentelemetry/v1/metrics`, VictoriaLogs at
+  `/insert/opentelemetry/v1/logs`) gets each URL as it documents it.
+- `interval_secs` is the time between exports, from 1 to 86400 (a day).
+- `encoding`, optional, is `protobuf` (the default; bodies are posted as
+  `application/x-protobuf`) or `json` (`application/json`). Protobuf is the
+  encoding the OTLP/HTTP specification requires every collector to accept;
+  `json` is for a collector that only takes OTLP/JSON.
+- `authorization_env`, optional, names the environment variable holding the
+  `Authorization` header's whole value: `Basic <base64>` for Grafana Cloud,
+  `Bearer <token>` elsewhere. Absent, no header is sent. Over `http://` the
+  header travels unencrypted, so a collector reached across a network you do
+  not control, a hosted one, needs `https://`.
+
+`[telemetry]` needs `journal`: the gauges and the events come from the
+stream the queue derives as it journals. It works under either forge.
+
+A configuration the queue cannot use stops it at load: `telemetry needs
+journal`; `telemetry.metrics_endpoint "<url>" is not a URL: …`, `… is not
+an http:// or https:// URL`, `… has no host` or `… has an invalid port`;
+`telemetry.metrics_endpoint carries credentials; use authorization_env` or
+`telemetry.metrics_endpoint has a query or fragment` (an endpoint that could
+hold a secret is not repeated), and the same for `telemetry.logs_endpoint`; `telemetry.interval_secs is 0` or `… is above 86400`;
+`telemetry.authorization_env is empty`. `encoding` set to anything else is
+refused by the parser: ``unknown variant `xml`, expected `protobuf` or
+`json` ``. At start, before the forge is
+reached, the variable `authorization_env` names must be set:
+`telemetry.authorization_env <var> is unset, empty or not UTF-8`, or
+`… holds a value that is not a valid HTTP header value` for one with a
+trailing newline or another byte a header cannot carry. Neither message
+shows the value. Whether the collector answers is not checked at start.
+
+### The metrics
+
+Every export carries these, in the scope `dorfq`, under the resource
+`service.name = dorfq`, `service.version = <the dorfq version>`:
+
+| Metric | Unit | Attributes | Value |
+|---|---|---|---|
+| `dorfq_queue_prs` | `{pull_request}` | `status`: `ready`, `waiting`, `conflicting` | pull requests queued, by status |
+| `dorfq_batches` | `{batch}` | `state`: `testing`, `passed`, `failed`, `landed`, `refused`, `conflict` | batches in flight, by state |
+| `dorfq_oldest_queued_seconds` | `s` | | how long the oldest queued pull request has been queued; 0 when none is |
+| `dorfq_window_landed_prs` | `{pull_request}` | `window_seconds` | pull requests landed |
+| `dorfq_window_landed_batches` | `{batch}` | `window_seconds` | batches landed |
+| `dorfq_window_ejected_prs` | `{pull_request}` | `window_seconds` | pull requests ejected |
+| `dorfq_window_refused_landings` | `{batch}` | `window_seconds` | landings GitHub refused |
+| `dorfq_window_runs` | `{run}` | `verdict`: `passed`, `failed`, `cancelled`; `window_seconds` | batch runs ended |
+| `dorfq_window_batch_run_seconds` | `s` | `quantile`: `0.5`, `0.95`; `window_seconds` | batch run time |
+| `dorfq_window_land_seconds` | `s` | `quantile`; `window_seconds` | time from arrival to landing |
+| `dorfq_tick_age_seconds` | `s` | | time since the queue last observed the repository |
+| `dorfq_queue_blocked_prs` | `{pull_request}` | | pull requests labelled but not enqueued, told they are blocked; GitHub only |
+| `dorfq_api_rate_limit_remaining` | `{request}` | | the last `x-ratelimit-remaining` GitHub sent for a repository request; GitHub only |
+| `dorfq_telemetry_export_failures_total` | `{request}` | | export requests that failed, since start (a cumulative sum) |
+| `dorfq_telemetry_events_dropped_total` | `{event}` | | events dropped from a full buffer, since start (a cumulative sum) |
+
+The status of a queued pull request and the state of a batch are those the
+status issue shows, without what follows the `:`. The `window_` figures are
+the status issue's last-24-hours figures, and `window_seconds` is 86400 on
+each: a figure counts what ended in the trailing 24 hours of the forge's
+clock, and a run or a lifetime still open is in none. The pool gauges are
+not windowed. Every status, state and verdict is sent, zero included, so
+zero is never confused with absent; a metric or point is absent only when
+its value is unknown: a percentile with no samples, `dorfq_tick_age_seconds`
+before the first observation, the two GitHub-only gauges under the mock
+forge, and the rate limit before the first repository request.
+
+With `capture` set, the capture file spends `1 + ceil(files / 100)`
+requests of the rate limit per new pull request head, at most eight heads
+a tick, and nothing otherwise while the process runs; a restart re-asks
+the current segment's heads found moved, see [the capture
+file](#the-capture-file).
+
+A metric's time is the host time of the export that carries it. The queue's
+figures change only when it ticks, so between ticks each export repeats
+them with its own time, and `dorfq_tick_age_seconds` says how old they are.
+No metrics are sent before the first tick that observes the repository.
+
+### The log records
+
+Every event the events file would hold is sent as one log record, in order:
+its body is the events file's line, its time the event's own (the forge's
+clock), its observed time the host time of the tick that produced it. Its
+attributes are `kind`, and `pr` and `batch` when the event names them. An
+`error` event is severity `ERROR`, `FATAL` when fatal; every other event
+`INFO`. Events the queue replays from the journal at start are not sent
+again.
+
+### Delivery
+
+The queue never waits on the collector: a thread of its own exports every
+`interval_secs`, whatever the queue is doing, and once more when the queue
+exits, idle or fatal. An export is one metrics request, then the
+pending log records in requests of 1,000. A request is bounded by 10
+seconds; any answer but a 2xx is a failure, and a redirect is not followed.
+
+A failed request is counted in `dorfq_telemetry_export_failures_total` and
+tried again at the next interval; a refused log request keeps its records
+and the ones after it for then. Each signal says it once on stderr when it
+starts failing, `dorfq: telemetry: logs export failed: <error>; retrying
+every 60s`, with a refused answer's status and its first 200 bytes on one
+line, and once when it recovers, `dorfq: telemetry: logs export resumed
+after <n> failed requests`. A collector that takes metrics and refuses logs
+is reported for logs alone, once. A refusal whose body
+is not text (a protobuf `Status`, for instance) is noted as `HTTP <status>:
+<type> body omitted`, its media type (its first 200 characters) in place
+of its bytes; one with an empty media type is quoted as one with none.
+
+Up to 10,000 events wait for delivery. Past that the oldest are dropped and
+counted in `dorfq_telemetry_events_dropped_total`, with one line, `dorfq:
+telemetry: 10000 events pending; dropping the oldest until the collector
+takes them`; when log records are next delivered the count is written,
+appended to the `resumed` line or as `dorfq: telemetry: <m> events dropped
+while the buffer was full`. Every event stays in the events file whatever
+the collector does.
+
+The export at exit can delay the exit. Against an unreachable collector it
+waits for the export in flight, if any, and then the final one: up to four
+request timeouts, 40 seconds. A slow collector working through a full
+buffer can extend this to a few minutes: each export is one metrics request
+and up to 10,000 / 1,000 log requests, each up to 10 seconds.
+
+A stop by signal runs no export: `systemctl stop` and `restart`, and so
+`make local-deploy`, end the process at once, during an exit export or not.
+The events not yet delivered reach the events file only, uncounted in
+`dorfq_telemetry_events_dropped_total`, and the next start does not send
+them: up to `interval_secs` of log records per stop, more while the
+collector is failing.
+
+### What to alert on
+
+- `dorfq_tick_age_seconds` above a few refresh intervals: the queue no
+  longer observes the repository — observing fails, or the loop is stuck.
+- No samples for two intervals: the process has stopped, by a stop or on a
+  fatal error: a scheduler error or a permanent forge error.
+- Log records with `kind = error`: a tick that failed. A failure after the
+  queue observed, such as a merge or a CI start GitHub refused, does not age
+  `dorfq_tick_age_seconds`; these records are its signal.
+- A rising `dorfq_telemetry_export_failures_total`: the collector, not the
+  queue.
 
 ## Stacks
 

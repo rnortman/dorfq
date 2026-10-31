@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use super::events::{Event, Kind};
 
-const HOUR: f64 = 3600.0;
+pub(crate) const HOUR: f64 = 3600.0;
 
 /// What a journal's events add up to; `None` where the set it summarises is
 /// empty.
@@ -339,7 +339,7 @@ fn root(lives: &[Lifetime], life: &Lifetime) -> Option<Exit> {
 }
 
 /// The nearest-rank 50th and 95th percentiles of `values`.
-fn percentiles(mut values: Vec<f64>) -> (Option<f64>, Option<f64>) {
+pub(super) fn percentiles(mut values: Vec<f64>) -> (Option<f64>, Option<f64>) {
     values.sort_by(f64::total_cmp);
     let at = |p: f64| {
         let rank = ((p * values.len() as f64).ceil() as usize).max(1);
@@ -421,4 +421,4 @@ impl fmt::Display for Summary {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

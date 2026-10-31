@@ -1,5 +1,5 @@
 {
-  "checksum": "b907d761c3daa7f9681b5e30bb00eca04712a9d01357e185c391d80e876b62d2",
+  "checksum": "0cad1bd08adb30bc3435fc6b5351960e127847ecfe6c01c6db9cf26a74842b57",
   "conditions": {
     "aarch64-apple-darwin": [
       "aarch64-apple-darwin"
@@ -869,6 +869,16 @@
           {
             "id": "toml 1.1.8+spec-1.1.0",
             "target": "toml"
+          },
+          {
+            "id": "ureq 3.5.0",
+            "target": "ureq"
+          }
+        ],
+        "deps_dev": [
+          {
+            "id": "httparse 1.10.1",
+            "target": "httparse"
           }
         ],
         "edition": "2024"

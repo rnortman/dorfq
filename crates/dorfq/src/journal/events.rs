@@ -36,12 +36,12 @@ pub enum Kind {
         pr: u64,
         base: Option<u64>,
         atomic: bool,
-        head: String,
+        head: Sha,
     },
     /// The queue sees the pull request from now; with every `arrive`.
     Admit { pr: u64, base: Option<u64> },
     /// Its head changed.
-    Repush { pr: u64, head: String },
+    Repush { pr: u64, head: Sha },
     /// It stopped merging into its base: `"trunk"` or a pull request's
     /// number.
     Conflicting { pr: u64, with: Value },
@@ -149,52 +149,78 @@ pub struct PlannedPr {
     pub reason: String,
 }
 
+/// `event` as one line of the event stream's text: its JSON, then `\n`.
+pub fn line(event: &Event) -> String {
+    serde_json::to_string(event).expect("an event serialises") + "\n"
+}
+
 /// The event stream of a journal's entries, in order.
 pub fn derive(entries: &[Entry]) -> Vec<Event> {
     let mut fold = Fold::default();
     for entry in entries {
-        match entry {
-            Entry::Header(header) => fold.header(header),
-            Entry::Tick(line) => match &line.kind {
-                LineKind::Report { report, failure } => {
-                    fold.observe(&report.observation, &report.plan, line.at, line.tick);
-                    if let Some(failure) = failure {
-                        fold.error(failure, line.at);
-                    }
-                }
-                LineKind::Same { now } => fold.same(*now, line.at, line.tick),
-                LineKind::Error(failure) => fold.error(failure, line.at),
-            },
-        }
+        fold.entry(entry);
     }
-    fold.finish()
+    let mut events = fold.take();
+    events.extend(fold.finish());
+    events
 }
 
+/// The event stream folded one journal entry at a time: each entry point
+/// adds its events, which [`Fold::take`] drains. Its state is bounded by
+/// the last two observations: batch tips and landings of batches absent
+/// from both are forgotten, as are ejection reasons of pull requests gone.
 #[derive(Default)]
-struct Fold {
+pub struct Fold {
+    /// The events not yet taken.
     events: Vec<Event>,
     /// The previous journaled observation.
     previous: Option<Observation>,
     /// Whether a header has been read.
     headed: bool,
+    /// Whether an observation has been folded since the last header.
+    observed: bool,
     /// Events whose `t` is the next observation's `now`.
     waiting: Vec<Kind>,
-    /// The latest plan ejection's reason, by pull request.
-    ejections: BTreeMap<u64, String>,
-    /// Every batch tip seen, to the batch's id.
-    tips: BTreeMap<Sha, u64>,
-    /// Every batch seen `Landed`.
-    landed: BTreeSet<u64>,
+    /// The latest plan ejection's reason, by queued pull request.
+    pub(super) ejections: BTreeMap<u64, String>,
+    /// The tips of the batches in the last two observations, to the
+    /// batch's id.
+    pub(super) tips: BTreeMap<Sha, u64>,
+    /// The batches of the last two observations seen `Landed`.
+    pub(super) landed: BTreeSet<u64>,
     /// A `start` header was read and no observation has followed it.
     restarted: bool,
 }
 
 impl Fold {
+    /// Folds one entry of a journal.
+    pub fn entry(&mut self, entry: &Entry) {
+        match entry {
+            Entry::Header(header) => self.header(header),
+            Entry::Tick(line) => match &line.kind {
+                LineKind::Report { report, failure } => {
+                    self.observe(&report.observation, &report.plan, line.at, line.tick);
+                    if let Some(failure) = failure {
+                        self.error(failure, line.at);
+                    }
+                }
+                LineKind::Same { now } => self.same(*now, line.at, line.tick),
+                LineKind::Error(failure) => self.error(failure, line.at),
+            },
+        }
+    }
+
+    /// The events produced since the last call, in order.
+    pub fn take(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
+    }
+
     fn push(&mut self, t: u64, kind: Kind) {
         self.events.push(Event { t, kind });
     }
 
-    fn header(&mut self, header: &Header) {
+    /// Folds a header.
+    pub fn header(&mut self, header: &Header) {
         if self.headed && header.cause == Cause::Start {
             self.waiting.push(Kind::Restart {
                 started: header.started,
@@ -204,6 +230,7 @@ impl Fold {
         }
         self.restarted |= header.cause == Cause::Start;
         self.headed = true;
+        self.observed = false;
     }
 
     /// What a restart keeps: pull requests and shas are the repository's
@@ -217,16 +244,19 @@ impl Fold {
         self.landed.retain(adopted);
     }
 
-    fn error(&mut self, failure: &Failure, at: u64) {
+    /// Folds the error a tick ended with, `at` on the host clock.
+    pub fn error(&mut self, failure: &Failure, at: u64) {
         let kind = Kind::Error {
             message: failure.message.clone(),
             fatal: failure.fatal,
             at,
         };
         match &self.previous {
-            // An error after a restart waits behind it for the next
-            // observation, keeping the two in order.
-            Some(previous) if self.waiting.is_empty() => {
+            // An error after a header waits for the next observation: one
+            // after a restart stays behind it, and a fold that begins at a
+            // `rotate` header places it where one that read the segment
+            // before does.
+            Some(previous) if self.observed => {
                 let t = previous.now.0;
                 self.push(t, kind);
             }
@@ -241,13 +271,17 @@ impl Fold {
         }
     }
 
-    fn finish(mut self) -> Vec<Event> {
+    /// Ends the stream: the events still waiting for an observation, at the
+    /// last observation's `now`, or 0 with none. Every event before them was
+    /// taken.
+    pub fn finish(mut self) -> Vec<Event> {
         let t = self.previous.as_ref().map_or(0, |o| o.now.0);
         self.release(t);
         self.events
     }
 
-    fn same(&mut self, now: dorfq_core::Timestamp, at: u64, tick: u64) {
+    /// Folds a `same` line: the previous observation again at `now`.
+    pub fn same(&mut self, now: dorfq_core::Timestamp, at: u64, tick: u64) {
         let Some(previous) = &mut self.previous else {
             // A `same` line follows a `report` in every journal the writer
             // makes; without one there is nothing to repeat.
@@ -256,12 +290,15 @@ impl Fold {
         previous.now = now;
         let step = step(previous, &Plan::default(), at, tick);
         self.release(now.0);
+        self.observed = true;
         self.push(now.0, step);
     }
 
-    fn observe(&mut self, o: &Observation, plan: &Plan, at: u64, tick: u64) {
+    /// Folds an observation and the plan made on it.
+    pub fn observe(&mut self, o: &Observation, plan: &Plan, at: u64, tick: u64) {
         let t = o.now.0;
         self.release(t);
+        self.observed = true;
         let restarted = std::mem::take(&mut self.restarted);
         if restarted {
             self.forget_the_old_process(o);
@@ -277,6 +314,7 @@ impl Fold {
             .unwrap_or_default();
 
         self.departures(t, o, &before, &now);
+        self.ejections.retain(|pr, _| now.contains_key(pr));
         // A batch first seen gets its endings after its `start`.
         let mut fresh = Vec::new();
         let mut newly_landed = Vec::new();
@@ -352,6 +390,12 @@ impl Fold {
                 .insert(ejection.pr.0, ejection.reason.to_string());
         }
         self.push(t, step(o, plan, at, tick));
+        // A batch starts on trunk or the tip of a batch tracked at its
+        // plan's observation, and is observed at the next: its base is in
+        // this observation or the one before.
+        let kept = |id: &u64| was.contains_key(id) || o.batches.iter().any(|b| b.id.0 == *id);
+        self.tips.retain(|_, id| kept(id));
+        self.landed.retain(kept);
         self.previous = Some(o.clone());
     }
 
@@ -450,7 +494,7 @@ impl Fold {
                         pr,
                         base,
                         atomic: now.stack == dorfq_core::StackPolicy::Atomic,
-                        head: now.head.to_string(),
+                        head: now.head.clone(),
                     },
                 );
                 self.push(t, Kind::Admit { pr, base });
@@ -459,7 +503,7 @@ impl Fold {
                 t,
                 Kind::Repush {
                     pr,
-                    head: now.head.to_string(),
+                    head: now.head.clone(),
                 },
             ),
             Some(_) => {}

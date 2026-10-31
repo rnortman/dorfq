@@ -252,6 +252,22 @@ fn a_pause_ending_inside_a_second_rounds_up() {
 }
 
 #[test]
+fn a_rate_limited_files_read_holds_the_next_wait_to_its_end() {
+    let fake = FakeGitHub::new();
+    let head = queued(&fake, 1).remove(0);
+    let (clock, _) = scripted(&[0, 100]);
+    let (mut forge, _send) = hinted(&fake, clock);
+    fake.fail(
+        "pr_files",
+        Failure::RateLimited(UNIX_EPOCH + StdDuration::from_secs(NOW.0 + 40)),
+    );
+    let error = forge.head_files(PrNumber(1), &head).unwrap_err();
+    assert!(matches!(error, ApiError::Transient(_)), "{error}");
+    forge.wait(false);
+    assert_eq!(forge.schedule.next_deadline(), Some(Timestamp(NOW.0 + 40)));
+}
+
+#[test]
 fn transient_failures_back_off_doubling_to_a_minute_and_a_completed_tick_resets() {
     // Each wait reads its start, a second before its hold ends, the same
     // second again for the hint that arrives, and the hold's end. A hint
@@ -432,6 +448,7 @@ fn a_hold_is_a_backoff_a_rate_limit_pause_or_nothing_due_sooner() {
         start: t(0),
         held: t(0),
         outbox_due: None,
+        status_due: None,
     };
     // A backoff that is what the wake is.
     assert_eq!(
@@ -537,6 +554,7 @@ fn a_wait_held_after_hints_says_how_long_and_why() {
                     start: at(1),
                     held: at(1),
                     outbox_due: None,
+                    status_due: None,
                 },
             )
             .as_deref(),
@@ -550,6 +568,7 @@ fn a_wait_held_after_hints_says_how_long_and_why() {
                     start: at(1),
                     held: at(61),
                     outbox_due: None,
+                    status_due: None,
                 },
             )
             .as_deref(),
@@ -562,6 +581,7 @@ fn a_wait_held_after_hints_says_how_long_and_why() {
                 start: at(1),
                 held: at(1),
                 outbox_due: None,
+                status_due: None,
             },
         ),
         None
@@ -575,6 +595,7 @@ fn a_wait_held_after_hints_says_how_long_and_why() {
                     start: at(1),
                     held: at(1),
                     outbox_due: None,
+                    status_due: None,
                 },
             )
             .as_deref(),
@@ -712,6 +733,7 @@ fn a_rate_limit_pause_holds_a_kept_comment_s_retry_to_its_end() {
                     start: at(0),
                     held: at(0),
                     outbox_due: Some(at(20)),
+                    status_due: None,
                 },
             )
             .as_deref(),
@@ -759,6 +781,7 @@ fn a_kept_comment_s_retry_is_a_hold_of_its_own_below_a_backoff_and_a_pause() {
         start: t(0),
         held: t(0),
         outbox_due: None,
+        status_due: None,
     };
     // The retry is sooner than any deadline.
     assert_eq!(
@@ -853,9 +876,239 @@ fn a_wait_held_for_a_kept_comment_says_so() {
                     start: at(0),
                     held: at(0),
                     outbox_due: Some(at(5)),
+                    status_due: None,
                 },
             )
             .as_deref(),
         Some("dorfq: next tick in 5 s: retrying a comment post")
+    );
+}
+
+/// A forge over `fake`, with the status issue 12 and a hint channel,
+/// reading `clock`.
+fn status_hinted(fake: &FakeGitHub, clock: Clock) -> (GitHubForge, Sender<Hint>) {
+    fake.state().issues.insert(12, String::new());
+    let (send, receive) = mpsc::channel();
+    let settings = Settings {
+        status_issue: Some(12),
+        ..settings()
+    };
+    let forge = GitHubForge::new(
+        Box::new(fake.clone()),
+        settings,
+        clock,
+        Box::new(io::sink()),
+        Some(receive),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    (forge, send)
+}
+
+#[test]
+fn a_kept_status_body_holds_the_wait_and_the_next_observation_writes_it() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    let elsewhere = fake.commit(&[fake.trunk()]);
+    // Observe at 0; the refused write sent and returned at 0; the wait's
+    // start, a second before the retry, the hint's own reading, the retry;
+    // the observation and the write sent and returned at 5.
+    let (clock, taken) = scripted(&[0, 0, 0, 0, 4, 4, 5, 5, 5, 5]);
+    let (mut forge, send) = status_hinted(&fake, clock);
+    forge.observe().unwrap();
+    quiet_after(&mut forge, 1000);
+    fake.fail("set_issue_body", Failure::Transient);
+    forge.publish_status("status".to_owned());
+    assert_eq!(taken.get(), 3);
+    send.send(Hint::Commit(elsewhere)).unwrap();
+    forge.wait(false);
+    assert_eq!(taken.get(), 7);
+    forge.observe().unwrap();
+    assert_eq!(taken.get(), 10);
+    assert_eq!(fake.state().issues[&12], "status");
+}
+
+#[test]
+fn a_status_write_s_retry_and_floor_are_timed_from_its_return() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    // Observe at 0; a refused write sent at 0 that returns at 30; a write
+    // sent at 35 that returns at 60.
+    let (clock, taken) = scripted(&[0, 0, 30, 35, 60]);
+    let (mut forge, _send) = status_hinted(&fake, clock);
+    forge.observe().unwrap();
+    fake.fail("set_issue_body", Failure::Transient);
+    forge.publish_status("first".to_owned());
+    let status = forge.status.as_ref().unwrap();
+    assert_eq!(
+        (status.backoff, status.due),
+        (Some(5), Timestamp(NOW.0 + 35))
+    );
+    forge.publish_status("second".to_owned());
+    assert_eq!(taken.get(), 5);
+    let status = forge.status.as_ref().unwrap();
+    assert_eq!(
+        (status.pending.as_deref(), status.due),
+        (None, Timestamp(NOW.0 + 90))
+    );
+}
+
+#[test]
+fn a_rate_limit_pause_holds_a_kept_status_body_s_retry_to_its_end() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    let elsewhere = fake.commit(&[fake.trunk()]);
+    // Observe at 0; the refused write sent and returned at 0; the wait's
+    // start, a second before the pause ends, the hint's own reading, the
+    // pause's end.
+    let (clock, taken) = scripted(&[0, 0, 0, 0, 19, 19, 20]);
+    let (mut forge, send) = status_hinted(&fake, clock);
+    forge.observe().unwrap();
+    quiet_after(&mut forge, 1000);
+    fake.fail("set_issue_body", Failure::Transient);
+    forge.publish_status("status".to_owned());
+    fake.state().rate_limit_pause = Some(UNIX_EPOCH + StdDuration::from_secs(NOW.0 + 20));
+    send.send(Hint::Commit(elsewhere)).unwrap();
+    forge.wait(false);
+    assert_eq!(taken.get(), 7);
+}
+
+#[test]
+fn a_body_handed_over_inside_a_pause_waits_for_its_end() {
+    let fake = FakeGitHub::new();
+    queued(&fake, 1);
+    let elsewhere = fake.commit(&[fake.trunk()]);
+    // Observe at 0; the held write at 0; the wait's start, a second before
+    // the pause ends, the hint's own reading, the pause's end; the
+    // observation, the held write's due check, its pause gate and its return
+    // at 20.
+    let (clock, taken) = scripted(&[0, 0, 0, 19, 19, 20, 20, 20, 20, 20]);
+    let (mut forge, send) = status_hinted(&fake, clock);
+    forge.observe().unwrap();
+    quiet_after(&mut forge, 1000);
+    // The rate-limited tick's response recorded the pause; nothing has
+    // read it yet.
+    fake.state().rate_limit_pause = Some(UNIX_EPOCH + StdDuration::from_secs(NOW.0 + 20));
+    forge.publish_status("status".to_owned());
+    assert_eq!(fake.writes(), ["set_issue_body 12"]);
+    send.send(Hint::Commit(elsewhere)).unwrap();
+    forge.wait(false);
+    assert_eq!(taken.get(), 6);
+    assert_eq!(fake.writes(), ["set_issue_body 12"]);
+    forge.observe().unwrap();
+    assert_eq!(taken.get(), 10);
+    assert_eq!(fake.writes(), ["set_issue_body 12", "set_issue_body 12"]);
+    assert_eq!(fake.state().issues[&12], "status");
+}
+
+#[test]
+fn a_held_status_body_is_a_hold_of_its_own_after_a_kept_comment() {
+    let t = Timestamp;
+    // A wait that began at 0 with no backoff, no comment kept and no body
+    // held.
+    let idle = Holds {
+        start: t(0),
+        held: t(0),
+        outbox_due: None,
+        status_due: None,
+    };
+    // The write is sooner than any deadline.
+    assert_eq!(
+        hold(
+            t(30),
+            None,
+            Holds {
+                status_due: Some(t(5)),
+                ..idle
+            }
+        ),
+        WaitHold::Status
+    );
+    // The write is no sooner than the earliest deadline.
+    assert_eq!(
+        hold(
+            t(30),
+            None,
+            Holds {
+                status_due: Some(t(30)),
+                ..idle
+            }
+        ),
+        WaitHold::Floor
+    );
+    // Of a kept comment's retry and the write, the sooner names the hold;
+    // at the same time, the comment's retry does.
+    assert_eq!(
+        hold(
+            t(30),
+            None,
+            Holds {
+                outbox_due: Some(t(20)),
+                status_due: Some(t(5)),
+                ..idle
+            }
+        ),
+        WaitHold::Status
+    );
+    assert_eq!(
+        hold(
+            t(30),
+            None,
+            Holds {
+                outbox_due: Some(t(5)),
+                status_due: Some(t(20)),
+                ..idle
+            }
+        ),
+        WaitHold::Outbox
+    );
+    assert_eq!(
+        hold(
+            t(30),
+            None,
+            Holds {
+                outbox_due: Some(t(5)),
+                status_due: Some(t(5)),
+                ..idle
+            }
+        ),
+        WaitHold::Outbox
+    );
+    // A backoff or a pause at or past the write decides.
+    assert_eq!(
+        hold(
+            t(30),
+            None,
+            Holds {
+                held: t(10),
+                status_due: Some(t(5)),
+                ..idle
+            }
+        ),
+        WaitHold::Backoff
+    );
+    assert_eq!(
+        hold(
+            t(30),
+            Some(t(20)),
+            Holds {
+                status_due: Some(t(20)),
+                ..idle
+            }
+        ),
+        WaitHold::RateLimit
+    );
+    // The wake is the earliest of the three.
+    assert_eq!(
+        Holds {
+            outbox_due: Some(t(20)),
+            status_due: Some(t(5)),
+            ..idle
+        }
+        .wake(t(30)),
+        t(5)
+    );
+    assert_eq!(
+        hold_line(5, WaitHold::Status),
+        "dorfq: next tick in 5 s: writing the status issue"
     );
 }

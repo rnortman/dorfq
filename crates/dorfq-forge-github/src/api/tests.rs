@@ -126,6 +126,9 @@ fn pr_json(number: u64, head: &str, labels: &[&str], merge_state: &str) -> Value
         "mergeable_state": merge_state,
         "draft": false,
         "merged": false,
+        "additions": 120,
+        "deletions": 7,
+        "changed_files": 3,
     })
 }
 
@@ -147,8 +150,153 @@ fn get_pr_decodes_every_field() {
             merge_state: MergeState::Unknown,
             draft: true,
             merged: false,
+            base_sha: sha(A),
+            additions: Some(120),
+            deletions: Some(7),
+            changed_files: Some(3),
         }
     );
+}
+
+#[test]
+fn get_pr_decodes_the_base_sha_and_the_size() {
+    let mut moved_base = pr_json(5, B, &[], "clean");
+    moved_base["base"]["sha"] = json!(C);
+    let mut no_count = pr_json(6, B, &[], "clean");
+    no_count.as_object_mut().unwrap().remove("changed_files");
+    let mut bad_base = pr_json(7, B, &[], "clean");
+    bad_base["base"]["sha"] = json!("not a sha");
+    let (mut api, _) = client(vec![
+        route("GET", "/pulls/5", ok(moved_base)),
+        route("GET", "/pulls/6", ok(no_count)),
+        route("GET", "/pulls/7", ok(bad_base)),
+    ]);
+    let pr = api.get_pr(PrNumber(5)).unwrap();
+    assert_eq!(
+        (pr.base_sha, pr.additions, pr.deletions, pr.changed_files),
+        (sha(C), Some(120), Some(7), Some(3))
+    );
+    // A count only the capture needs is not the refresh's to require.
+    let pr = api.get_pr(PrNumber(6)).unwrap();
+    assert_eq!(
+        (pr.additions, pr.deletions, pr.changed_files),
+        (Some(120), Some(7), None)
+    );
+    let error = api.get_pr(PrNumber(7)).unwrap_err();
+    assert!(!is_transient(&error), "{error}");
+    assert!(error.to_string().contains("GET /pulls/7"), "{error}");
+}
+
+fn file_json(path: &str, additions: u64, deletions: u64, status: &str) -> Value {
+    json!({
+        "sha": A,
+        "filename": path,
+        "status": status,
+        "additions": additions,
+        "deletions": deletions,
+        "changes": additions + deletions,
+        "patch": "@@ -1 +1 @@",
+    })
+}
+
+fn changed(path: &str, additions: u64, deletions: u64, status: &str) -> ChangedFile {
+    ChangedFile {
+        path: path.to_owned(),
+        additions,
+        deletions,
+        status: status.to_owned(),
+        previous: None,
+    }
+}
+
+#[test]
+fn pr_files_follows_link_next_and_keeps_the_listing_order() {
+    let page2 = format!("{REPO}/pulls/7/files?per_page=100&page=2");
+    let mut first = ok(Value::Array(
+        (0..100)
+            .map(|i| file_json(&format!("src/f{i:03}.rs"), i, 1, "modified"))
+            .collect(),
+    ));
+    first
+        .headers
+        .push(("link", format!("<{page2}>; rel=\"next\"")));
+    let mut renamed = file_json("docs/new.md", 20, 0, "renamed");
+    renamed["previous_filename"] = json!("docs/old.md");
+    let second = ok(json!([
+        file_json("b.txt", 0, 4, "removed"),
+        renamed,
+        file_json("a.txt", 9, 0, "added"),
+    ]));
+    let (mut api, seen) = client(vec![
+        route("GET", "/pulls/7/files?per_page=100", first),
+        (format!("GET {page2}"), second),
+    ]);
+    let files = api.pr_files(PrNumber(7)).unwrap();
+    assert_eq!(files.len(), 103);
+    assert_eq!(files[0], changed("src/f000.rs", 0, 1, "modified"));
+    assert_eq!(files[99], changed("src/f099.rs", 99, 1, "modified"));
+    assert_eq!(
+        files[100..],
+        [
+            changed("b.txt", 0, 4, "removed"),
+            ChangedFile {
+                previous: Some("docs/old.md".to_owned()),
+                ..changed("docs/new.md", 20, 0, "renamed")
+            },
+            changed("a.txt", 9, 0, "added"),
+        ]
+    );
+    assert_eq!(seen.borrow().len(), 2);
+}
+
+#[test]
+fn pr_files_classifies_a_later_page_s_failure() {
+    let path = "/pulls/7/files?per_page=100";
+    let page2 = format!("{REPO}/pulls/7/files?per_page=100&page=2");
+    let mut first = ok(json!([file_json("a.txt", 1, 0, "added")]));
+    first
+        .headers
+        .push(("link", format!("<{page2}>; rel=\"next\"")));
+    let (mut api, _) = client(vec![
+        route("GET", path, first),
+        (
+            format!("GET {page2}"),
+            status(502, json!({ "message": "Bad Gateway" })),
+        ),
+    ]);
+    let error = api.pr_files(PrNumber(7)).unwrap_err();
+    assert!(is_transient(&error), "{error}");
+    assert!(error.to_string().contains("HTTP 502"), "{error}");
+
+    let (mut api, _) = client(vec![route(
+        "GET",
+        path,
+        status(404, json!({ "message": "Not Found" })),
+    )]);
+    let error = api.pr_files(PrNumber(7)).unwrap_err();
+    assert!(!is_transient(&error), "{error}");
+    assert!(error.to_string().contains("/pulls/7/files"), "{error}");
+
+    let clock = Rc::new(Cell::new(UNIX_EPOCH + Duration::from_secs(1000)));
+    let (mut api, _) = client_with(
+        Auth::Token(TOKEN.to_owned()),
+        vec![route(
+            "GET",
+            path,
+            limited(
+                403,
+                "API rate limit exceeded",
+                &[
+                    ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", "1792000000"),
+                ],
+            ),
+        )],
+        clock,
+    );
+    let error = api.pr_files(PrNumber(7)).unwrap_err();
+    assert!(is_transient(&error), "{error}");
+    assert_eq!(api.rate_limit_pause(), paused_at(1_792_000_000));
 }
 
 #[test]
@@ -705,6 +853,122 @@ fn set_base_maps_a_refusal() {
 }
 
 #[test]
+fn get_issue_tells_an_issue_from_a_pull_request_and_reads_404_as_none() {
+    let (mut api, _) = client(vec![
+        route(
+            "GET",
+            "/issues/12",
+            ok(json!({ "number": 12, "title": "status" })),
+        ),
+        route(
+            "GET",
+            "/issues/7",
+            ok(json!({ "number": 7, "pull_request": { "url": "x" } })),
+        ),
+        route(
+            "GET",
+            "/issues/99",
+            status(404, json!({ "message": "Not Found" })),
+        ),
+    ]);
+    assert_eq!(
+        api.get_issue(12).unwrap(),
+        Some(IssueDetail {
+            pull_request: false
+        })
+    );
+    assert_eq!(
+        api.get_issue(7).unwrap(),
+        Some(IssueDetail { pull_request: true })
+    );
+    assert_eq!(api.get_issue(99).unwrap(), None);
+}
+
+#[test]
+fn get_issue_maps_a_403_to_a_permanent_error_with_github_s_message() {
+    let (mut api, _) = client(vec![route(
+        "GET",
+        "/issues/12",
+        status(
+            403,
+            json!({ "message": "Resource not accessible by integration" }),
+        ),
+    )]);
+    let error = api.get_issue(12).unwrap_err();
+    assert!(!is_transient(&error), "{error}");
+    assert!(
+        error
+            .to_string()
+            .ends_with("GET /issues/12: HTTP 403: Resource not accessible by integration"),
+        "{error}"
+    );
+}
+
+#[test]
+fn set_issue_body_patches_the_issue_and_maps_a_refusal() {
+    let (mut api, seen) = client(vec![route(
+        "PATCH",
+        "/issues/12",
+        ok(json!({ "number": 12 })),
+    )]);
+    api.set_issue_body(12, "the body").unwrap();
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, Method::Patch);
+    assert_eq!(seen[0].2, Some(json!({ "body": "the body" })));
+    for (canned, transient) in [
+        (
+            status(
+                422,
+                json!({ "message": "Validation Failed", "errors": [{ "code": "too_long" }] }),
+            ),
+            false,
+        ),
+        (
+            status(410, json!({ "message": "Issues are disabled" })),
+            false,
+        ),
+        (status(502, Value::Null), true),
+    ] {
+        let code = canned.status;
+        let (mut api, _) = client(vec![route("PATCH", "/issues/12", canned)]);
+        let error = api.set_issue_body(12, "the body").unwrap_err();
+        assert_eq!(is_transient(&error), transient, "HTTP {code}: {error}");
+        let error = error.to_string();
+        assert!(error.contains("PATCH /issues/12"), "{error}");
+        assert!(error.contains(&format!("HTTP {code}")), "{error}");
+    }
+}
+
+#[test]
+fn a_redirect_on_either_issue_call_says_the_issue_may_have_been_transferred() {
+    let moved = || {
+        let mut c = status(301, json!({ "message": "Moved Permanently" }));
+        c.headers
+            .push(("location", format!("{BASE}/repositories/42/issues/7")));
+        c
+    };
+    let (mut api, _) = client(vec![route("GET", "/issues/12", moved())]);
+    let read = api.get_issue(12).unwrap_err();
+    let (mut api, _) = client(vec![route("PATCH", "/issues/12", moved())]);
+    let written = api.set_issue_body(12, "the body").unwrap_err();
+    for error in [read, written] {
+        assert!(!is_transient(&error), "{error}");
+        let text = error.to_string();
+        assert!(
+            text.contains(&format!("redirected to {BASE}/repositories/42/issues/7")),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "if the issue was transferred, set status_issue to an issue in this repository"
+            ),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn merged_pr_heads_asks_for_trunk_merges_of_the_branch_and_keeps_merged_ones() {
     let mut merged = pr_json(5, A, &[], "unknown");
     merged["state"] = json!("closed");
@@ -864,6 +1128,18 @@ fn a_rate_limited_response_records_when_requests_may_resume() {
                 "API rate limit exceeded",
                 &[
                     ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", "1792000000"),
+                ],
+            ),
+            paused_at(1_792_000_000),
+        ),
+        // A padded `x-ratelimit-remaining` still counts as exhausted.
+        (
+            limited(
+                403,
+                "Forbidden",
+                &[
+                    ("x-ratelimit-remaining", " 0 "),
                     ("x-ratelimit-reset", "1792000000"),
                 ],
             ),
@@ -1790,4 +2066,98 @@ fn a_refused_actions_call_names_the_permission_unless_rate_limited() {
     assert!(named(&error), "{error}");
     let error = api.list_runs(&sha(A)).unwrap_err();
     assert!(is_transient(&error), "{error}");
+}
+
+/// A `GET /labels/queue` answer carrying `x-ratelimit-remaining: remaining`.
+fn label_remaining(remaining: &str) -> Canned {
+    let mut c = ok(json!({ "name": "queue" }));
+    c.headers
+        .push(("x-ratelimit-remaining", remaining.to_owned()));
+    c
+}
+
+#[test]
+fn the_latest_repository_response_says_how_many_requests_remain() {
+    let mut api = labels_client(
+        0,
+        vec![
+            label_remaining("4999"),
+            ok(json!({ "name": "queue" })),
+            label_remaining("abc"),
+            label_remaining(" 17 "),
+        ],
+    );
+    assert_eq!(api.rate_limit_remaining(), None, "before any request");
+    api.label_exists("queue").unwrap();
+    assert_eq!(api.rate_limit_remaining(), Some(4999));
+    api.label_exists("queue").unwrap();
+    assert_eq!(api.rate_limit_remaining(), None, "no header");
+    api.label_exists("queue").unwrap();
+    assert_eq!(api.rate_limit_remaining(), None, "not a whole number");
+    api.label_exists("queue").unwrap();
+    assert_eq!(api.rate_limit_remaining(), Some(17));
+}
+
+#[test]
+fn a_transport_failure_leaves_the_remaining_requests_as_they_were() {
+    let mut answered = false;
+    let transport: Transport = Box::new(move |_: &HttpRequest<'_>| {
+        if answered {
+            return Err(TransportError {
+                transient: true,
+                message: "connection reset".to_owned(),
+            });
+        }
+        answered = true;
+        Ok(HttpResponse {
+            status: 200,
+            headers: vec![("x-ratelimit-remaining".to_owned(), "4999".to_owned())],
+            body: json!({ "name": "queue" }).to_string(),
+        })
+    });
+    let mut api = RestClient::with_transport(
+        BASE,
+        "acme",
+        "widgets",
+        Auth::Token(TOKEN.to_owned()),
+        transport,
+        Box::new(SystemTime::now),
+    );
+    api.label_exists("queue").unwrap();
+    api.label_exists("queue").unwrap_err();
+    assert_eq!(api.rate_limit_remaining(), Some(4999));
+}
+
+#[test]
+fn the_app_credential_requests_do_not_set_the_remaining_requests() {
+    let with_remaining = |(key, mut canned): (String, Canned), remaining: &str| {
+        canned
+            .headers
+            .push(("x-ratelimit-remaining", remaining.to_owned()));
+        (key, canned)
+    };
+    // A mint that fails: only the app's own requests were answered.
+    let failed_mint = (
+        MINT.to_owned(),
+        limited(500, "boom", &[("x-ratelimit-remaining", "4000")]),
+    );
+    let (mut api, _) = client_with(
+        app(),
+        vec![with_remaining(installation(), "4001"), failed_mint],
+        Rc::new(Cell::new(at(1_800_000_000))),
+    );
+    api.label_exists("queue").unwrap_err();
+    assert_eq!(api.rate_limit_remaining(), None);
+
+    let (mut api, _) = client_with(
+        app(),
+        vec![
+            with_remaining(installation(), "4001"),
+            with_remaining(minted("installation-token-1"), "4000"),
+            route("GET", "/labels/queue", label_remaining("12")),
+        ],
+        Rc::new(Cell::new(at(1_800_000_000))),
+    );
+    api.label_exists("queue").unwrap();
+    assert_eq!(api.rate_limit_remaining(), Some(12));
 }

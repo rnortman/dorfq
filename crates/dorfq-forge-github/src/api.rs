@@ -45,6 +45,9 @@ pub trait GitHubApi {
     /// in this repository.
     fn open_pr_with_head(&mut self, branch: &str) -> Result<Option<OpenPr>, ApiError>;
     fn get_pr(&mut self, number: PrNumber) -> Result<PrDetail, ApiError>;
+    /// The files the pull request changes, in the listing's order; at most
+    /// 3,000, GitHub's limit, however many it changes.
+    fn pr_files(&mut self, number: PrNumber) -> Result<Vec<ChangedFile>, ApiError>;
     /// Changes the branch a pull request targets.
     fn set_base(&mut self, number: PrNumber, base: &str) -> Result<(), ApiError>;
     /// The heads, as merged, of the closed and merged pull requests whose head
@@ -57,6 +60,10 @@ pub trait GitHubApi {
     /// Comment bodies on a pull request, oldest first.
     fn list_comments(&mut self, number: PrNumber) -> Result<Vec<String>, ApiError>;
     fn create_comment(&mut self, number: PrNumber, body: &str) -> Result<(), ApiError>;
+    /// What issue `number` is; `None` when there is no such issue.
+    fn get_issue(&mut self, number: u64) -> Result<Option<IssueDetail>, ApiError>;
+    /// Replaces issue `number`'s body.
+    fn set_issue_body(&mut self, number: u64, body: &str) -> Result<(), ApiError>;
     fn label_exists(&mut self, label: &str) -> Result<bool, ApiError>;
     /// The repository ruleset named `name`: its id and the branches, by
     /// short name, it includes. Two of that name is an error.
@@ -89,6 +96,10 @@ pub trait GitHubApi {
     /// latest rate-limited response since the last call said; cleared by
     /// the call. Not a request.
     fn rate_limit_pause(&mut self) -> Option<SystemTime>;
+    /// `x-ratelimit-remaining` of the latest response to a repository
+    /// request; `None` before one, or when it carried none readable. Not a
+    /// request.
+    fn rate_limit_remaining(&self) -> Option<u64>;
 }
 
 /// A repository ruleset's id.
@@ -194,6 +205,38 @@ pub struct PrDetail {
     pub draft: bool,
     /// Whether it was merged, by any hand.
     pub merged: bool,
+    /// Its base branch's sha at the read.
+    pub base_sha: Sha,
+    /// Lines added across the pull request; `None` when the response
+    /// carried no such field.
+    pub additions: Option<u64>,
+    /// Lines deleted across the pull request; `None` when the response
+    /// carried no such field.
+    pub deletions: Option<u64>,
+    /// How many files it changes; `None` when the response carried no such
+    /// field.
+    pub changed_files: Option<u64>,
+}
+
+/// One file a pull request changes, as `GET /pulls/{n}/files` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
+    /// GitHub's word: `added`, `removed`, `modified`, `renamed`, `copied`,
+    /// `changed`, `unchanged`.
+    pub status: String,
+    /// The path before a rename or copy.
+    pub previous: Option<String>,
+}
+
+/// One issue, as the single-item endpoint reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IssueDetail {
+    /// The issue is a pull request: GitHub lists pull requests as issues
+    /// carrying a `pull_request` key.
+    pub pull_request: bool,
 }
 
 /// A pull request's `mergeable_state`: whether GitHub would merge it into
@@ -330,6 +373,12 @@ impl HttpResponse {
             .map(|(_, v)| v.as_str())
     }
 
+    /// The header read as a whole number, surrounding whitespace ignored;
+    /// `None` when absent or not a whole number.
+    fn header_u64(&self, name: &str) -> Option<u64> {
+        self.header(name).and_then(|v| v.trim().parse().ok())
+    }
+
     fn json(&self, what: &str) -> Result<Value, ApiError> {
         if self.body.is_empty() {
             return Ok(Value::Null);
@@ -415,6 +464,9 @@ pub struct RestClient {
     /// The end of the latest rate-limit pause a response asked for, until
     /// [`GitHubApi::rate_limit_pause`] takes it.
     paused_until: Option<SystemTime>,
+    /// `x-ratelimit-remaining` of the latest response to a repository
+    /// request, when it carried a whole number.
+    remaining: Option<u64>,
 }
 
 const PER_PAGE: &str = "per_page=100";
@@ -477,6 +529,7 @@ impl RestClient {
             transport,
             now,
             paused_until: None,
+            remaining: None,
         }
     }
 
@@ -497,6 +550,7 @@ impl RestClient {
             transport,
             now: clock,
             paused_until,
+            remaining: _,
         } = self;
         let (key, repo, installation, token) = match credential {
             Credential::Token(bearer) => return Ok(bearer.clone()),
@@ -620,6 +674,7 @@ impl RestClient {
             &authorization,
             body,
         )?;
+        self.remaining = response.header_u64("x-ratelimit-remaining");
         if response.status == 401 && matches!(self.credential, Credential::App { .. }) {
             return Err(permanent(format!(
                 "{method} {path}: HTTP 401: {} ({INSTALLATION_TOKEN_REJECTED})",
@@ -847,7 +902,25 @@ impl GitHubApi for RestClient {
             merge_state,
             draft,
             merged,
+            base_sha: parse_sha(&what, &pr.base.sha)?,
+            additions: pr.additions,
+            deletions: pr.deletions,
+            changed_files: pr.changed_files,
         })
+    }
+
+    fn pr_files(&mut self, number: PrNumber) -> Result<Vec<ChangedFile>, ApiError> {
+        let found: Vec<FileJson> = self.get_array(&format!("/pulls/{}/files", number.0))?;
+        Ok(found
+            .into_iter()
+            .map(|file| ChangedFile {
+                path: file.filename,
+                additions: file.additions,
+                deletions: file.deletions,
+                status: file.status,
+                previous: file.previous_filename,
+            })
+            .collect())
     }
 
     fn set_base(&mut self, number: PrNumber, base: &str) -> Result<(), ApiError> {
@@ -947,6 +1020,31 @@ impl GitHubApi for RestClient {
         let path = format!("/issues/{}/comments", number.0);
         self.json_call(Method::Post, &path, Some(&json!({ "body": body })))
             .map(|_| ())
+    }
+
+    fn get_issue(&mut self, number: u64) -> Result<Option<IssueDetail>, ApiError> {
+        let path = format!("/issues/{number}");
+        let response = self.call(Method::Get, &path, None)?;
+        match response.status {
+            200 => {
+                let what = format!("GET {path}");
+                let issue: IssueJson = decode(&what, response.json(&what)?)?;
+                Ok(Some(IssueDetail {
+                    pull_request: issue.pull_request.is_some(),
+                }))
+            }
+            404 => Ok(None),
+            _ => Err(issue_failure(Method::Get, &path, &response)),
+        }
+    }
+
+    fn set_issue_body(&mut self, number: u64, body: &str) -> Result<(), ApiError> {
+        let path = format!("/issues/{number}");
+        let response = self.call(Method::Patch, &path, Some(&json!({ "body": body })))?;
+        match response.status {
+            200 => Ok(()),
+            _ => Err(issue_failure(Method::Patch, &path, &response)),
+        }
     }
 
     fn label_exists(&mut self, label: &str) -> Result<bool, ApiError> {
@@ -1068,6 +1166,10 @@ impl GitHubApi for RestClient {
 
     fn rate_limit_pause(&mut self) -> Option<SystemTime> {
         self.paused_until.take()
+    }
+
+    fn rate_limit_remaining(&self) -> Option<u64> {
+        self.remaining
     }
 }
 
@@ -1227,6 +1329,18 @@ fn failure(method: Method, path: &str, response: &HttpResponse) -> ApiError {
     permanent(message)
 }
 
+/// [`failure`] for a call on one issue: a redirect there also means the
+/// issue was transferred to another repository.
+fn issue_failure(method: Method, path: &str, response: &HttpResponse) -> ApiError {
+    match failure(method, path, response) {
+        ApiError::Permanent(error) if (300..400).contains(&response.status) => permanent(format!(
+            "{error}; if the issue was transferred, set status_issue to an issue in this \
+             repository"
+        )),
+        error => error,
+    }
+}
+
 /// How long a rate limit that names no time pauses the queue.
 const UNSTATED_PAUSE_SECS: u64 = 60;
 
@@ -1263,7 +1377,7 @@ fn rate_limit(response: &HttpResponse) -> Option<RateLimit> {
     // what it is.
     let rate_limited = status == 429
         || status == 403
-            && (response.header("x-ratelimit-remaining") == Some("0")
+            && (response.header_u64("x-ratelimit-remaining") == Some(0)
                 || response.header("retry-after").is_some()
                 || github_message(response)
                     .to_ascii_lowercase()
@@ -1271,16 +1385,14 @@ fn rate_limit(response: &HttpResponse) -> Option<RateLimit> {
     if !rate_limited {
         return None;
     }
-    let seconds = |name| {
-        response
-            .header(name)
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    };
     // Every response carries `x-ratelimit-reset`, the primary window's end;
     // it says when requests may resume only once that window is exhausted.
-    let exhausted = response.header("x-ratelimit-remaining") == Some("0");
+    let exhausted = response.header_u64("x-ratelimit-remaining") == Some(0);
     Some(
-        match (seconds("retry-after"), seconds("x-ratelimit-reset")) {
+        match (
+            response.header_u64("retry-after"),
+            response.header_u64("x-ratelimit-reset"),
+        ) {
             (Some(after), _) => RateLimit::After(after),
             (None, Some(reset)) if exhausted => RateLimit::ResetAt(reset),
             (None, _) => RateLimit::Unstated,
@@ -1487,6 +1599,7 @@ struct LabelJson {
 
 #[derive(Deserialize)]
 struct BranchJson {
+    sha: String,
     #[serde(rename = "ref")]
     branch: String,
 }
@@ -1532,6 +1645,26 @@ struct PrJson {
     /// The list endpoint's merge record; null when not merged.
     #[serde(default)]
     merged_at: Option<String>,
+    /// Only the single-item endpoint carries it.
+    #[serde(default)]
+    additions: Option<u64>,
+    /// Only the single-item endpoint carries it.
+    #[serde(default)]
+    deletions: Option<u64>,
+    /// Only the single-item endpoint carries it.
+    #[serde(default)]
+    changed_files: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct FileJson {
+    filename: String,
+    additions: u64,
+    deletions: u64,
+    status: String,
+    /// Present only on a renamed or copied file.
+    #[serde(default)]
+    previous_filename: Option<String>,
 }
 
 #[derive(Deserialize)]

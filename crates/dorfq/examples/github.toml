@@ -10,6 +10,22 @@
 # The tick journal: every tick's observation and plan, one JSON line each,
 # relative to this file; absent, none. See docs/running-on-github.md.
 # journal = "dorfq.journal"
+# The events file: the journal's event stream, one JSON line per event,
+# rotated with it; needs journal. See docs/running-on-github.md.
+# events = "dorfq.events"
+# The capture file: each pull request head's changed files, read from GitHub
+# once when the queue first sees the head, rotated with the journal; needs
+# journal. See docs/running-on-github.md.
+# capture = "dorfq.capture"
+
+# Telemetry: the queue's gauges and its events pushed over OTLP/HTTP to a
+# collector, every interval_secs; needs journal. See docs/running-on-github.md.
+# [telemetry]
+# metrics_endpoint = "http://127.0.0.1:4318/v1/metrics"   # the complete URL metrics are posted to, as given
+# logs_endpoint = "http://127.0.0.1:4318/v1/logs"         # the complete URL logs are posted to, as given
+# interval_secs = 60
+# encoding = "protobuf"                            # or "json", for a collector that takes only OTLP/JSON
+# authorization_env = "DORFQ_OTLP_AUTHORIZATION"   # the environment variable holding the Authorization header's value, if the collector needs one
 
 [forge]
 kind = "github"
@@ -22,6 +38,7 @@ checks = ["check"]                    # required check names on pull request hea
 # batch_checks = ["check"]            # required check names on batch tips; absent, the same as checks
 # lock_heads = true                   # lock each batched pull request's branch with a ruleset while it is batched; needs Administration: read/write
 # ci = "actions"                      # cancel a retired batch's workflow runs; needs Actions: read/write
+# status_issue = 12                   # keep this issue's body as the queue's status; needs journal and Issues: read/write; see docs/running-on-github.md
 
 # How often each entity is read unprompted, in seconds. With webhooks, as
 # here, a change reaches the queue when GitHub delivers it, and these bound

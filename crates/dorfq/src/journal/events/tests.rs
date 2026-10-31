@@ -211,7 +211,7 @@ fn a_pull_request_arrives_and_is_admitted_with_its_base_stack_and_head() {
                     pr: 1,
                     base: None,
                     atomic: false,
-                    head: sha(1).to_string(),
+                    head: sha(1),
                 }
             ),
             (10, Kind::Admit { pr: 1, base: None }),
@@ -221,7 +221,7 @@ fn a_pull_request_arrives_and_is_admitted_with_its_base_stack_and_head() {
                     pr: 2,
                     base: Some(1),
                     atomic: true,
-                    head: sha(2).to_string(),
+                    head: sha(2),
                 }
             ),
             (
@@ -298,7 +298,7 @@ fn a_head_change_is_a_repush() {
         last(&entries),
         [Kind::Repush {
             pr: 1,
-            head: sha(77).to_string(),
+            head: sha(77),
         }]
     );
 }
@@ -381,7 +381,7 @@ fn a_push_while_own_ci_runs_cancels_that_run_and_starts_another() {
         [
             Kind::Repush {
                 pr: 1,
-                head: sha(9).to_string(),
+                head: sha(9),
             },
             Kind::PrCiEnd {
                 pr: 1,
@@ -951,6 +951,117 @@ fn errors_ride_on_the_tick_or_the_time_before_or_after() {
 }
 
 #[test]
+fn an_error_after_a_rotate_header_waits_for_the_next_observation() {
+    let entries = [
+        start(),
+        report(0, at(10), Plan::default()),
+        header(Cause::Rotate, 4000, 4500),
+        error(1, "transient forge error: observe", false),
+    ];
+    let errors = |entries: &[Entry]| -> Vec<u64> {
+        derive(entries)
+            .iter()
+            .filter(|e| kind_name(*e) == "error")
+            .map(|e| e.t)
+            .collect()
+    };
+    // At the end of the journal it is released at the last observation's
+    // time; with an observation after it, at that one's.
+    assert_eq!(errors(&entries), [10]);
+    let observed = [entries.as_slice(), &[report(2, at(20), Plan::default())]].concat();
+    assert_eq!(errors(&observed), [20]);
+    // The segment after the rotation, read alone, places it the same.
+    assert_eq!(errors(&observed[2..]), [20]);
+}
+
+#[test]
+fn a_batch_starts_on_a_tip_last_seen_two_observations_before() {
+    let pending = |tip| testing(tip, CiStatus::Pending);
+    let entries = [
+        start(),
+        report(
+            0,
+            at(10)
+                .prs(vec![pr(1)])
+                .batches(vec![batch(1, 1000, &[1], pending(51))]),
+            Plan::default(),
+        ),
+        report(1, at(20).prs(vec![pr(2)]), Plan::default()),
+        report(
+            2,
+            at(30)
+                .prs(vec![pr(2)])
+                .batches(vec![batch(2, 51, &[2], pending(52))]),
+            Plan::default(),
+        ),
+    ];
+    let starts: Vec<Kind> = events(&entries)
+        .into_iter()
+        .filter(|(_, k)| matches!(k, Kind::Start { .. }))
+        .map(|(_, k)| k)
+        .collect();
+    assert_eq!(
+        starts,
+        [
+            Kind::Start {
+                batch: 1,
+                base: None,
+                probe: false,
+                members: vec![1],
+            },
+            Kind::Start {
+                batch: 2,
+                base: Some(1),
+                probe: false,
+                members: vec![2],
+            },
+        ]
+    );
+}
+
+#[test]
+fn an_ejection_reason_planned_ticks_before_the_departure_is_kept() {
+    let plan = Plan {
+        eject: vec![
+            Ejection::new(PrNumber(1), EjectReason::BatchFailed { batch: BatchId(3) }),
+            Ejection::new(PrNumber(2), EjectReason::BatchFailed { batch: BatchId(3) }),
+        ],
+        ..Plan::default()
+    };
+    let entries = [
+        start(),
+        report(0, at(10).prs(vec![pr(1), pr(2)]), plan),
+        report(1, at(20).prs(vec![pr(1), pr(2)]), Plan::default()),
+        // Pull request 2 is gone unsaid and back: a new lifetime with no
+        // reason of its own.
+        report(2, at(30).prs(vec![pr(1)]), Plan::default()),
+        report(3, at(40).prs(vec![pr(1), pr(2)]), Plan::default()),
+        report(
+            4,
+            at(50)
+                .departed(1, Departed::Ejected)
+                .departed(2, Departed::Ejected),
+            Plan::default(),
+        ),
+    ];
+    assert_eq!(
+        last(&entries),
+        [
+            Kind::Eject {
+                pr: 1,
+                reason: Some("batch 3 failed".to_owned()),
+                r#final: true,
+            },
+            Kind::Eject {
+                pr: 2,
+                reason: None,
+                r#final: true,
+            },
+        ]
+    );
+}
+
+#[test]
 fn within_a_tick_departures_then_endings_then_trunk_then_changes_then_starts() {
     let entries = [
         start(),
@@ -1102,12 +1213,12 @@ fn shared_real_events() -> Vec<Kind> {
             pr: 1,
             base: None,
             atomic: false,
-            head: String::new(),
+            head: sha(1),
         },
         Kind::Admit { pr: 1, base: None },
         Kind::Repush {
             pr: 1,
-            head: String::new(),
+            head: sha(1),
         },
         Kind::Withdraw {
             pr: 1,

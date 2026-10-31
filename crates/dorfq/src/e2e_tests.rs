@@ -434,7 +434,7 @@ fn a_journaled_run_records_what_the_driver_returned() {
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("q.journal");
     let header = Header::start("mock", &SchedulerConfig::AllAtOnce {}, 1000);
-    let (mut writer, _) = Writer::open(&path, header).unwrap();
+    let (mut writer, _) = Writer::open(&path, header, None, None, &mut |_, _| {}).unwrap();
     let run = run_with(
         include_str!("../examples/scenario.toml"),
         &mut AllAtOnce::new(),

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use dorfq_core::Sha;
 use dorfq_scheduler::SchedulerConfig;
 use serde::Deserialize;
 use serde_json::Value;
@@ -17,7 +18,7 @@ fn events() -> Vec<Event> {
                 pr: 1,
                 base: None,
                 atomic: false,
-                head: format!("{:040x}", 1),
+                head: Sha::parse(&format!("{:040x}", 1)).unwrap(),
             },
         },
         Event {

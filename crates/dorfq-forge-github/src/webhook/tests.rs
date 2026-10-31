@@ -18,6 +18,7 @@ fn settings() -> Settings {
             pr: Duration::from_secs(1800),
             batch: Duration::from_secs(300),
         },
+        status_issue: None,
     }
 }
 
